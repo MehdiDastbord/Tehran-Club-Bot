@@ -6,7 +6,7 @@ const {
   StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle
 } = require('discord.js');
 const { supabase, getSettings, setSettings } = require('./db');
-const { isAdmin, replacePlaceholders, parseDurationMinutes } = require('./utils');
+const { isAdmin, replacePlaceholders } = require('./utils');
 
 const client = new Client({
   intents: [
@@ -17,6 +17,16 @@ const client = new Client({
   ],
   partials:[Partials.Channel]
 });
+
+function isOwner(userId) {
+  return String(process.env.OWNER_ID || '').split(',').map(x => x.trim()).filter(Boolean).includes(String(userId));
+}
+
+function replyError(interaction, error, fallback='عملیات انجام نشد.') {
+  console.error(error);
+  const payload={content:`❌ ${fallback}`,ephemeral:true};
+  return interaction.replied || interaction.deferred ? interaction.followUp(payload).catch(()=>{}) : interaction.reply(payload).catch(()=>{});
+}
 
 const ACCESS = {
   giveaway:'Giveaway Access',
@@ -124,7 +134,7 @@ client.on('messageCreate',async message=>{
   }
 
   // owner text relay/custom commands
-  if(message.guild && (process.env.OWNER_ID || '').split(',').map(x=>x.trim()).filter(Boolean).includes(message.author.id)) {
+  if(message.guild && isOwner(message.author.id)) {
     const s=await getSettings(message.guild.id);
     if(s.owner_relay_channel===message.channel.id) {
       await message.delete().catch(()=>{});
@@ -250,10 +260,10 @@ client.on('interactionCreate',async interaction=>{
 
   if(interaction.isChatInputCommand()) {
     const c=interaction.commandName, member=interaction.member, guild=interaction.guild;
-    if(c==='giveaway' || c==='Giveawaysv') {
+    if(c==='giveaway' || c==='giveawaysv') {
       if(!hasAccess(member,ACCESS.giveaway)) return interaction.reply({content:'Giveaway Access لازم است.',ephemeral:true});
       const prize=interaction.options.getString('prize'), minutes=interaction.options.getInteger('minutes');
-      const link=c==='Giveawaysv'?interaction.options.getString('link'):null;
+      const link=c==='giveawaysv'?interaction.options.getString('link'):null;
       const end=new Date(Date.now()+minutes*60000);
       const {data:g}=await supabase.from('giveaways').insert({guild_id:guild.id,channel_id:interaction.channel.id,prize,duration_minutes:minutes,end_at:end.toISOString(),link}).select().single();
       const row=new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`gw:${g.id}`).setLabel('🎉 شرکت در Giveaway').setStyle(ButtonStyle.Success));
@@ -288,7 +298,7 @@ client.on('interactionCreate',async interaction=>{
       await interaction.reply({content:`🎫 ${name}\nانتخاب کتگوری و ساخت Ticket:`,components:[new ActionRowBuilder().addComponents(menu)]});
       return;
     }
-    if(c==='Menu') {
+    if(c==='menu') {
       if(!hasAccess(member,ACCESS.ticket)) return interaction.reply({content:'Ticket Access لازم است.',ephemeral:true});
       const {data:panels}=await supabase.from('ticket_panels').select('*').eq('guild_id',guild.id);
       if(!panels?.length) return interaction.reply({content:'اول /panel بساز.',ephemeral:true});
@@ -332,6 +342,28 @@ client.on('interactionCreate',async interaction=>{
       await interaction.reply(`✅ ${c} انجام شد.`);
       return;
     }
+    if(c==='stats') {
+      if(!hasAccess(member,ACCESS.ticket)) return interaction.reply({content:'دسترسی Ticket لازم است.',ephemeral:true});
+      await setSettings(guild.id,{stats_channel:interaction.channel.id});
+      return interaction.reply({content:'✅ این کانال برای آمار Claim ساعتی تنظیم شد.',ephemeral:true});
+    }
+    if(c==='setrolexp') {
+      if(!isAdmin(member)) return interaction.reply({content:'فقط Administrator می‌تواند این تنظیم را تغییر دهد.',ephemeral:true});
+      const level=interaction.options.getInteger('level'), role=interaction.options.getRole('role');
+      const {error}=await supabase.from('xp_roles').upsert({guild_id:guild.id,level,role_id:role.id});
+      if(error) return replyError(interaction,error,'ثبت نقش XP انجام نشد.');
+      return interaction.reply({content:`✅ نقش ${role} برای Level ${level} تنظیم شد.`,ephemeral:true});
+    }
+    if(c==='setxp') {
+      if(!isAdmin(member)) return interaction.reply({content:'فقط Administrator می‌تواند XP را تغییر دهد.',ephemeral:true});
+      const u=interaction.options.getUser('user'), amount=interaction.options.getInteger('amount');
+      const {data:old,error:readError}=await supabase.from('xp_users').select('*').eq('guild_id',guild.id).eq('user_id',u.id).maybeSingle();
+      if(readError) return replyError(interaction,readError,'خواندن XP انجام نشد.');
+      const xp=Math.max(0,(old?.xp||0)+amount), level=Math.floor(xp/100);
+      const {error}=await supabase.from('xp_users').upsert({guild_id:guild.id,user_id:u.id,xp,level});
+      if(error) return replyError(interaction,error,'ثبت XP انجام نشد.');
+      return interaction.reply({content:`✅ ${amount >= 0 ? '+' : ''}${amount} XP برای <@${u.id}> ثبت شد. اکنون Level ${level} و XP ${xp} است.`,ephemeral:true});
+    }
     if(c==='level') {
       const {data:x}=await supabase.from('xp_users').select('*').eq('guild_id',guild.id).eq('user_id',interaction.user.id).maybeSingle();
       return interaction.reply(`⭐ Level: ${x?.level||0}\nXP: ${x?.xp||0}`);
@@ -340,11 +372,26 @@ client.on('interactionCreate',async interaction=>{
       const {data:xs}=await supabase.from('xp_users').select('*').eq('guild_id',guild.id).order('xp',{ascending:false}).limit(10);
       return interaction.reply(`🏆 Leaderboard\n${(xs||[]).map((x,i)=>`${i+1}. <@${x.user_id}> — Lv.${x.level} (${x.xp} XP)`).join('\n')||'خالی است.'}`);
     }
-    if(c==='Exchange') {
+    if(c==='exchange') {
       if(!hasAccess(member,ACCESS.exchange)) return interaction.reply({content:'Exchange Access لازم است.',ephemeral:true});
       const modal=new ModalBuilder().setCustomId('exchange').setTitle('Exchange');
       modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('banner').setLabel('Banner').setStyle(TextInputStyle.Paragraph).setRequired(true)));
       return interaction.showModal(modal);
+    }
+    if(c==='textowner') {
+      if(!isOwner(interaction.user.id)) return interaction.reply({content:'فقط Owner می‌تواند Owner Relay را تنظیم کند.',ephemeral:true});
+      await setSettings(guild.id,{owner_relay_channel:interaction.channel.id});
+      return interaction.reply({content:'✅ این کانال برای Owner Relay تنظیم شد.',ephemeral:true});
+    }
+    if(c==='createcmd') {
+      if(!isAdmin(member)) return interaction.reply({content:'فقط Administrator می‌تواند Custom Command بسازد.',ephemeral:true});
+      const keyword=interaction.options.getString('keyword').trim().toLowerCase().replace(/^\//,'');
+      const text=interaction.options.getString('text');
+      if(!keyword || keyword.length>50 || keyword.includes(' ')) return interaction.reply({content:'❌ Keyword باید یک کلمه و حداکثر 50 کاراکتر باشد.',ephemeral:true});
+      const settings=await getSettings(guild.id);
+      const custom_commands={...(settings.custom_commands||{}),[keyword]:text};
+      await setSettings(guild.id,{custom_commands});
+      return interaction.reply({content:`✅ Custom command ساخته شد: \`${keyword}\``,ephemeral:true});
     }
     if(c==='banner') {
       const s=await getSettings(guild.id);
@@ -364,6 +411,11 @@ client.on('messageCreate',async message=>{
   if(newLevel>row.level) {
     row.level=newLevel;
     if(s.level_channel) message.guild.channels.cache.get(s.level_channel)?.send((s.level_text||'🎉 [user] به Level [level] رسید!').replaceAll('[user]',`<@${message.author.id}>`).replaceAll('[level]',String(newLevel)));
+    const {data:rewards}=await supabase.from('xp_roles').select('level,role_id').eq('guild_id',message.guild.id).lte('level',newLevel);
+    for(const reward of rewards||[]) {
+      const role=message.guild.roles.cache.get(reward.role_id);
+      if(role && !message.member.roles.cache.has(role.id)) await message.member.roles.add(role).catch(()=>{});
+    }
   }
   await supabase.from('xp_users').upsert(row);
 });
