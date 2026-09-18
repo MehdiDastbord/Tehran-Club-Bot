@@ -187,10 +187,10 @@ async function setup(i,cfg){
  const add=(id,label,value,style=TextInputStyle.Short)=>new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(style).setValue(value||"").setRequired(false);
  const rows=[
   add("welcome","متن خوشامدگویی",cfg.welcome.text,TextInputStyle.Paragraph),
-  add("channels","چنل‌ها: welcome,logs,dmLogs,inviteLogs,ticketLogs,ticketStats,feedback,xpLevel,rankup,recruit,demote,staffWarn,exchange",Object.values(cfg.channels).join("|"),TextInputStyle.Paragraph),
-  add("roles","رول‌ها: ticket,staffMain,staffExtra1,staffExtra2,staffManager",Object.values(cfg.roles).join("|"),TextInputStyle.Paragraph),
-  add("ranks","رنک‌ها از پایین به بالا: name:roleId,name:roleId",cfg.staff.ranks.map(x=>`${x.name}:${x.roleId}`).join(","),TextInputStyle.Paragraph),
-  add("levelroles","رول Level: level:roleId,level:roleId",Object.entries(cfg.levelRoles).map(([l,r])=>`${l}:${r}`).join(","),TextInputStyle.Paragraph)
+  add("channels","Channel IDs (use | between them)",Object.values(cfg.channels).join("|"),TextInputStyle.Paragraph),
+  add("roles","Role IDs (use | between them)",Object.values(cfg.roles).join("|"),TextInputStyle.Paragraph),
+  add("ranks","Staff ranks: name:roleId,name:roleId",cfg.staff.ranks.map(x=>`${x.name}:${x.roleId}`).join(","),TextInputStyle.Paragraph),
+  add("levelroles","Level roles: level:roleId,level:roleId",Object.entries(cfg.levelRoles).map(([l,r])=>`${l}:${r}`).join(","),TextInputStyle.Paragraph)
  ].map(x=>new ActionRowBuilder().addComponents(x));
  modal.addComponents(...rows);return i.showModal(modal);
 }
@@ -204,7 +204,7 @@ async function modal(i){
   const rr=vals.getTextInputValue("roles").split("|");roleKeys.forEach((k,n)=>cfg.roles[k]=rr[n]||null);
   cfg.staff.ranks=vals.getTextInputValue("ranks").split(",").filter(Boolean).map((x,n)=>{const [name,roleId]=x.split(":");return {level:n,name,roleId};});
   cfg.levelRoles={};for(const x of vals.getTextInputValue("levelroles").split(",").filter(Boolean)){const [l,r]=x.split(":");if(l&&r)cfg.levelRoles[l]=r;}
-  saveConfig(i.guild.id,cfg);return i.reply({content:"✅ تنظیمات ذخیره شد.",ephemeral:true});
+  await saveConfig(i.guild.id,cfg);return i.reply({content:"✅ تنظیمات ذخیره شد.",ephemeral:true});
  }
 }
 async function button(i){
