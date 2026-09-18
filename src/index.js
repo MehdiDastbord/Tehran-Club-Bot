@@ -124,7 +124,7 @@ client.on('messageCreate',async message=>{
   }
 
   // owner text relay/custom commands
-  if(message.guild && message.author.id===process.env.OWNER_ID) {
+  if(message.guild && (process.env.OWNER_ID || '').split(',').map(x=>x.trim()).filter(Boolean).includes(message.author.id)) {
     const s=await getSettings(message.guild.id);
     if(s.owner_relay_channel===message.channel.id) {
       await message.delete().catch(()=>{});
