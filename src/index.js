@@ -1,6 +1,6 @@
 require("dotenv").config();
 const {Client,GatewayIntentBits,Partials,EmbedBuilder,ActionRowBuilder,ButtonBuilder,ButtonStyle,ChannelType,PermissionFlagsBits}=require("discord.js");
-const {db,getConfig,saveConfig}=require("./db");
+const {getConfig,saveConfig,getXp,saveXp,upsertStaffMember,removeStaffMember,getStaffClaims,incrementStaffClaim,getWarnCount,setWarnCount,createGiveaway,setGiveawayMessage,getGiveaway,enterGiveaway,getGiveawayEntryCount,getActiveEndingGiveaways,getGiveawayEntries,endGiveaway,createExchangeRequest,getExchangeRequest,updateExchangeStatus,getLeaderboard}=require("./db");
 const {isManager,rankIndex,log,levelForXp}=require("./utils");
 
 const client=new Client({intents:[
@@ -13,16 +13,16 @@ const cooldown=new Map();
 const drops=new Map();
 
 async function addXp(member,amount,voice=false){
- const cfg=getConfig(member.guild.id);
+ const cfg=await getConfig(member.guild.id);
  const ignored=voice?false:(cfg.xp.ignoredChannels||[]).includes(member.guild.channels.cache.find(c=>c.id===member.channelId)?.id);
  if(ignored) return;
  const roles=member.roles.cache.map(r=>r.id);
  if(!voice && roles.some(r=>(cfg.xp.ignoredRoles||[]).includes(r))) return;
- let row=db.prepare("SELECT * FROM xp WHERE guild_id=? AND user_id=?").get(member.guild.id,member.id);
+ let row=await getXp(member.guild.id,member.id);
  if(!row) row={xp:0,level:0,voice_minutes:0};
  const old=row.level; row.xp+=amount; if(voice) row.voice_minutes++;
  const nl=levelForXp(row.xp,cfg);
- db.prepare("INSERT OR REPLACE INTO xp(guild_id,user_id,xp,level,voice_minutes) VALUES(?,?,?,?,?)").run(member.guild.id,member.id,row.xp,nl,row.voice_minutes);
+ await saveXp(member.guild.id,member.id,row.xp,nl,row.voice_minutes);
  if(nl>old){
   const roleId=cfg.levelRoles[String(nl)];
   if(roleId && member.guild.roles.cache.has(roleId)) {
@@ -41,7 +41,7 @@ client.once("ready",async()=>{
  console.log(`Logged in as ${client.user.tag}`);
  setInterval(async()=>{
   for(const guild of client.guilds.cache.values()){
-   const cfg=getConfig(guild.id),afk=guild.afkChannelId;
+   const cfg=await getConfig(guild.id),afk=guild.afkChannelId;
    for(const [,member] of guild.members.cache){
     if(member.user.bot || !member.voice.channelId) continue;
     if(cfg.xp.ignoreAfk && afk && member.voice.channelId===afk) continue;
@@ -53,7 +53,7 @@ client.once("ready",async()=>{
 });
 
 client.on("guildMemberAdd",async m=>{
- const cfg=getConfig(m.guild.id);
+ const cfg=await getConfig(m.guild.id);
  if(cfg.welcome.enabled && cfg.channels.welcome){
   const ch=m.guild.channels.cache.get(cfg.channels.welcome);
   if(ch) ch.send((cfg.welcome.text||"خوش اومدی {user}").replaceAll("{user}",`${m}`).replaceAll("{server}",m.guild.name));
@@ -61,10 +61,10 @@ client.on("guildMemberAdd",async m=>{
  await log(m.guild,cfg,"👋 ورود عضو",`${m.user.tag} وارد سرور شد.`);
 });
 
-client.on("guildMemberRemove",async m=>{const cfg=getConfig(m.guild.id);await log(m.guild,cfg,"🚪 خروج عضو",`${m.user.tag} از سرور خارج شد.`);});
+client.on("guildMemberRemove",async m=>{const cfg=await getConfig(m.guild.id);await log(m.guild,cfg,"🚪 خروج عضو",`${m.user.tag} از سرور خارج شد.`);});
 client.on("messageCreate",async m=>{
  if(m.author.bot||!m.guild) return;
- const cfg=getConfig(m.guild.id);
+ const cfg=await getConfig(m.guild.id);
  if(cfg.xp.message){
   const key=m.guild.id+":"+m.author.id,now=Date.now(),last=cooldown.get(key)||0;
   if(now-last>=(cfg.xp.cooldown||30)*1000){cooldown.set(key,now);await addXp(m.member,cfg.xp.message||10);}
@@ -74,15 +74,15 @@ client.on("messageCreate",async m=>{
   if(d.mode==="text" && m.content.trim()===d.answer){drops.delete(m.channel.id);await m.channel.send(`🎉 ${m.author} برنده **${d.prize}** شد!`);await log(m.guild,cfg,"🎯 Drop برنده",`${m.author.tag} برنده ${d.prize} شد.`);}
  }
 });
-client.on("messageDelete",async m=>{if(!m.guild)return;await log(m.guild,getConfig(m.guild.id),"🗑️ حذف پیام",`پیام در <#${m.channelId}> حذف شد.`);});
-client.on("messageUpdate",async(a,b)=>{if(!a.guild)return;if(a.content!==b.content)await log(a.guild,getConfig(a.guild.id),"✏️ ویرایش پیام",`پیام در <#${a.channelId}> ویرایش شد.`);});
-client.on("channelCreate",async c=>{await log(c.guild,getConfig(c.guild.id),"📁 ساخت چنل",`< #${c.id}> ساخته شد.`);});
-client.on("channelDelete",async c=>{await log(c.guild,getConfig(c.guild.id),"🗑️ حذف چنل",`${c.name} حذف شد.`);});
-client.on("roleCreate",async r=>{await log(r.guild,getConfig(r.guild.id),"🎭 ساخت رول",`${r} ساخته شد.`);});
-client.on("roleDelete",async r=>{await log(r.guild,getConfig(r.guild.id),"🎭 حذف رول",`${r.name} حذف شد.`);});
-client.on("guildBanAdd",async b=>{await log(b.guild,getConfig(b.guild.id),"🔨 بن",`${b.user.tag} بن شد.`);});
-client.on("guildBanRemove",async b=>{await log(b.guild,getConfig(b.guild.id),"🔓 آنبن",`${b.user.tag} آنبن شد.`);});
-client.on("voiceStateUpdate",async(o,n)=>{if(o.channelId===n.channelId)return;await log(n.guild,getConfig(n.guild.id),"🔊 Voice",`${n.member?.user.tag||"عضو"}: ${o.channelId?"خروج":"ورود"} / ${n.channelId?"ورود":"خروج"}`);});
+client.on("messageDelete",async m=>{if(!m.guild)return;await log(m.guild,await getConfig(m.guild.id),"🗑️ حذف پیام",`پیام در <#${m.channelId}> حذف شد.`);});
+client.on("messageUpdate",async(a,b)=>{if(!a.guild)return;if(a.content!==b.content)await log(a.guild,await getConfig(a.guild.id),"✏️ ویرایش پیام",`پیام در <#${a.channelId}> ویرایش شد.`);});
+client.on("channelCreate",async c=>{await log(c.guild,await getConfig(c.guild.id),"📁 ساخت چنل",`< #${c.id}> ساخته شد.`);});
+client.on("channelDelete",async c=>{await log(c.guild,await getConfig(c.guild.id),"🗑️ حذف چنل",`${c.name} حذف شد.`);});
+client.on("roleCreate",async r=>{await log(r.guild,await getConfig(r.guild.id),"🎭 ساخت رول",`${r} ساخته شد.`);});
+client.on("roleDelete",async r=>{await log(r.guild,await getConfig(r.guild.id),"🎭 حذف رول",`${r.name} حذف شد.`);});
+client.on("guildBanAdd",async b=>{await log(b.guild,await getConfig(b.guild.id),"🔨 بن",`${b.user.tag} بن شد.`);});
+client.on("guildBanRemove",async b=>{await log(b.guild,await getConfig(b.guild.id),"🔓 آنبن",`${b.user.tag} آنبن شد.`);});
+client.on("voiceStateUpdate",async(o,n)=>{if(o.channelId===n.channelId)return;await log(n.guild,await getConfig(n.guild.id),"🔊 Voice",`${n.member?.user.tag||"عضو"}: ${o.channelId?"خروج":"ورود"} / ${n.channelId?"ورود":"خروج"}`);});
 client.on("interactionCreate",async i=>{
  if(i.isChatInputCommand()) return command(i);
  if(i.isButton()) return button(i);
@@ -90,7 +90,7 @@ client.on("interactionCreate",async i=>{
 });
 
 async function command(i){
- const cfg=getConfig(i.guild.id);
+ const cfg=await getConfig(i.guild.id);
  if(i.commandName==="setup"){return setup(i,cfg);}
  if(["rankup","rankdown","staff"].includes(i.commandName)&&!isManager(i.member,cfg)) return i.reply({content:"❌ دسترسی مدیریت استاف نداری.",ephemeral:true});
  if(i.commandName==="rankup"||i.commandName==="rankdown"){
@@ -110,27 +110,27 @@ async function command(i){
   if(sub==="join"){
    if(cfg.roles.staffMain)await u.roles.add(cfg.roles.staffMain).catch(()=>{});
    for(const r of [cfg.roles.staffExtra1,cfg.roles.staffExtra2])if(r)await u.roles.add(r).catch(()=>{});
-   db.prepare("INSERT OR REPLACE INTO staff_members VALUES(?,?,?)").run(i.guild.id,u.id,Date.now());
+   await upsertStaffMember(i.guild.id,u.id,Date.now());
    await log(i.guild,cfg,"👮 ورود به استاف",`${u.user.tag} توسط ${i.user.tag} وارد استاف شد.`);
    return i.reply(`✅ ${u} به استاف اضافه شد.`);
   }
   if(sub==="remove"){
    if(cfg.roles.staffMain)await u.roles.remove(cfg.roles.staffMain).catch(()=>{});
    for(const r of [cfg.roles.staffExtra1,cfg.roles.staffExtra2])if(r)await u.roles.remove(r).catch(()=>{});
-   db.prepare("DELETE FROM staff_members WHERE guild_id=? AND user_id=?").run(i.guild.id,u.id);
+   await removeStaffMember(i.guild.id,u.id);
    await log(i.guild,cfg,"🚪 خروج از استاف",`${u.user.tag} توسط ${i.user.tag} از استاف خارج شد.`);
    return i.reply(`✅ ${u} از استاف خارج شد.`);
   }
-  const rows=db.prepare("SELECT user_id,count FROM staff_claims WHERE guild_id=? ORDER BY count DESC LIMIT 20").all(i.guild.id);
+  const rows=await getStaffClaims(i.guild.id);
   return i.reply({content:rows.length?rows.map((x,n)=>`${n+1}. <@${x.user_id}> — ${x.count} کلیم`).join("\n"):"هنوز آماری ثبت نشده.",ephemeral:true});
  }
  if(i.commandName==="giveaway"){
   const title=i.options.getString("title"),prize=i.options.getString("prize"),w=i.options.getInteger("winners"),minutes=i.options.getInteger("minutes");
   const end=Date.now()+minutes*60000;
-  const row=db.prepare("INSERT INTO giveaways(guild_id,channel_id,title,prize,winners,duration_ms,ends_at) VALUES(?,?,?,?,?,?,?)").run(i.guild.id,i.channel.id,title,prize,w,minutes*60000,end);
+  const giveawayId=await createGiveaway(i.guild.id,i.channel.id,title,prize,w,minutes*60000,end);
   const emb=new EmbedBuilder().setTitle(`🎉 ${title}`).setDescription(`🎁 جایزه: **${prize}**\n🏆 برنده: **${w}** نفر\n⏱️ پایان: <t:${Math.floor(end/1000)}:R>\n👥 شرکت‌کنندگان: **0**`).setTimestamp();
-  const msg=await i.channel.send({embeds:[emb],components:[new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`gw:${row.lastInsertRowid}`).setLabel("شرکت در گیووای").setEmoji("🎉").setStyle(ButtonStyle.Success))]});
-  db.prepare("UPDATE giveaways SET message_id=? WHERE id=?").run(msg.id,row.lastInsertRowid);
+  const msg=await i.channel.send({embeds:[emb],components:[new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`gw:${giveawayId}`).setLabel("شرکت در گیووای").setEmoji("🎉").setStyle(ButtonStyle.Success))]});
+  await setGiveawayMessage(giveawayId,msg.id);
   return i.reply({content:"✅ گیووای ساخته شد.",ephemeral:true});
  }
  if(i.commandName==="drop"){
@@ -160,9 +160,9 @@ async function command(i){
  if(i.commandName==="warn"){
   if(!i.member.permissions.has(PermissionFlagsBits.ModerateMembers))return i.reply({content:"❌ دسترسی نداری.",ephemeral:true});
   const u=i.options.getMember("user"),reason=i.options.getString("reason")||"بدون دلیل";
-  const old=db.prepare("SELECT count FROM warns WHERE guild_id=? AND user_id=?").get(i.guild.id,u.id)?.count||0,n=old+1;
-  db.prepare("INSERT OR REPLACE INTO warns VALUES(?,?,?)").run(i.guild.id,u.id,n);
-  if(n>=3){await u.timeout(2*60*60*1000,"رسیدن به ۳ وارن");db.prepare("UPDATE warns SET count=0 WHERE guild_id=? AND user_id=?").run(i.guild.id,u.id);}
+  const old=await getWarnCount(i.guild.id,u.id),n=old+1;
+  await setWarnCount(i.guild.id,u.id,n);
+  if(n>=3){await u.timeout(2*60*60*1000,"رسیدن به ۳ وارن");await setWarnCount(i.guild.id,u.id,0);}
   await log(i.guild,cfg,"⚠️ Warn",`${u.user.tag} — وارن ${n}\nدلیل: ${reason}\nتوسط: ${i.user.tag}`);
   return i.reply(`⚠️ ${u} وارن شد. تعداد: ${n>=3?0:n}${n>=3?" — به‌دلیل ۳ وارن، ۲ ساعت تایم‌اوت شد.":""}`);
  }
@@ -171,11 +171,11 @@ async function command(i){
   return i.reply({content:"برای ثبت درخواست روی دکمه بزنید.",components:[b]});
  }
  if(i.commandName==="level"){
-  const u=i.options.getMember("user")||i.member,row=db.prepare("SELECT xp,level FROM xp WHERE guild_id=? AND user_id=?").get(i.guild.id,u.id)||{xp:0,level:0};
+  const u=i.options.getMember("user")||i.member,row=await getLevel(i.guild.id,u.id)||{xp:0,level:0};
   return i.reply(`📊 **${u.user.username}**\n⭐ XP: **${row.xp}**\n🏆 Level: **${row.level}**`);
  }
  if(i.commandName==="leaderboard"){
-  const rows=db.prepare("SELECT user_id,xp,level FROM xp WHERE guild_id=? ORDER BY xp DESC LIMIT 10").all(i.guild.id);
+  const rows=await getLeaderboard(i.guild.id);
   return i.reply(rows.length?rows.map((x,n)=>`${n+1}. <@${x.user_id}> — Level ${x.level} | ${x.xp} XP`).join("\n"):"هنوز کسی XP ندارد.");
  }
  if(i.commandName==="invites")return i.reply("🔗 سیستم ثبت دعوت فعال است و اطلاعات دعوت در لاگ تنظیم‌شده ثبت می‌شود.");
@@ -196,7 +196,7 @@ async function setup(i,cfg){
 }
 async function modal(i){
  if(i.customId==="setup:main"){
-  const cfg=getConfig(i.guild.id),vals=i.fields;
+  const cfg=await getConfig(i.guild.id),vals=i.fields;
   cfg.welcome.text=vals.getTextInputValue("welcome")||cfg.welcome.text;
   const chKeys=["welcome","logs","dmLogs","inviteLogs","ticketLogs","ticketStats","feedback","xpLevel","rankup","recruit","demote","staffWarn","exchange"];
   const ch=vals.getTextInputValue("channels").split("|");chKeys.forEach((k,n)=>cfg.channels[k]=ch[n]||null);
@@ -208,7 +208,7 @@ async function modal(i){
  }
 }
 async function button(i){
- const cfg=getConfig(i.guild.id);
+ const cfg=await getConfig(i.guild.id);
  if(i.customId==="ticket:open"){
   const name=`ticket-${i.user.username}`.slice(0,90);
   const ch=await i.guild.channels.create({name,type:ChannelType.GuildText,parent:cfg.ticket.category||undefined,permissionOverwrites:[
@@ -227,8 +227,8 @@ async function button(i){
   await i.channel.setTopic(`CLAIMER:${i.user.id}`).catch(()=>{});
   const overwrites=i.channel.permissionOverwrites.cache;
   for(const [id,o] of overwrites){if(id===i.guild.roles.everyone.id||id===i.user.id||id===cfg.roles.ticket)continue;await o.edit({SendMessages:false}).catch(()=>{});}
-  db.prepare("INSERT INTO staff_claims(guild_id,user_id,count) VALUES(?,?,1) ON CONFLICT(guild_id,user_id) DO UPDATE SET count=count+1").run(i.guild.id,i.user.id);
-  if(cfg.channels.ticketStats)i.guild.channels.cache.get(cfg.channels.ticketStats)?.send(`📊 ${i.user} کلیم کرد — مجموع کلیم: ${db.prepare("SELECT count FROM staff_claims WHERE guild_id=? AND user_id=?").get(i.guild.id,i.user.id).count}`);
+  const claimCount=await incrementStaffClaim(i.guild.id,i.user.id);
+  if(cfg.channels.ticketStats)i.guild.channels.cache.get(cfg.channels.ticketStats)?.send(`📊 ${i.user} کلیم کرد — مجموع کلیم: ${claimCount}`);
   await log(i.guild,cfg,"📌 Claim Ticket",`${i.user.tag} تیکت ${i.channel.name} را کلیم کرد.`);
   return i.reply(`✅ ${i.user} این تیکت را کلیم کرد.`);
  }
@@ -239,9 +239,9 @@ async function button(i){
   return i.showModal(m);
  }
  if(i.customId.startsWith("gw:")){
-  const id=Number(i.customId.split(":")[1]);const g=db.prepare("SELECT * FROM giveaways WHERE id=?").get(id);if(!g||g.ended)return i.reply({content:"این گیووای تمام شده.",ephemeral:true});
-  db.prepare("INSERT OR IGNORE INTO giveaway_entries VALUES(?,?)").run(id,i.user.id);
-  const n=db.prepare("SELECT COUNT(*) c FROM giveaway_entries WHERE giveaway_id=?").get(id).c;
+  const id=Number(i.customId.split(":")[1]);const g=await getGiveaway(id);if(!g||g.ended)return i.reply({content:"این گیووای تمام شده.",ephemeral:true});
+  await enterGiveaway(id,i.user.id);
+  const n=await getGiveawayEntryCount(id);
   const emb=i.message.embeds[0];const d=emb.description.replace(/شرکت‌کنندگان: \*\*\d+\*\*/,"شرکت‌کنندگان: **"+n+"**");
   await i.message.edit({embeds:[EmbedBuilder.from(emb).setDescription(d)]});
   return i.reply({content:"🎉 وارد گیووای شدی!",ephemeral:true});
@@ -257,14 +257,14 @@ async function button(i){
   return i.showModal(m);
  }
  if(i.customId.startsWith("exchange:approve:")||i.customId.startsWith("exchange:reject:")){
-  const id=Number(i.customId.split(":")[2]);const req=db.prepare("SELECT * FROM exchange_requests WHERE id=?").get(id);if(!req||req.status!=="pending")return i.reply({content:"این درخواست قبلاً بررسی شده.",ephemeral:true});
-  const ok=i.customId.startsWith("exchange:approve");db.prepare("UPDATE exchange_requests SET status=? WHERE id=?").run(ok?"approved":"rejected",id);
+  const id=Number(i.customId.split(":")[2]);const req=await getExchangeRequest(id);if(!req||req.status!=="pending")return i.reply({content:"این درخواست قبلاً بررسی شده.",ephemeral:true});
+  const ok=i.customId.startsWith("exchange:approve");await updateExchangeStatus(id,ok?"approved":"rejected");
   if(ok&&cfg.channels.exchange){const ch=i.guild.channels.cache.get(cfg.channels.exchange);if(ch)await ch.send(`💱 اکسچنج تأیید شد\n👤 <@${req.user_id}>\n🌐 ${req.server_text}`);}
   await i.message.edit({components:[]});return i.reply({content:ok?"✅ تأیید شد و در چنل اکسچنج ارسال شد.":"❌ رد شد.",ephemeral:true});
  }
 }
 async function modalClose(i){
- const reason=i.fields.getTextInputValue("reason"),cfg=getConfig(i.guild.id);
+ const reason=i.fields.getTextInputValue("reason"),cfg=await getConfig(i.guild.id);
  const topic=i.channel.topic||"",m=topic.match(/CLAIMER:(\d+)/),userId=m?.[1];
  if(cfg.channels.ticketLogs)i.guild.channels.cache.get(cfg.channels.ticketLogs)?.send(`🔒 تیکت ${i.channel.name} بسته شد\nدلیل: ${reason}\nتوسط: ${i.user}`);
  await log(i.guild,cfg,"🔒 بستن Ticket",`${i.channel.name}\nدلیل: ${reason}\nتوسط: ${i.user.tag}`);
@@ -272,23 +272,24 @@ async function modalClose(i){
  await i.reply("🔒 تیکت در حال بسته شدن است.");setTimeout(()=>i.channel.delete().catch(()=>{}),1500);
 }
 async function endGiveaways(){
- const now=Date.now(),rows=db.prepare("SELECT * FROM giveaways WHERE ended=0 AND ends_at<=?").all(now);
+ const now=Date.now(),rows=await getActiveEndingGiveaways(now);
  for(const g of rows){
   const ch=client.channels.cache.get(g.channel_id);const msg=ch&&await ch.messages.fetch(g.message_id).catch(()=>null);
-  const entries=db.prepare("SELECT user_id FROM giveaway_entries WHERE giveaway_id=?").all(g.id).map(x=>x.user_id);
+  const entries=(await getGiveawayEntries(g.id)).map(x=>x.user_id);
   const winners=entries.sort(()=>Math.random()-0.5).slice(0,g.winners);
   if(ch)await ch.send(winners.length?`🎉 گیووای **${g.title}** تمام شد!\n🏆 برنده‌ها: ${winners.map(x=>`<@${x}>`).join("، ")}\n🎁 جایزه: **${g.prize}**`:`❌ برای گیووای **${g.title}** شرکت‌کننده کافی وجود نداشت.`);
   if(msg)await msg.edit({components:[]}).catch(()=>{});
-  db.prepare("UPDATE giveaways SET ended=1 WHERE id=?").run(g.id);
+  await endGiveaway(g.id);
  }
 }
 client.on("interactionCreate",async i=>{
  if(i.isModalSubmit()&&i.customId==="ticketclose")return modalClose(i);
  if(i.isModalSubmit()&&i.customId==="exchange:submit"){
-  const server=i.fields.getTextInputValue("server"),cfg=getConfig(i.guild.id);
-  const r=db.prepare("INSERT INTO exchange_requests(guild_id,user_id,server_text,created_at) VALUES(?,?,?,?)").run(i.guild.id,i.user.id,server,Date.now());
-  if(cfg.channels.logs){const ch=i.guild.channels.cache.get(cfg.channels.logs);if(ch){const row=new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`exchange:approve:${r.lastInsertRowid}`).setLabel("تأیید").setStyle(ButtonStyle.Success),new ButtonBuilder().setCustomId(`exchange:reject:${r.lastInsertRowid}`).setLabel("رد").setStyle(ButtonStyle.Danger));await ch.send({content:"💱 درخواست جدید اکسچنج",embeds:[new EmbedBuilder().setDescription(`👤 <@${i.user.id}>\n🌐 ${server}\n🆔 درخواست: ${r.lastInsertRowid}`)],components:[row]});}}
+  const server=i.fields.getTextInputValue("server"),cfg=await getConfig(i.guild.id);
+  const requestId=await createExchangeRequest(i.guild.id,i.user.id,server,Date.now());
+  if(cfg.channels.logs){const ch=i.guild.channels.cache.get(cfg.channels.logs);if(ch){const row=new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`exchange:approve:${requestId}`).setLabel("تأیید").setStyle(ButtonStyle.Success),new ButtonBuilder().setCustomId(`exchange:reject:${requestId}`).setLabel("رد").setStyle(ButtonStyle.Danger));await ch.send({content:"💱 درخواست جدید اکسچنج",embeds:[new EmbedBuilder().setDescription(`👤 <@${i.user.id}>\n🌐 ${server}\n🆔 درخواست: ${requestId}`)],components:[row]});}}
   return i.reply({content:"✅ درخواستت برای Staff ارسال شد.",ephemeral:true});
  }
 });
-client.login(process.env.DISCORD_TOKEN);
+const {initDb}=require("./db");
+initDb().then(()=>client.login(process.env.DISCORD_TOKEN)).catch(err=>{console.error("Database initialization failed:",err);process.exit(1);});
