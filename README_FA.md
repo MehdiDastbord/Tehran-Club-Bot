@@ -1,56 +1,64 @@
+# Tehran Club Bot V5 - VPS + Supabase
 
-# Tehran Club Bot V5 — Supabase
+این نسخه همه قابلیت‌های درخواستی را در یک پروژه جمع می‌کند و داده‌های دائمی را در Supabase نگه می‌دارد.
 
-این نسخه سایت و Dashboard ندارد. فقط Discord Bot + Supabase Database است.
+## Variables
+```env
+DISCORD_TOKEN=
+CLIENT_ID=
+GUILD_ID=
+OWNER_ID=
+SUPABASE_URL=
+SUPABASE_SERVICE_ROLE_KEY=
+```
 
 ## نصب روی VPS
-
-1. Node.js 20 یا جدیدتر نصب باشد.
+1. Node.js 22+ پیشنهاد می‌شود؛ package.json حداقل Node 22 را مشخص کرده است.
+اگر Railway نسخه دیگری نشان داد، Deployment Logs را بررسی کن.
 2. `npm install`
-3. فایل `.env.example` را به `.env` تبدیل کن و مقدارها را وارد کن.
-4. داخل Supabase بخش SQL Editor، فایل `supabase/schema.sql` را کامل اجرا کن.
-5. `npm run deploy`
-6. `npm start`
+3. فایل `.env` را از روی `.env.example` بساز و مقادیر را وارد کن.
+4. محتوای `supabase/schema.sql` را یک بار در Supabase SQL Editor اجرا کن.
+5. `node src/deploy-commands.js`
+6. `node src/index.js`
 
-## متغیرها
+## Access Roleها
+بات در شروع خودش می‌سازد:
+- `Giveway Acces`
+- `Ticket Acces`
+- `Ban/Kick Acces`
+- `Logs`
+- `Exchange`
+- `Staff Acces`
 
-- DISCORD_TOKEN
-- CLIENT_ID
-- GUILD_ID
-- OWNER_ID
-- SUPABASE_URL
-- SUPABASE_SERVICE_ROLE_KEY
+## نکته مهم درباره setch
+تمام دستورهایی که با `setch` شروع می‌شوند **Prefix/Text Command** هستند و با `/` نیستند. فقط Administrator می‌تواند آن‌ها را اجرا کند و بعد از موفقیت پیام دستور حذف می‌شود.
 
-`SUPABASE_SERVICE_ROLE_KEY` فقط روی VPS باشد و هرگز داخل کد فرانت‌اند یا جای عمومی قرار نگیرد.
-
-## نقش‌های خودکار
-
-بات در هر سرور این نقش‌ها را در صورت نبودن می‌سازد:
-
-- Giveaway Access
-- Ticket Access
-- Ban/Kick Access
-- Logs
-- Exchange
-
-Administrator همیشه دسترسی مدیریتی دارد.
-
-## تنظیم کانال‌ها
-
-تمام `setch...` ها Text Command هستند و بعد از موفقیت، پیام تنظیمات حذف می‌شود؛ مثال:
-
+نمونه:
 `setcht #ticket-logs`
-
 `setchm #message-logs`
+`setchg #giveaway-create #giveaway-winner #drop-create #drop-winner`
 
-`setchwel #welcome`
+## Slash Commands
+Giveaway/Drop: `/giveaway` `/giveawaysv` `/dropmatn` `/dropclick`
 
-`setchinv #invites`
+Ticket: `/panel` `/menu` `/claim` `/claimchange` `/add` `/remove` `/close` `/reopen` `/stats`
 
-## Ticket
+Staff: `/hire` `/setrole` `/rankup` `/rankdown` `/demote` `/setrolee` `/warnstaff`
 
-ساخت Panel با `/panel`، انتخاب دسته با `/Menu`، Claim، Claim Change، Add، Close و Reopen در معماری Supabase ذخیره می‌شوند. Ticketها در DB باقی می‌مانند تا بعداً قابل بازگشایی/گزارش‌گیری باشند.
+Moderation: `/setfosh` `/deletefosh` `/whiteuser` `/kick` `/ban` `/timeout` `/warn`
 
-## نکته
+Welcome/Invite: `/settextwel` `/settextinc`
 
-این اسکلت V5 است و ساختار Supabase و هسته قابلیت‌ها را آماده می‌کند؛ برای استفاده production باید قبل از انتشار نهایی، همه permission overwriteها، transcript، DM feedback، invite cache و تمام فرم‌های Ticket Tool-style تست شوند.
+Exchange: `/setex` `/exchange` `/setbanner` `/banner`
+
+XP: `/setrolexp` `/leaderboard` `/level` `/settextxp` `/setxp` (و `setchlevel` به صورت text command)
+
+Owner: `/textowner` `/createcmd`
+
+### Staff role setup
+`/setrole` را با mention رول‌ها اجرا کن، مثلاً: `/setrole roles:@Staff1 @Staff2 @Staff3`.
+`/setrolee` هم Rank را با `/setrole` انتخاب می‌کند و رول‌های اضافه را با mention دریافت می‌کند.
+Staffهای hired شده رول `Staff Acces` را نیز دریافت می‌کنند.
+
+### Discord command naming
+Discord slash command names باید lowercase باشند؛ بنابراین چیزی که در متن شما `/Giveawaysv` یا `/Menu` نوشته شده بود، در Discord به صورت `/giveawaysv` و `/menu` ثبت می‌شود.

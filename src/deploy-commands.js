@@ -1,33 +1,43 @@
 require('dotenv').config();
-const { REST, Routes, SlashCommandBuilder, PermissionFlagsBits, ChannelType } = require('discord.js');
+const { REST, Routes, SlashCommandBuilder, ChannelType } = require('discord.js');
+const cmds=[];
+const add=(c)=>cmds.push(c);
+add(new SlashCommandBuilder().setName('giveaway').setDescription('Giveaway').addStringOption(o=>o.setName('prize').setDescription('Prize').setRequired(true)).addIntegerOption(o=>o.setName('minutes').setDescription('Minutes').setRequired(true)));
+add(new SlashCommandBuilder().setName('giveawaysv').setDescription('Giveaway with link').addStringOption(o=>o.setName('prize').setDescription('Prize').setRequired(true)).addIntegerOption(o=>o.setName('minutes').setDescription('Minutes').setRequired(true)).addStringOption(o=>o.setName('link').setDescription('URL').setRequired(true)));
+add(new SlashCommandBuilder().setName('dropmatn').setDescription('Text drop').addStringOption(o=>o.setName('text').setDescription('Winning text').setRequired(true)));
+add(new SlashCommandBuilder().setName('dropclick').setDescription('Click drop'));
+const panel=new SlashCommandBuilder().setName('panel').setDescription('Create ticket panel').addStringOption(o=>o.setName('name').setDescription('Panel name').setRequired(true)).addStringOption(o=>o.setName('text').setDescription('First panel text')).addStringOption(o=>o.setName('welcome').setDescription('Ticket welcome')).addRoleOption(o=>o.setName('mention_role').setDescription('Role to mention')).addChannelOption(o=>o.setName('category').setDescription('Ticket category').addChannelTypes(ChannelType.GuildCategory)).addBooleanOption(o=>o.setName('claim').setDescription('Claim button')).addBooleanOption(o=>o.setName('close').setDescription('Close button'));
+for(let i=1;i<=5;i++) panel.addStringOption(o=>o.setName(`q${i}`).setDescription(`Form question ${i}`)); add(panel);
+add(new SlashCommandBuilder().setName('menu').setDescription('Create ticket dropdown menu'));
+add(new SlashCommandBuilder().setName('claim').setDescription('Claim ticket'));
+add(new SlashCommandBuilder().setName('claimchange').setDescription('Transfer claim').addUserOption(o=>o.setName('user').setDescription('New claimant').setRequired(true)));
+add(new SlashCommandBuilder().setName('add').setDescription('Add user to ticket').addUserOption(o=>o.setName('user').setDescription('User').setRequired(true)));
+add(new SlashCommandBuilder().setName('remove').setDescription('Remove user from ticket').addUserOption(o=>o.setName('user').setDescription('User').setRequired(true)));
+add(new SlashCommandBuilder().setName('close').setDescription('Close ticket'));
+add(new SlashCommandBuilder().setName('reopen').setDescription('Reopen ticket'));
+add(new SlashCommandBuilder().setName('stats').setDescription('Save channel for hourly claim stats'));
+add(new SlashCommandBuilder().setName('hire').setDescription('Hire staff').addUserOption(o=>o.setName('user').setDescription('Member').setRequired(true)).addIntegerOption(o=>o.setName('rank').setDescription('Rank position').setRequired(true).setMinValue(1)));
+add(new SlashCommandBuilder().setName('setrole').setDescription('Set staff rank roles; mention roles in order').addStringOption(o=>o.setName('roles').setDescription('Mention roles in order: @role1 @role2 ...').setRequired(true)));
+add(new SlashCommandBuilder().setName('rankup').setDescription('Rank up staff').addUserOption(o=>o.setName('user').setDescription('Staff').setRequired(true)));
+add(new SlashCommandBuilder().setName('rankdown').setDescription('Rank down staff').addUserOption(o=>o.setName('user').setDescription('Staff').setRequired(true)));
+add(new SlashCommandBuilder().setName('demote').setDescription('Demote staff').addUserOption(o=>o.setName('user').setDescription('Staff').setRequired(true)));
+add(new SlashCommandBuilder().setName('setrolee').setDescription('Set extra roles for a rank').addIntegerOption(o=>o.setName('rank').setDescription('Rank').setRequired(true).setMinValue(1)).addStringOption(o=>o.setName('roles').setDescription('Mention roles: @role1 @role2 ...').setRequired(true)));
+add(new SlashCommandBuilder().setName('warnstaff').setDescription('Warn staff').addUserOption(o=>o.setName('user').setDescription('Staff').setRequired(true)).addStringOption(o=>o.setName('reason').setDescription('Reason')));
+add(new SlashCommandBuilder().setName('setfosh').setDescription('Add profanity words').addStringOption(o=>o.setName('words').setDescription('Comma separated').setRequired(true)));
+add(new SlashCommandBuilder().setName('deletefosh').setDescription('Delete profanity words').addStringOption(o=>o.setName('words').setDescription('Comma separated').setRequired(true)));
+add(new SlashCommandBuilder().setName('whiteuser').setDescription('Whitelist user').addUserOption(o=>o.setName('user').setDescription('User').setRequired(true)));
+for(const n of ['kick','ban','timeout','warn']) add(new SlashCommandBuilder().setName(n).setDescription(n).addUserOption(o=>o.setName('user').setDescription('Member').setRequired(true)).addStringOption(o=>o.setName('reason').setDescription('Reason')));
+add(new SlashCommandBuilder().setName('setrolexp').setDescription('Set XP role').addIntegerOption(o=>o.setName('level').setDescription('Level').setRequired(true)).addRoleOption(o=>o.setName('role').setDescription('Role').setRequired(true)));
+add(new SlashCommandBuilder().setName('setxp').setDescription('Give XP').addUserOption(o=>o.setName('user').setDescription('User').setRequired(true)).addIntegerOption(o=>o.setName('amount').setDescription('XP').setRequired(true)));
+add(new SlashCommandBuilder().setName('leaderboard').setDescription('XP leaderboard'));
+add(new SlashCommandBuilder().setName('level').setDescription('Show your XP level'));
+add(new SlashCommandBuilder().setName('settextwel').setDescription('Set welcome text').addStringOption(o=>o.setName('text').setDescription('Text with [user] [Number]').setRequired(true)));
+add(new SlashCommandBuilder().setName('settextinc').setDescription('Set invite text').addStringOption(o=>o.setName('text').setDescription('Text with [user] [inv] [invnum]').setRequired(true)));
+add(new SlashCommandBuilder().setName('setex').setDescription('Set exchange channel').addChannelOption(o=>o.setName('channel').setDescription('Channel').addChannelTypes(ChannelType.GuildText).setRequired(true)));
+add(new SlashCommandBuilder().setName('exchange').setDescription('Open exchange form'));
+add(new SlashCommandBuilder().setName('setbanner').setDescription('Set server banner URL/text').addStringOption(o=>o.setName('banner').setDescription('Banner URL or text').setRequired(true)));
+add(new SlashCommandBuilder().setName('banner').setDescription('Show server banner'));
+add(new SlashCommandBuilder().setName('textowner').setDescription('Set owner relay channel').addChannelOption(o=>o.setName('channel').setDescription('Channel').setRequired(true)));
+add(new SlashCommandBuilder().setName('createcmd').setDescription('Create owner custom command').addStringOption(o=>o.setName('keyword').setDescription('Keyword').setRequired(true)).addStringOption(o=>o.setName('text').setDescription('Text').setRequired(true)));
 
-const cmds = [
-  new SlashCommandBuilder().setName('giveaway').setDescription('Create a giveaway').addStringOption(o=>o.setName('prize').setDescription('Prize').setRequired(true)).addIntegerOption(o=>o.setName('minutes').setDescription('Duration in minutes').setMinValue(1).setRequired(true)),
-  new SlashCommandBuilder().setName('giveawaysv').setDescription('Create a giveaway with a link').addStringOption(o=>o.setName('prize').setDescription('Prize').setRequired(true)).addIntegerOption(o=>o.setName('minutes').setDescription('Duration in minutes').setMinValue(1).setRequired(true)).addStringOption(o=>o.setName('link').setDescription('Link').setRequired(true)),
-  new SlashCommandBuilder().setName('dropmatn').setDescription('Create a text drop').addStringOption(o=>o.setName('text').setDescription('Winning text').setRequired(true)),
-  new SlashCommandBuilder().setName('dropclick').setDescription('Create a click drop'),
-  new SlashCommandBuilder().setName('panel').setDescription('Create a ticket panel').addStringOption(o=>o.setName('name').setDescription('Panel name').setRequired(true)).addStringOption(o=>o.setName('welcome').setDescription('Welcome text')).addChannelOption(o=>o.setName('category').setDescription('Ticket category').addChannelTypes(ChannelType.GuildCategory)).addRoleOption(o=>o.setName('role').setDescription('Role to mention in tickets')),
-  new SlashCommandBuilder().setName('menu').setDescription('Show the ticket menu'),
-  new SlashCommandBuilder().setName('claim').setDescription('Claim the current ticket'),
-  new SlashCommandBuilder().setName('claimchange').setDescription('Change ticket claimant').addUserOption(o=>o.setName('user').setDescription('New claimant').setRequired(true)),
-  new SlashCommandBuilder().setName('add').setDescription('Add a user to the current ticket').addUserOption(o=>o.setName('user').setDescription('User').setRequired(true)),
-  new SlashCommandBuilder().setName('close').setDescription('Close the current ticket'),
-  new SlashCommandBuilder().setName('reopen').setDescription('Reopen the current ticket'),
-  new SlashCommandBuilder().setName('stats').setDescription('Set this channel as the hourly claim stats channel'),
-  ...['kick','ban','timeout','warn'].map(n=>new SlashCommandBuilder().setName(n).setDescription(n).addUserOption(o=>o.setName('user').setDescription('Member').setRequired(true)).addStringOption(o=>o.setName('reason').setDescription('Reason'))),
-  new SlashCommandBuilder().setName('level').setDescription('Show your level'),
-  new SlashCommandBuilder().setName('leaderboard').setDescription('Show XP leaderboard'),
-  new SlashCommandBuilder().setName('setrolexp').setDescription('Set a role reward for an XP level').addIntegerOption(o=>o.setName('level').setDescription('Level').setMinValue(1).setRequired(true)).addRoleOption(o=>o.setName('role').setDescription('Role').setRequired(true)),
-  new SlashCommandBuilder().setName('setxp').setDescription('Give XP to a user').addUserOption(o=>o.setName('user').setDescription('User').setRequired(true)).addIntegerOption(o=>o.setName('amount').setDescription('XP amount').setRequired(true)),
-  new SlashCommandBuilder().setName('exchange').setDescription('Open the exchange form'),
-  new SlashCommandBuilder().setName('banner').setDescription('Show the server banner text'),
-  new SlashCommandBuilder().setName('textowner').setDescription('Set this channel as the owner relay channel'),
-  new SlashCommandBuilder().setName('createcmd').setDescription('Create a custom text command').addStringOption(o=>o.setName('keyword').setDescription('Keyword without /').setRequired(true)).addStringOption(o=>o.setName('text').setDescription('Response text').setRequired(true))
-];
-
-(async()=>{
-  if(!process.env.DISCORD_TOKEN || !process.env.CLIENT_ID || !process.env.GUILD_ID) throw new Error('DISCORD_TOKEN, CLIENT_ID and GUILD_ID are required.');
-  const rest=new REST({version:'10'}).setToken(process.env.DISCORD_TOKEN);
-  await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID,process.env.GUILD_ID),{body:cmds.map(x=>x.toJSON())});
-  console.log(`Commands deployed: ${cmds.length}`);
-})().catch(err=>{ console.error(err); process.exit(1); });
+(async()=>{ const rest=new REST({version:'10'}).setToken(process.env.DISCORD_TOKEN); await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID,process.env.GUILD_ID),{body:cmds.map(x=>x.toJSON())}); console.log(`Deployed ${cmds.length} commands.`); })().catch(e=>{console.error(e);process.exit(1)});
