@@ -413,7 +413,7 @@ client.on('interactionCreate',async interaction=>{
           new ButtonBuilder().setCustomId(`exreject:${e.id}`).setLabel('DECLINE').setStyle(ButtonStyle.Danger)
         );
         try{
-          await logChannel.send({content:`${mentions}\n📥 **Exchange Request**\nUser: <@${interaction.user.id}>\n\n${banner}`,components:[row],allowedMentions:{users:[...logMentionUsers,interaction.user.id],parse:[]}});
+          await logChannel.send({content:`${mentions}\n📥 **Exchange Request**\nUser: <@${interaction.user.id}>\n\n${banner}`,components:[row],allowedMentions:{users:[...new Set([...logMentionUsers, interaction.user.id])],parse:[]}});
         }catch(err){
           console.error('exchange log send error:',err);
           await supabase.from('exchange_requests').delete().eq('id',e.id);
