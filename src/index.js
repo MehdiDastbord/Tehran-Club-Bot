@@ -160,7 +160,7 @@ async function flushGuildLogs(guild,force=false){
     return {sent:true,count:rows.length};
   }catch(error){
     console.error('log flush error:',error?.message||error);
-    return {sent:false,reason:'send-failed'};
+    return {sent:false,reason:'send-failed',error:error?.message||String(error)};
   }finally{ logFlushRunning=false; }
 }
 
@@ -188,10 +188,21 @@ const SETCH = {
 };
 
 async function protectLogChannel(guild, channelId){
-  const ch=guild.channels.cache.get(channelId); if(!ch?.permissionOverwrites) return;
+  const ch=guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(()=>null);
+  if(!ch?.permissionOverwrites) return;
   const role=await ensureRole(guild,ACCESS.logs);
-  await ch.permissionOverwrites.edit(guild.roles.everyone.id,{ViewChannel:false,SendMessages:false}).catch(()=>{});
-  await ch.permissionOverwrites.edit(role.id,{ViewChannel:true,ReadMessageHistory:true,SendMessages:false}).catch(()=>{});
+  await ch.permissionOverwrites.edit(guild.roles.everyone.id,{
+    ViewChannel:false, SendMessages:false, EmbedLinks:false, ReadMessageHistory:false
+  }).catch(()=>{});
+  await ch.permissionOverwrites.edit(role.id,{
+    ViewChannel:true, ReadMessageHistory:true, SendMessages:false
+  }).catch(()=>{});
+  const botMember=guild.members.me || await guild.members.fetch(client.user.id).catch(()=>null);
+  if(botMember){
+    await ch.permissionOverwrites.edit(botMember.id,{
+      ViewChannel:true, ReadMessageHistory:true, SendMessages:true, EmbedLinks:true, AttachFiles:true
+    }).catch(err=>console.error('log channel bot permission error:',err?.message||err));
+  }
 }
 async function handleSetCh(message, parts){
   if(!message.guild || !isBotOwner(message.author.id)) return false;
@@ -1025,7 +1036,7 @@ client.on('interactionCreate',async interaction=>{
       const result=await flushGuildLogs(guild,true);
       if(result.reason==='not-configured') return interaction.editReply({content:'❌ ابتدا با `/setlogchannel` کانال لاگ را تنظیم کنید.'});
       if(result.reason==='invalid-channel') return interaction.editReply({content:'❌ کانال لاگ معتبر نیست یا دیگر وجود ندارد.'});
-      if(!result.sent) return interaction.editReply({content:'❌ ارسال گزارش لاگ انجام نشد. دسترسی Send Messages و Embed Links کانال را بررسی کنید.'});
+      if(!result.sent) return interaction.editReply({content:`❌ ارسال گزارش لاگ انجام نشد.\nدلیل: ${result.error || result.reason || 'خطای نامشخص'}\n\nدسترسی‌های موردنیاز بات: View Channel, Send Messages, Embed Links, Read Message History.`});
       return interaction.editReply({content:`✅ گزارش لاگ ارسال شد (${result.count} مورد) و زمان گزارش بعدی روی ۶ ساعت بعد تنظیم شد.`});
     }
     if(commandName==='setexlog'){ if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); const ch=interaction.options.getChannel('channel'); await setSettings(guild.id,{exchange_log_channel:ch.id}); return interaction.reply({content:`Exchange Log روی ${ch} تنظیم شد.`}); }
