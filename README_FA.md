@@ -50,17 +50,8 @@
 
 ## Staff
 دستورات Staff فقط با رول `Staff Manager`:
-- `/hire`
-- `/setrole`
-- `/setrolee`
-- `/rankup`
-- `/rankdown`
-- `/demote`
-- `/warnstaff`
-- `/unwarnst`
 - `/stats`
 
-Hire قبل از ثبت Staff، امکان اضافه‌کردن Role را بررسی می‌کند و خطای دیتابیس را پنهان نمی‌کند. اگر عضوی Role رنک Staff را داشته باشد ولی رکورد Staff او ناقص باشد، هنگام دستورات Staff قابل بازیابی است.
 
 ## Moderation
 - `/kick`
@@ -77,15 +68,11 @@ Hire قبل از ثبت Staff، امکان اضافه‌کردن Role را بر�
 `setfosh` می‌تواند چند کلمه را با کاما بگیرد. پیام دارای کلمه تنظیم‌شده حذف می‌شود و یک Warn در همان جدول Warn ممبر ثبت می‌شود. در 3 Warn، Timeout دو ساعته اعمال می‌شود.
 
 `/unwarn` آخرین Warn ممبر را حذف می‌کند.
-`/unwarnst` آخرین Warn Staff را حذف می‌کند.
 
 ## Logs
 `setch...`ها طبق نسخه قبلی Text Command هستند و بعد از اجرای موفق، پیام دستور حذف می‌شود:
 - `setcht`
 - `setchfead`
-- `setchru`
-- `setchhi`
-- `setchstw`
 - `setchm`
 - `setchb`
 - `setchto`
