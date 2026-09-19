@@ -113,14 +113,113 @@ async function logTo(guild,key,text){
   if(error) console.error('log queue error:',error.message);
 }
 
-function formatLogSection(section, rows){
-  const lines=rows.map(r=>{
+function formatLogSection(section, rows, total){
+  const shown=rows.slice(-8);
+  const lines=shown.map(r=>{
     const stamp=r.created_at ? new Date(r.created_at).toLocaleString('en-GB',{timeZone:'Asia/Dubai',hour12:false}) : '';
     return `• ${stamp} — ${String(r.content||'').replace(/\n/g,'\n  ')}`;
   });
-  let value=lines.join('\n');
+  let value=`**تعداد کل: ${total}**`;
+  if(shown.length) value+=`\n${lines.join('\n')}`;
+  else value+='\n—';
   if(value.length>1000) value=value.slice(0,997)+'...';
-  return value || '—';
+  return value;
+}
+
+async function fetchAllLogRows(guildId){
+  const all=[];
+  const pageSize=1000;
+  for(let from=0;;from+=pageSize){
+    const {data,error}=await supabase.from('log_queue')
+      .select('id,section,content,created_at')
+      .eq('guild_id',guildId)
+      .order('created_at',{ascending:true})
+      .range(from,from+pageSize-1);
+    if(error) return {rows:null,error};
+    if(data?.length) all.push(...data);
+    if(!data || data.length<pageSize) break;
+  }
+  return {rows:all,error:null};
+}
+
+async function fetchTicketPerformance(guildId){
+  const {data:tickets,error:ticketError}=await supabase.from('tickets')
+    .select('id,claimed_by,opener_id,status')
+    .eq('guild_id',guildId);
+  if(ticketError) return {error:ticketError};
+  const staff=new Map();
+  let totalTickets=0, claimedTickets=0, unclaimedTickets=0;
+  const claimHistoryResult=await supabase.from('ticket_claim_history').select('ticket_id,user_id,action').eq('guild_id',guildId);
+  const claimHistory=claimHistoryResult.error ? [] : (claimHistoryResult.data||[]);
+  const historyTicketIds=new Set(claimHistory.map(h=>String(h.ticket_id)));
+  for(const t of tickets||[]){
+    totalTickets++;
+    if(t.claimed_by){
+      claimedTickets++;
+      // Backfill old tickets that were claimed before claim history existed.
+      if(!historyTicketIds.has(String(t.id))){
+        const id=String(t.claimed_by);
+        const row=staff.get(id)||{claims:0,ratings:0,stars:0,counts:{1:0,2:0,3:0,4:0,5:0}};
+        row.claims++;
+        staff.set(id,row);
+      }
+    }else unclaimedTickets++;
+  }
+
+  for(const h of claimHistory){
+    if(!h.user_id) continue;
+    const id=String(h.user_id);
+    const row=staff.get(id)||{claims:0,ratings:0,stars:0,counts:{1:0,2:0,3:0,4:0,5:0}};
+    row.claims++;
+    staff.set(id,row);
+  }
+
+  const ticketIds=(tickets||[]).map(t=>t.id).filter(Boolean);
+  const feedback=[];
+  for(let i=0;i<ticketIds.length;i+=100){
+    const ids=ticketIds.slice(i,i+100);
+    if(!ids.length) continue;
+    const {data,error}=await supabase.from('ticket_feedback')
+      .select('ticket_id,user_id,claimed_by,stars,text')
+      .in('ticket_id',ids);
+    if(error) return {error};
+    if(data?.length) feedback.push(...data);
+  }
+  const ticketMap=new Map((tickets||[]).map(t=>[String(t.id),t]));
+  for(const f of feedback){
+    const t=ticketMap.get(String(f.ticket_id));
+    const claimer=f.claimed_by || t?.claimed_by;
+    if(!claimer) continue;
+    const id=String(claimer);
+    const row=staff.get(id)||{claims:0,ratings:0,stars:0,counts:{1:0,2:0,3:0,4:0,5:0}};
+    const stars=Number(f.stars);
+    if(!Number.isInteger(stars) || stars<1 || stars>5) continue;
+    row.ratings++; row.stars+=stars; row.counts[stars]=(row.counts[stars]||0)+1;
+    staff.set(id,row);
+  }
+  return {tickets:totalTickets,claimedTickets,unclaimedTickets,staff,feedbackCount:feedback.length,error:null};
+}
+
+async function buildTicketPerformanceFields(guildId){
+  const perf=await fetchTicketPerformance(guildId);
+  if(perf.error){
+    console.error('ticket performance error:',perf.error.message||perf.error);
+    return [{name:'👤 Ticket Staff Performance',value:'❌ آمار Claim/Rating خوانده نشد.\n'+String(perf.error.message||perf.error).slice(0,900)}];
+  }
+  const fields=[];
+  fields.push({name:'🎫 Ticket Summary',value:`**کل Ticket:** ${perf.tickets}\n**Claim شده:** ${perf.claimedTickets}\n**بدون Claim:** ${perf.unclaimedTickets}\n**Rating ثبت‌شده:** ${perf.feedbackCount}`});
+  const entries=[...perf.staff.entries()].sort((a,b)=>{
+    if(b[1].claims!==a[1].claims) return b[1].claims-a[1].claims;
+    return (b[1].ratings?b[1].stars/b[1].ratings:0)-(a[1].ratings?a[1].stars/a[1].ratings:0);
+  });
+  if(!entries.length){ fields.push({name:'👤 Ticket Staff Performance',value:'هنوز هیچ Ticket توسط Staff Claim نشده است.'}); return fields; }
+  for(const [id,row] of entries){
+    const avg=row.ratings ? (row.stars/row.ratings).toFixed(2) : '—';
+    const dist=`1⭐:${row.counts[1]||0} 2⭐:${row.counts[2]||0} 3⭐:${row.counts[3]||0} 4⭐:${row.counts[4]||0} 5⭐:${row.counts[5]||0}`;
+    fields.push({name:`👤 <@${id}>`,value:`**Claims:** ${row.claims}\n**Ratings:** ${row.ratings}\n**Average:** ${avg}/5 ⭐\n${dist}`.slice(0,1000)});
+    if(fields.length>=24) break;
+  }
+  return fields;
 }
 
 async function flushGuildLogs(guild,force=false){
@@ -130,8 +229,8 @@ async function flushGuildLogs(guild,force=false){
   if(!channelId) return {sent:false,reason:'not-configured'};
   const channel=guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(()=>null);
   if(!channel?.isTextBased()) return {sent:false,reason:'invalid-channel'};
-  const {data:rows,error}=await supabase.from('log_queue').select('id,section,content,created_at').eq('guild_id',guild.id).order('created_at',{ascending:true}).limit(500);
-  if(error){ console.error('log queue read error:',error.message); return {sent:false,reason:'database'}; }
+  const {rows,error}=await fetchAllLogRows(guild.id);
+  if(error){ console.error('log queue read error:',error.message); return {sent:false,reason:'database',error:error.message}; }
   if(!rows?.length && !force){
     await setSettings(guild.id,{next_log_flush_at:new Date(Date.now()+LOG_FLUSH_INTERVAL_MS).toISOString()});
     return {sent:false,reason:'empty'};
@@ -141,22 +240,27 @@ async function flushGuildLogs(guild,force=false){
   try{
     const grouped=new Map();
     for(const section of AGG_LOG_ORDER) grouped.set(section,[]);
-    for(const row of rows||[]) { if(!grouped.has(row.section)) grouped.set(row.section,[]); grouped.get(row.section).push(row); }
+    for(const row of rows||[]){ if(!grouped.has(row.section)) grouped.set(row.section,[]); grouped.get(row.section).push(row); }
     const embeds=[];
-    let embed=new EmbedBuilder().setTitle('📋 Tehran Club Logs').setDescription(`لاگ‌های جمع‌آوری‌شده • ${new Date().toLocaleString('en-GB',{timeZone:'Asia/Dubai',hour12:false})} (Dubai)`).setTimestamp();
+    let embed=new EmbedBuilder().setTitle('📋 Tehran Club Logs').setDescription(`گزارش تجمعی لاگ‌ها • ${new Date().toLocaleString('en-GB',{timeZone:'Asia/Dubai',hour12:false})} (Dubai)\n⚠️ لاگ‌ها دائمی هستند و با ارسال گزارش حذف یا Reset نمی‌شوند.`).setTimestamp();
     let fields=0;
     for(const [section,items] of grouped){
       if(!items.length) continue;
       if(fields>=25){ embeds.push(embed); embed=new EmbedBuilder().setTitle('📋 Tehran Club Logs (ادامه)').setTimestamp(); fields=0; }
-      embed.addFields({name:section,value:formatLogSection(section,items)}); fields++;
+      embed.addFields({name:section,value:formatLogSection(section,items,items.length)}); fields++;
+    }
+    const performanceFields=await buildTicketPerformanceFields(guild.id);
+    for(const f of performanceFields){
+      if(fields>=25){ embeds.push(embed); embed=new EmbedBuilder().setTitle('📋 Tehran Club Logs (ادامه)').setTimestamp(); fields=0; }
+      embed.addFields(f); fields++;
     }
     if(fields===0) embed.addFields({name:'📭 Logs',value:'در این بازه لاگی ثبت نشده است.'});
     embeds.push(embed);
 
-    // Discord allows multiple embeds in one message, so this remains exactly one Discord message.
     await channel.send({embeds:embeds.slice(0,10)});
-    if(rows?.length) await supabase.from('log_queue').delete().in('id',rows.map(r=>r.id));
-    await setSettings(guild.id,{next_log_flush_at:new Date(Date.now()+LOG_FLUSH_INTERVAL_MS).toISOString()});
+    // IMPORTANT: log_queue is an immutable history. Never delete rows after /sendlogs
+    // or after the automatic 6-hour report. This keeps all historical logs and counts.
+    await setSettings(guild.id,{next_log_flush_at:new Date(Date.now()+LOG_FLUSH_INTERVAL_MS).toISOString(),last_log_report_at:new Date().toISOString()});
     return {sent:true,count:rows.length};
   }catch(error){
     console.error('log flush error:',error?.message||error);
@@ -463,6 +567,7 @@ async function claimTicket(interaction,t){
   if(t.claimed_by) return interaction.reply({content:`این Ticket قبلاً توسط <@${t.claimed_by}> Claim شده است.`,ephemeral:true});
   const {data:claimed,error}=await supabase.from('tickets').update({claimed_by:interaction.user.id}).eq('id',t.id).eq('status','open').is('claimed_by',null).select('id,claimed_by').maybeSingle();
   if(error || !claimed) return interaction.reply({content:'❌ این Ticket همین الان توسط شخص دیگری Claim شد.',ephemeral:true});
+  await supabase.from('ticket_claim_history').insert({ticket_id:t.id,guild_id:interaction.guild.id,user_id:interaction.user.id,action:'claim'}).catch(err=>console.error('ticket claim history error:',err?.message||err));
   return interaction.reply({content:`🎫 Ticket توسط <@${interaction.user.id}> Claim شد.`,allowedMentions:{users:[interaction.user.id]}});
 }
 async function buildTranscript(interaction,t){
@@ -603,15 +708,15 @@ client.on('interactionCreate',async interaction=>{
         // Keep the channel alive for exactly 3 seconds after the delete action.
         await new Promise(resolve=>setTimeout(resolve,3000));
 
-        // Clean up the database before removing the Discord channel.
+        // IMPORTANT: keep the ticket row and feedback forever. The Discord channel
+        // can be deleted, but claim/rating history must remain available for the
+        // cumulative log report. Only transient ticket members/answers are removed.
         const cleanupResults=await Promise.all([
-          supabase.from('ticket_feedback').delete().eq('ticket_id',t.id),
           supabase.from('ticket_answers').delete().eq('ticket_id',t.id),
-          supabase.from('ticket_members').delete().eq('ticket_id',t.id),
-          supabase.from('tickets').delete().eq('id',t.id)
+          supabase.from('ticket_members').delete().eq('ticket_id',t.id)
         ]);
         for(const result of cleanupResults){
-          if(result?.error) console.error('ticket delete db error:',result.error);
+          if(result?.error) console.error('ticket delete cleanup error:',result);
         }
 
         try{
@@ -654,7 +759,7 @@ client.on('interactionCreate',async interaction=>{
         if(t.status!=='closed' || interaction.user.id!==t.opener_id) return interaction.reply({content:'این Feedback فقط برای صاحب تیکت بسته‌شده قابل ثبت است.',ephemeral:true});
         const {data:existingFeedback}=await supabase.from('ticket_feedback').select('id').eq('ticket_id',id).eq('user_id',interaction.user.id).maybeSingle();
         if(existingFeedback) return interaction.reply({content:'این Ticket قبلاً Rating شده است.',ephemeral:true});
-        const {error:feedbackInsertError}=await supabase.from('ticket_feedback').insert({ticket_id:id,user_id:interaction.user.id,stars});
+        const {error:feedbackInsertError}=await supabase.from('ticket_feedback').insert({ticket_id:id,user_id:interaction.user.id,claimed_by:t.claimed_by||null,stars});
         if(feedbackInsertError){ console.error('feedback insert error:',feedbackInsertError); return interaction.reply({content:'❌ ذخیره Rating انجام نشد. دوباره تلاش کنید.',ephemeral:true}); }
         await logTo(interaction.guild,'ticket_feedback_channel',`⭐ Ticket Feedback | ${interaction.user.tag} | ${stars}/5 | Ticket ${id}`);
         const modal=new ModalBuilder().setCustomId(`feedbackmodal:${id}:${stars}`).setTitle(`${stars} ستاره`).addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('feedback').setLabel('نظر شما').setStyle(TextInputStyle.Paragraph).setRequired(false)));
@@ -934,7 +1039,10 @@ client.on('interactionCreate',async interaction=>{
     if(commandName==='claim'){ const t=await getTicket(interaction.channel); if(!t) return interaction.reply({content:'Ticket نیست.',ephemeral:true}); return claimTicket(interaction,t); }
     if(commandName==='claimchange'){
       const t=await getTicket(interaction.channel); if(!t||!isTicketStaff(interaction.member)) return interaction.reply({content:'دسترسی یا Ticket ندارید.',ephemeral:true}); const u=interaction.options.getUser('user');
-      await supabase.from('tickets').update({claimed_by:u.id}).eq('id',t.id); return interaction.reply({content:`Claim به <@${u.id}> منتقل شد.`,allowedMentions:{users:[u.id]}});
+      const {error:claimChangeError}=await supabase.from('tickets').update({claimed_by:u.id}).eq('id',t.id);
+      if(claimChangeError) return interaction.reply({content:`❌ تغییر Claim انجام نشد: ${claimChangeError.message}`,ephemeral:true});
+      await supabase.from('ticket_claim_history').insert({ticket_id:t.id,guild_id:guild.id,user_id:u.id,action:'claimchange',changed_by:interaction.user.id}).catch(err=>console.error('ticket claim history error:',err?.message||err));
+      return interaction.reply({content:`Claim به <@${u.id}> منتقل شد.`,allowedMentions:{users:[u.id]}});
     }
     if(commandName==='add'||commandName==='remove'){
       const t=await getTicket(interaction.channel); if(!t||!isTicketStaff(interaction.member)) return interaction.reply({content:'دسترسی یا Ticket ندارید.',ephemeral:true}); const u=interaction.options.getUser('user');
