@@ -218,18 +218,75 @@ function closedTicketRows(ticketId){
     new ButtonBuilder().setCustomId(`ticketreopen:${ticketId}`).setLabel('Reopen').setStyle(ButtonStyle.Success)
   )];
 }
-function panelLabel(p){
-  const t=TICKET_TYPES[p.panel_type];
-  return t ? `${t.emoji} ${t.label}` : String(p.name||'Ticket Panel').slice(0,100);
+function defaultPanelTypes(panel){
+  const meta=TICKET_TYPES[panel.panel_type];
+  return [{
+    name: meta?.label || String(panel.name || 'Ticket').slice(0,80),
+    emoji: meta?.emoji || panel.button_emoji || '🎫',
+    prefix: meta?.prefix || slugifyTicketType(panel.name || 'ticket')
+  }];
 }
-function panelTicketName(panel,user){
-  const type=TICKET_TYPES[panel.panel_type] || {prefix:'ticket'};
+function slugifyTicketType(value){
+  const slug=String(value||'ticket').toLowerCase().trim()
+    .replace(/[^a-z0-9\s_-]/g,'')
+    .replace(/[\s_]+/g,'-')
+    .replace(/-+/g,'-')
+    .replace(/^-|-$/g,'')
+    .slice(0,50);
+  return slug || 'ticket';
+}
+function getPanelTypes(panel){
+  if(Array.isArray(panel?.ticket_types) && panel.ticket_types.length) return panel.ticket_types;
+  return defaultPanelTypes(panel);
+}
+function selectedPanelType(panel,index){
+  const types=getPanelTypes(panel);
+  return types[Number(index)] || types[0] || {name:'Ticket',emoji:'🎫',prefix:'ticket'};
+}
+function panelLabel(p){
+  const types=getPanelTypes(p);
+  const first=types[0];
+  return first ? `${first.emoji || '🎫'} ${first.name}` : String(p.name||'Ticket Panel').slice(0,100);
+}
+function panelTicketName(panel,user,index=0){
+  const type=selectedPanelType(panel,index);
   const safeUser=String(user.username||'user').toLowerCase().replace(/[^a-z0-9-_]/g,'-').replace(/-+/g,'-').slice(0,70)||'user';
-  return `${type.prefix}-${safeUser}`.slice(0,100);
+  return `${slugifyTicketType(type.prefix || type.name)}-${safeUser}`.slice(0,100);
+}
+function buildPanelComponents(panel){
+  const types=getPanelTypes(panel).slice(0,25);
+  if(types.length<=5){
+    const row=new ActionRowBuilder();
+    types.forEach((t,i)=>{
+      const b=new ButtonBuilder().setCustomId(`openpanel:${panel.id}:${i}`).setLabel(String(t.name||`Ticket ${i+1}`).slice(0,80)).setStyle(ButtonStyle.Primary);
+      safeEmoji(b,t.emoji);
+      row.addComponents(b);
+    });
+    return [row];
+  }
+  const menu=new StringSelectMenuBuilder().setCustomId(`ticketmenu:${panel.id}`).setPlaceholder('نوع تیکت را انتخاب کنید').addOptions(types.map((t,i)=>({
+    label:String(t.name||`Ticket ${i+1}`).slice(0,100),
+    value:`${panel.id}:${i}`,
+    description:`باز کردن تیکت ${String(t.name||'').slice(0,90)}`,
+    ...(t.emoji ? {emoji:t.emoji} : {})
+  })));
+  return [new ActionRowBuilder().addComponents(menu)];
+}
+async function refreshTicketPanelMessage(guild,panel){
+  if(!panel?.channel_id || !panel?.message_id) return false;
+  const ch=guild.channels.cache.get(panel.channel_id) || await guild.channels.fetch(panel.channel_id).catch(()=>null);
+  const msg=ch ? await ch.messages.fetch(panel.message_id).catch(()=>null) : null;
+  if(!msg) return false;
+  const types=getPanelTypes(panel);
+  const first=types[0] || {emoji:'🎫',name:panel.name||'Ticket'};
+  const embed=new EmbedBuilder().setTitle(`${first.emoji || '🎫'} ${panel.name || first.name}`.slice(0,256)).setDescription(String(panel.description||'برای باز کردن تیکت، نوع موردنظر را انتخاب کنید.').slice(0,4096)).setFooter({text:`Panel #${panel.panel_number} • ${types.length} نوع تیکت`});
+  await msg.edit({embeds:[embed],components:buildPanelComponents(panel)});
+  return true;
 }
 async function createTicket(interaction,panel,answers={}){
-  const existing=await supabase.from('tickets').select('id,channel_id').eq('guild_id',interaction.guild.id).eq('opener_id',interaction.user.id).eq('status','open').maybeSingle();
-  if(existing.data) return interaction.reply({content:`تیکت فعال داری: <#${existing.data.channel_id}>`,ephemeral:true});
+  // Multiple users (and multiple tickets) may open tickets at the same time.
+  // There is intentionally NO global/per-user "one open ticket" lock here.
+  // Discord channel creation + the Supabase ticket row are independent per ticket.
   const cat=panel.category_id && interaction.guild.channels.cache.get(panel.category_id)?.type===ChannelType.GuildCategory ? panel.category_id : undefined;
   const ticketRole=interaction.guild.roles.cache.find(r=>r.name===TICKET_SUPPORT_ROLE) || await ensureRole(interaction.guild,TICKET_SUPPORT_ROLE).catch(()=>null);
   if(!ticketRole) return interaction.reply({content:'❌ Role `Tickets Support` پیدا نشد و بات اجازه ساخت آن را ندارد. Role/Manage Roles permission را بررسی کنید.',ephemeral:true});
@@ -240,7 +297,7 @@ async function createTicket(interaction,panel,answers={}){
   ];
   let channel;
   try{
-    channel=await interaction.guild.channels.create({name:panelTicketName(panel,interaction.user),type:ChannelType.GuildText,parent:cat,permissionOverwrites:overwrites,reason:`Ticket ${panel.panel_type||'custom'} opened by ${interaction.user.tag}`});
+    channel=await interaction.guild.channels.create({name:panelTicketName(panel,interaction.user,panel._typeIndex||0),type:ChannelType.GuildText,parent:cat,permissionOverwrites:overwrites,reason:`Ticket ${selectedPanelType(panel,panel._typeIndex||0).name||panel.panel_type||'custom'} opened by ${interaction.user.tag}`});
   }catch(error){
     console.error('ticket channel create error:',error);
     return interaction.reply({content:`❌ ساخت کانال Ticket انجام نشد: ${error?.message||error}`,ephemeral:true});
@@ -250,7 +307,7 @@ async function createTicket(interaction,panel,answers={}){
   if(Object.keys(answers).length) { const {error:aerr}=await supabase.from('ticket_answers').insert({ticket_id:t.id,answers}); if(aerr) console.error('ticket answers insert error:',aerr); }
   const welcome=placeholders(panel.welcome_text||'سلام [user]، تیکت شما ایجاد شد.',interaction.member,interaction.guild);
   await channel.send({content:`<@&${ticketRole.id}> <@${interaction.user.id}>\n${welcome}`,components:ticketRows(t.id,panel),allowedMentions:{users:[interaction.user.id],roles:[ticketRole.id]}});
-  await logTo(interaction.guild,'ticket_log_channel',`🎫 Ticket ایجاد شد | ${panelTicketName(panel,interaction.user)} | ${interaction.user.tag}`);
+  await logTo(interaction.guild,'ticket_log_channel',`🎫 Ticket ایجاد شد | ${panelTicketName(panel,interaction.user,panel._typeIndex||0)} | ${interaction.user.tag}`);
   return interaction.reply({content:`تیکت ساخته شد: ${channel}`,ephemeral:true});
 }
 async function getTicket(ch){ return (await supabase.from('tickets').select('*').eq('channel_id',ch.id).maybeSingle()).data; }
@@ -336,8 +393,10 @@ client.on('interactionCreate',async interaction=>{
       if(type==='openpanel'){
         const panel=(await supabase.from('ticket_panels').select('*').eq('id',id).maybeSingle()).data;
         if(!panel) return interaction.reply({content:'Panel پیدا نشد.',ephemeral:true});
+        const typeIndex=Number.isInteger(Number(extra)) ? Number(extra) : 0;
+        panel._typeIndex=typeIndex;
         if(panel.form_enabled && panel.form_questions?.length){
-          const modal=new ModalBuilder().setCustomId(`ticketform:${panel.id}`).setTitle(`فرم ${String(panel.name).slice(0,40)}`);
+          const modal=new ModalBuilder().setCustomId(`ticketform:${panel.id}:${typeIndex}`).setTitle(`فرم ${String(selectedPanelType(panel,typeIndex).name||panel.name).slice(0,40)}`);
           for(let i=0;i<Math.min(5,panel.form_questions.length);i++) modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId(`q${i}`).setLabel(String(panel.form_questions[i]).slice(0,45)).setStyle(TextInputStyle.Paragraph).setRequired(false)));
           return interaction.showModal(modal);
         }
@@ -387,12 +446,37 @@ client.on('interactionCreate',async interaction=>{
       if(type==='ticketdelete'){
         if(!isTicketStaff(interaction.member)) return interaction.reply({content:'فقط Tickets Support می‌تواند Ticket را حذف کند.',ephemeral:true});
         const t=await getTicket(interaction.channel); if(!t || t.id!==id) return interaction.reply({content:'Ticket پیدا نشد.',ephemeral:true});
-        await interaction.reply({content:'🗑️ Ticket در حال حذف است...',ephemeral:true});
-        await supabase.from('ticket_feedback').delete().eq('ticket_id',t.id).catch(()=>{});
-        await supabase.from('ticket_answers').delete().eq('ticket_id',t.id).catch(()=>{});
-        await supabase.from('ticket_members').delete().eq('ticket_id',t.id).catch(()=>{});
-        await supabase.from('tickets').delete().eq('id',t.id).catch(err=>console.error('ticket delete db error:',err));
-        return interaction.channel.delete(`Ticket deleted by ${interaction.user.tag}`).catch(err=>console.error('ticket channel delete error:',err));
+
+        // Prevent two staff members from triggering the same deletion at once.
+        if(interaction.channel.__ticketDeleteScheduled) {
+          return interaction.reply({content:'🗑️ حذف این Ticket قبلاً زمان‌بندی شده است.',ephemeral:true});
+        }
+        interaction.channel.__ticketDeleteScheduled=true;
+
+        await interaction.reply({content:'🗑️ Ticket در 3 ثانیه حذف می‌شود...',ephemeral:true});
+
+        // Keep the channel alive for exactly 3 seconds after the delete action.
+        await new Promise(resolve=>setTimeout(resolve,3000));
+
+        // Clean up the database before removing the Discord channel.
+        const cleanupResults=await Promise.all([
+          supabase.from('ticket_feedback').delete().eq('ticket_id',t.id),
+          supabase.from('ticket_answers').delete().eq('ticket_id',t.id),
+          supabase.from('ticket_members').delete().eq('ticket_id',t.id),
+          supabase.from('tickets').delete().eq('id',t.id)
+        ]);
+        for(const result of cleanupResults){
+          if(result?.error) console.error('ticket delete db error:',result.error);
+        }
+
+        try{
+          await interaction.channel.delete(`Ticket deleted by ${interaction.user.tag}`);
+        }catch(err){
+          console.error('ticket channel delete error:',err);
+          // If Discord temporarily failed, allow another click/retry instead of leaving the handler locked.
+          interaction.channel.__ticketDeleteScheduled=false;
+        }
+        return;
       }
       if(type==='transcript'){
         if(!isTicketStaff(interaction.member)) return interaction.reply({content:'فقط Tickets Support می‌تواند Transcript بگیرد.',ephemeral:true});
@@ -432,11 +516,13 @@ client.on('interactionCreate',async interaction=>{
       }
     }
     if(interaction.isStringSelectMenu()){
-      if(interaction.customId==='ticketmenu'){
-        const panel=(await supabase.from('ticket_panels').select('*').eq('id',interaction.values[0]).maybeSingle()).data;
+      if(interaction.customId==='ticketmenu' || interaction.customId.startsWith('ticketmenu:')){
+        const [panelId,typeIndexRaw]=String(interaction.values[0]||'').split(':');
+        const panel=(await supabase.from('ticket_panels').select('*').eq('id',panelId).maybeSingle()).data;
         if(!panel) return interaction.reply({content:'Panel پیدا نشد.',ephemeral:true});
+        const typeIndex=Number(typeIndexRaw)||0; panel._typeIndex=typeIndex;
         if(panel.form_enabled && panel.form_questions?.length){
-          const modal=new ModalBuilder().setCustomId(`ticketform:${panel.id}`).setTitle(`فرم ${String(panel.name).slice(0,40)}`);
+          const modal=new ModalBuilder().setCustomId(`ticketform:${panel.id}:${typeIndex}`).setTitle(`فرم ${String(selectedPanelType(panel,typeIndex).name||panel.name).slice(0,40)}`);
           for(let i=0;i<Math.min(5,panel.form_questions.length);i++) modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId(`q${i}`).setLabel(String(panel.form_questions[i]).slice(0,45)).setStyle(TextInputStyle.Paragraph).setRequired(false)));
           return interaction.showModal(modal);
         }
@@ -470,7 +556,10 @@ client.on('interactionCreate',async interaction=>{
         return interaction.editReply({content:'ممنون بابت Feedback ❤️'});
       }
       if(interaction.customId.startsWith('ticketform:')){
-        const panel=(await supabase.from('ticket_panels').select('*').eq('id',interaction.customId.split(':')[1]).maybeSingle()).data;
+        const parts=interaction.customId.split(':');
+        const panel=(await supabase.from('ticket_panels').select('*').eq('id',parts[1]).maybeSingle()).data;
+        if(!panel) return interaction.reply({content:'Panel پیدا نشد.',ephemeral:true});
+        panel._typeIndex=Number(parts[2])||0;
         const answers={}; for(let i=0;i<5;i++){ try{answers[`q${i}`]=interaction.fields.getTextInputValue(`q${i}`);}catch{} }
         return createTicket(interaction,panel,answers);
       }
@@ -546,13 +635,78 @@ client.on('interactionCreate',async interaction=>{
       const qs=[1,2,3,4,5].map(i=>interaction.options.getString(`q${i}`)).filter(Boolean);
       const {data:last}=await supabase.from('ticket_panels').select('panel_number').eq('guild_id',guild.id).order('panel_number',{ascending:false}).limit(1).maybeSingle();
       const number=Number(last?.panel_number||0)+1;
-      const {data:p,error:pError}=await supabase.from('ticket_panels').insert({guild_id:guild.id,panel_number:number,panel_type:type,name,welcome_text:welcome,description:text,category_id:interaction.options.getChannel('category')?.id||null,mention_roles:roles?[roles.id]:[],claim_enabled:true,close_enabled:true,button_name:'Open Ticket',button_emoji:meta.emoji,claim_emoji:'🎫',close_emoji:'🔒',form_enabled:qs.length>0,form_questions:qs}).select().single();
+      const {data:p,error:pError}=await supabase.from('ticket_panels').insert({guild_id:guild.id,panel_number:number,panel_type:type,name,welcome_text:welcome,description:text,category_id:interaction.options.getChannel('category')?.id||null,mention_roles:roles?[roles.id]:[],claim_enabled:true,close_enabled:true,button_name:'Open Ticket',button_emoji:meta.emoji,claim_emoji:'🎫',close_emoji:'🔒',form_enabled:qs.length>0,form_questions:qs,ticket_types:[{name:meta.label,emoji:meta.emoji,prefix:meta.prefix}]}).select().single();
       if(pError || !p){ console.error('panel insert error:',pError); return interaction.reply({content:`❌ ساخت Panel انجام نشد: ${pError?.message||'database error'}`,ephemeral:true}); }
       const embed=new EmbedBuilder().setTitle(`${meta.emoji} ${name}`.slice(0,256)).setDescription(text.slice(0,4096)).setFooter({text:`Panel #${number} • ${meta.label}`});
-      const openButton=new ButtonBuilder().setCustomId(`openpanel:${p.id}`).setLabel('Open Ticket').setStyle(ButtonStyle.Primary).setEmoji(meta.emoji);
-      const msg=await interaction.channel.send({embeds:[embed],components:[new ActionRowBuilder().addComponents(openButton)]});
+      const msg=await interaction.channel.send({embeds:[embed],components:buildPanelComponents(p)});
       await supabase.from('ticket_panels').update({channel_id:interaction.channel.id,message_id:msg.id}).eq('id',p.id);
       return interaction.reply({content:`✅ Panel #${number} (${meta.label}) ساخته شد.`,ephemeral:true});
+    }
+    if(commandName==='addtype'){
+      const num=interaction.options.getInteger('num',true);
+      const name=clean(interaction.options.getString('name',true)).slice(0,80);
+      const emoji=interaction.options.getString('emoji') || '🎫';
+      const prefix=slugifyTicketType(interaction.options.getString('prefix') || name);
+      const {data:p}=await supabase.from('ticket_panels').select('*').eq('guild_id',guild.id).eq('panel_number',num).maybeSingle();
+      if(!p) return interaction.reply({content:`❌ Panel #${num} پیدا نشد.`,ephemeral:true});
+      const types=getPanelTypes(p);
+      if(types.length>=25) return interaction.reply({content:'❌ حداکثر 25 نوع تیکت برای هر پنل است.',ephemeral:true});
+      if(types.some(t=>String(t.name).toLowerCase()===name.toLowerCase())) return interaction.reply({content:'❌ این نوع تیکت قبلاً در پنل وجود دارد.',ephemeral:true});
+      types.push({name,emoji,prefix});
+      const {data:updated,error}=await supabase.from('ticket_panels').update({ticket_types:types}).eq('id',p.id).select().single();
+      if(error) return interaction.reply({content:`❌ افزودن نوع تیکت انجام نشد: ${error.message}`,ephemeral:true});
+      await refreshTicketPanelMessage(guild,updated);
+      return interaction.reply({content:`✅ «${name}» به Panel #${num} اضافه شد.`,ephemeral:true});
+    }
+    if(commandName==='edittype'){
+      const num=interaction.options.getInteger('num',true), index=interaction.options.getInteger('index',true)-1;
+      const {data:p}=await supabase.from('ticket_panels').select('*').eq('guild_id',guild.id).eq('panel_number',num).maybeSingle();
+      if(!p) return interaction.reply({content:`❌ Panel #${num} پیدا نشد.`,ephemeral:true});
+      const types=getPanelTypes(p); if(index<0 || index>=types.length) return interaction.reply({content:'❌ شماره نوع تیکت معتبر نیست.',ephemeral:true});
+      const old={...types[index]}; const name=interaction.options.getString('name'); const emoji=interaction.options.getString('emoji'); const removeEmoji=interaction.options.getBoolean('remove_emoji')||false; const prefixInput=interaction.options.getString('prefix');
+      if(name!==null) old.name=clean(name).slice(0,80);
+      if(emoji!==null) old.emoji=emoji;
+      if(removeEmoji) old.emoji='';
+      if(prefixInput!==null) old.prefix=slugifyTicketType(prefixInput);
+      else if(name!==null) old.prefix=slugifyTicketType(name);
+      if(!old.name) return interaction.reply({content:'❌ نام نوع تیکت نمی‌تواند خالی باشد.',ephemeral:true});
+      types[index]=old;
+      if(types.some((t,i)=>i!==index && String(t.name).toLowerCase()===String(old.name).toLowerCase())) return interaction.reply({content:'❌ این نام تیکت قبلاً وجود دارد.',ephemeral:true});
+      const {data:updated,error}=await supabase.from('ticket_panels').update({ticket_types:types}).eq('id',p.id).select().single();
+      if(error) return interaction.reply({content:`❌ ویرایش نوع تیکت انجام نشد: ${error.message}`,ephemeral:true});
+      await refreshTicketPanelMessage(guild,updated);
+      return interaction.reply({content:`✅ نوع تیکت شماره ${index+1} در Panel #${num} ویرایش شد.`,ephemeral:true});
+    }
+    if(commandName==='listtypes'){
+      const num=interaction.options.getInteger('num',true);
+      const {data:p}=await supabase.from('ticket_panels').select('*').eq('guild_id',guild.id).eq('panel_number',num).maybeSingle();
+      if(!p) return interaction.reply({content:`❌ Panel #${num} پیدا نشد.`,ephemeral:true});
+      const types=getPanelTypes(p);
+      return interaction.reply({content:types.map((t,i)=>`${i+1}. ${t.emoji||'▫️'} ${t.name} — prefix: \`${slugifyTicketType(t.prefix||t.name)}\``).join('\n'),ephemeral:true});
+    }
+    if(commandName==='deltype'){
+      const num=interaction.options.getInteger('num',true), index=interaction.options.getInteger('index',true)-1;
+      const {data:p}=await supabase.from('ticket_panels').select('*').eq('guild_id',guild.id).eq('panel_number',num).maybeSingle();
+      if(!p) return interaction.reply({content:`❌ Panel #${num} پیدا نشد.`,ephemeral:true});
+      const types=getPanelTypes(p); if(index<0 || index>=types.length) return interaction.reply({content:'❌ شماره نوع تیکت معتبر نیست.',ephemeral:true});
+      if(types.length===1) return interaction.reply({content:'❌ نمی‌توان آخرین نوع تیکت پنل را حذف کرد. ابتدا نوع دیگری اضافه کنید.',ephemeral:true});
+      const removed=types.splice(index,1)[0];
+      const {data:updated,error}=await supabase.from('ticket_panels').update({ticket_types:types}).eq('id',p.id).select().single();
+      if(error) return interaction.reply({content:`❌ حذف نوع تیکت انجام نشد: ${error.message}`,ephemeral:true});
+      await refreshTicketPanelMessage(guild,updated);
+      return interaction.reply({content:`✅ «${removed.name}» از Panel #${num} حذف شد.`,ephemeral:true});
+    }
+    if(commandName==='reordertypes'){
+      const num=interaction.options.getInteger('num',true); const order=interaction.options.getString('order',true).split(',').map(x=>Number(x.trim()));
+      const {data:p}=await supabase.from('ticket_panels').select('*').eq('guild_id',guild.id).eq('panel_number',num).maybeSingle();
+      if(!p) return interaction.reply({content:`❌ Panel #${num} پیدا نشد.`,ephemeral:true});
+      const types=getPanelTypes(p);
+      if(order.length!==types.length || new Set(order).size!==types.length || order.some(n=>n<1||n>types.length)) return interaction.reply({content:`❌ ترتیب باید دقیقاً شامل شماره‌های 1 تا ${types.length} باشد؛ مثال: ${types.map((_,i)=>i+1).join(',')}`,ephemeral:true});
+      const reordered=order.map(n=>types[n-1]);
+      const {data:updated,error}=await supabase.from('ticket_panels').update({ticket_types:reordered}).eq('id',p.id).select().single();
+      if(error) return interaction.reply({content:`❌ تغییر ترتیب انجام نشد: ${error.message}`,ephemeral:true});
+      await refreshTicketPanelMessage(guild,updated);
+      return interaction.reply({content:`✅ ترتیب انواع Panel #${num} تغییر کرد.`,ephemeral:true});
     }
     if(commandName==='delpanel'){
       const num=interaction.options.getInteger('num',true);
@@ -570,13 +724,13 @@ client.on('interactionCreate',async interaction=>{
       for(const k of ['name','text','welcome']){
         const v=interaction.options.getString(k); if(v!==null) patch[k==='text'?'description':k==='welcome'?'welcome_text':'name']=v;
       }
-      const type=interaction.options.getString('type'); if(type) patch.panel_type=type;
+      const type=interaction.options.getString('type'); if(type) { patch.panel_type=type; patch.ticket_types=[{name:TICKET_TYPES[type].label,emoji:TICKET_TYPES[type].emoji,prefix:TICKET_TYPES[type].prefix}]; }
       const cat=interaction.options.getChannel('category'); if(cat) patch.category_id=cat.id;
       const role=interaction.options.getRole('mention_role'); if(role) patch.mention_roles=[role.id];
       if(!Object.keys(patch).length) return interaction.reply({content:'هیچ تغییری وارد نشده است.',ephemeral:true});
       const {data:updated,error}=await supabase.from('ticket_panels').update(patch).eq('id',p.id).select().single();
       if(error) return interaction.reply({content:`❌ ویرایش Panel انجام نشد: ${error.message}`,ephemeral:true});
-      if(updated.channel_id && updated.message_id){ const ch=guild.channels.cache.get(updated.channel_id); const msg=ch?await ch.messages.fetch(updated.message_id).catch(()=>null):null; if(msg){ const meta=TICKET_TYPES[updated.panel_type]||{}; const embed=new EmbedBuilder().setTitle(`${meta.emoji||'🎫'} ${updated.name}`.slice(0,256)).setDescription(String(updated.description||'برای باز کردن تیکت روی دکمه زیر بزنید.').slice(0,4096)).setFooter({text:`Panel #${num}`}); const b=new ButtonBuilder().setCustomId(`openpanel:${updated.id}`).setLabel('Open Ticket').setStyle(ButtonStyle.Primary); if(meta.emoji) b.setEmoji(meta.emoji); await msg.edit({embeds:[embed],components:[new ActionRowBuilder().addComponents(b)]}).catch(()=>{}); } }
+      if(updated.channel_id && updated.message_id){ const ch=guild.channels.cache.get(updated.channel_id); const msg=ch?await ch.messages.fetch(updated.message_id).catch(()=>null):null; if(msg){ const meta=TICKET_TYPES[updated.panel_type]||{}; const embed=new EmbedBuilder().setTitle(`${meta.emoji||'🎫'} ${updated.name}`.slice(0,256)).setDescription(String(updated.description||'برای باز کردن تیکت روی دکمه زیر بزنید.').slice(0,4096)).setFooter({text:`Panel #${num}`}); await msg.edit({embeds:[embed],components:buildPanelComponents(updated)}).catch(()=>{}); } }
       return interaction.reply({content:`✅ Panel #${num} ویرایش شد.`,ephemeral:true});
     }
     if(commandName==='panels'){
@@ -585,19 +739,15 @@ client.on('interactionCreate',async interaction=>{
     }
     if(commandName==='allpanel'){
       const channel=interaction.options.getChannel('channel')||interaction.channel;
-      let {data:panels}=await supabase.from('ticket_panels').select('*').eq('guild_id',guild.id).in('panel_type',Object.keys(TICKET_TYPES)).order('panel_number',{ascending:true});
-      const byType=new Map((panels||[]).map(p=>[p.panel_type,p]));
-      for(const type of Object.keys(TICKET_TYPES)) if(!byType.has(type)){
-        const meta=TICKET_TYPES[type];
-        const {data:last}=await supabase.from('ticket_panels').select('panel_number').eq('guild_id',guild.id).order('panel_number',{ascending:false}).limit(1).maybeSingle();
-        const number=Number(last?.panel_number||0)+1;
-        const {data:p,error}=await supabase.from('ticket_panels').insert({guild_id:guild.id,panel_number:number,panel_type:type,name:meta.label,welcome_text:`سلام [user]، تیکت ${meta.label} شما ایجاد شد.`,description:`${meta.emoji} برای باز کردن تیکت ${meta.label} را انتخاب کنید.`,category_id:null,mention_roles:[],claim_enabled:true,close_enabled:true,button_name:'Open Ticket',button_emoji:meta.emoji,claim_emoji:'🎫',close_emoji:'🔒',form_enabled:false,form_questions:[]}).select().single();
-        if(error) return interaction.reply({content:`❌ ساخت Panel پیش‌فرض ${meta.label} انجام نشد: ${error.message}`,ephemeral:true});
-        byType.set(type,p); panels.push(p);
+      const {data:panels}=await supabase.from('ticket_panels').select('*').eq('guild_id',guild.id).order('panel_number',{ascending:true});
+      const entries=[];
+      for(const p of panels||[]) for(let i=0;i<getPanelTypes(p).length;i++){
+        const t=getPanelTypes(p)[i]; entries.push({label:String(t.name).slice(0,100),value:`${p.id}:${i}`,description:`Panel #${p.panel_number} • ${String(t.name).slice(0,70)}`,...(t.emoji ? {emoji:t.emoji} : {})});
       }
-      const options=Object.keys(TICKET_TYPES).map(type=>{ const p=byType.get(type), meta=TICKET_TYPES[type]; return {label:meta.label,value:p.id,description:`Open ${meta.label} ticket`,emoji:meta.emoji}; });
-      const menu=new StringSelectMenuBuilder().setCustomId('ticketmenu').setPlaceholder(interaction.options.getString('placeholder')||'Select a ticket type').addOptions(options);
-      const embed=new EmbedBuilder().setTitle(interaction.options.getString('name')||'🎫 Ticket Center').setDescription(interaction.options.getString('text')||'نوع تیکت خود را انتخاب کنید.');
+      if(!entries.length) return interaction.reply({content:'❌ ابتدا حداقل یک Panel بسازید.',ephemeral:true});
+      if(entries.length>25) return interaction.reply({content:`❌ All-in-one Menu حداکثر 25 گزینه دارد. الان ${entries.length} نوع تیکت دارید.`,ephemeral:true});
+      const menu=new StringSelectMenuBuilder().setCustomId('ticketmenu').setPlaceholder(interaction.options.getString('placeholder')||'نوع تیکت را انتخاب کنید').addOptions(entries);
+      const embed=new EmbedBuilder().setTitle(interaction.options.getString('name')||'🎫 Ticket Menu').setDescription(interaction.options.getString('text')||'نوع تیکت موردنظر را انتخاب کنید.');
       const msg=await channel.send({embeds:[embed],components:[new ActionRowBuilder().addComponents(menu)]});
       await setSettings(guild.id,{ticket_all_in_one_channel:channel.id,ticket_all_in_one_message:msg.id});
       return interaction.reply({content:`✅ All-in-one Ticket menu ساخته شد: ${channel}`,ephemeral:true});
