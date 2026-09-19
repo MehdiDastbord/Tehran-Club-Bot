@@ -66,6 +66,8 @@ add(new SlashCommandBuilder().setName('setticketlog').setDescription('تنظیم
 add(new SlashCommandBuilder().setName('textowner').setDescription('تنظیم کانال ارسال پیام مالک').addChannelOption(o=>o.setName('channel').setDescription('کانال').setRequired(true)));
 add(new SlashCommandBuilder().setName('untextowner').setDescription('غیرفعال کردن ارسال پیام مالک'));
 add(new SlashCommandBuilder().setName('createcmd').setDescription('ایجاد یک دستور متنی عمومی سفارشی').addStringOption(o=>o.setName('keyword').setDescription('کلمه کلیدی').setRequired(true)).addStringOption(o=>o.setName('text').setDescription('پاسخ').setRequired(true)));
+add(new SlashCommandBuilder().setName('setlogchannel').setDescription('تنظیم کانال اصلی گزارش لاگ‌ها').addChannelOption(o=>o.setName('channel').setDescription('کانال ارسال گزارش‌های تجمیعی').addChannelTypes(ChannelType.GuildText).setRequired(true)));
+add(new SlashCommandBuilder().setName('sendlogs').setDescription('ارسال فوری گزارش لاگ‌های جمع‌شده'));
 
 (async()=>{
   const rest=new REST({version:'10'}).setToken(process.env.DISCORD_TOKEN);

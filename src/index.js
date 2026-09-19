@@ -80,10 +80,102 @@ async function ensureRole(guild,name){
 async function ensureRoles(guild){
   await ensureRole(guild,TICKET_SUPPORT_ROLE).catch(()=>{});
   await ensureRole(guild,ACCESS.logs).catch(()=>{});
+  await ensureRole(guild,ACCESS.giveaway).catch(()=>{});
 }
+const AGG_LOGS = {
+  giveaway_create_log_channel: '🎉 Giveaway / Drop',
+  giveaway_winner_log_channel: '🎉 Giveaway / Drop',
+  drop_create_log_channel: '🎉 Giveaway / Drop',
+  drop_winner_log_channel: '🎉 Giveaway / Drop',
+  ticket_log_channel: '🎫 Ticket Logs',
+  ticket_feedback_channel: '⭐ Feedback',
+  message_log_channel: '💬 Message Logs',
+  ban_kick_log_channel: '🔨 Ban / Kick Logs',
+  timeout_log_channel: '⏱️ Timeout Logs',
+  voice_log_channel: '🔊 Voice / Stage Logs',
+  dm_log_channel: '📩 DM Logs',
+  server_update_log_channel: '🛠️ Server Logs',
+  member_warn_log_channel: '⚠️ Member Warn Logs',
+  welcome_channel: '👋 Welcome',
+  invite_log_channel: '📨 Invite Logs',
+  level_channel: '⬆️ Level Up'
+};
+const AGG_LOG_ORDER = [...new Set(Object.values(AGG_LOGS))];
+const LOG_FLUSH_FIRST_MS = 3 * 60 * 60 * 1000;
+const LOG_FLUSH_INTERVAL_MS = 6 * 60 * 60 * 1000;
+let logFlushRunning = false;
+
 async function logTo(guild,key,text){
-  const s=await getSettings(guild.id); const id=s[key]; if(!id) return;
-  const ch=guild.channels.cache.get(id); if(ch?.isTextBased()) await ch.send({content:text}).catch(()=>{});
+  const section=AGG_LOGS[key];
+  if(!guild || !section || !String(text||'').trim()) return;
+  const content=String(text).slice(0,1900);
+  const {error}=await supabase.from('log_queue').insert({guild_id:guild.id,section,content});
+  if(error) console.error('log queue error:',error.message);
+}
+
+function formatLogSection(section, rows){
+  const lines=rows.map(r=>{
+    const stamp=r.created_at ? new Date(r.created_at).toLocaleString('en-GB',{timeZone:'Asia/Dubai',hour12:false}) : '';
+    return `• ${stamp} — ${String(r.content||'').replace(/\n/g,'\n  ')}`;
+  });
+  let value=lines.join('\n');
+  if(value.length>1000) value=value.slice(0,997)+'...';
+  return value || '—';
+}
+
+async function flushGuildLogs(guild,force=false){
+  if(!guild || logFlushRunning) return {sent:false,reason:'busy'};
+  const settings=await getSettings(guild.id);
+  const channelId=settings.aggregated_log_channel;
+  if(!channelId) return {sent:false,reason:'not-configured'};
+  const channel=guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(()=>null);
+  if(!channel?.isTextBased()) return {sent:false,reason:'invalid-channel'};
+  const {data:rows,error}=await supabase.from('log_queue').select('id,section,content,created_at').eq('guild_id',guild.id).order('created_at',{ascending:true}).limit(500);
+  if(error){ console.error('log queue read error:',error.message); return {sent:false,reason:'database'}; }
+  if(!rows?.length && !force){
+    await setSettings(guild.id,{next_log_flush_at:new Date(Date.now()+LOG_FLUSH_INTERVAL_MS).toISOString()});
+    return {sent:false,reason:'empty'};
+  }
+
+  logFlushRunning=true;
+  try{
+    const grouped=new Map();
+    for(const section of AGG_LOG_ORDER) grouped.set(section,[]);
+    for(const row of rows||[]) { if(!grouped.has(row.section)) grouped.set(row.section,[]); grouped.get(row.section).push(row); }
+    const embeds=[];
+    let embed=new EmbedBuilder().setTitle('📋 Tehran Club Logs').setDescription(`لاگ‌های جمع‌آوری‌شده • ${new Date().toLocaleString('en-GB',{timeZone:'Asia/Dubai',hour12:false})} (Dubai)`).setTimestamp();
+    let fields=0;
+    for(const [section,items] of grouped){
+      if(!items.length) continue;
+      if(fields>=25){ embeds.push(embed); embed=new EmbedBuilder().setTitle('📋 Tehran Club Logs (ادامه)').setTimestamp(); fields=0; }
+      embed.addFields({name:section,value:formatLogSection(section,items)}); fields++;
+    }
+    if(fields===0) embed.addFields({name:'📭 Logs',value:'در این بازه لاگی ثبت نشده است.'});
+    embeds.push(embed);
+
+    // Discord allows multiple embeds in one message, so this remains exactly one Discord message.
+    await channel.send({embeds:embeds.slice(0,10)});
+    if(rows?.length) await supabase.from('log_queue').delete().in('id',rows.map(r=>r.id));
+    await setSettings(guild.id,{next_log_flush_at:new Date(Date.now()+LOG_FLUSH_INTERVAL_MS).toISOString()});
+    return {sent:true,count:rows.length};
+  }catch(error){
+    console.error('log flush error:',error?.message||error);
+    return {sent:false,reason:'send-failed'};
+  }finally{ logFlushRunning=false; }
+}
+
+async function checkScheduledLogFlush(){
+  for(const guild of client.guilds.cache.values()){
+    try{
+      const s=await getSettings(guild.id);
+      const configured=s.aggregated_log_channel;
+      if(!configured) continue;
+      let next=s.next_log_flush_at ? new Date(s.next_log_flush_at).getTime() : Date.now()+LOG_FLUSH_FIRST_MS;
+      if(!Number.isFinite(next)){ next=Date.now()+LOG_FLUSH_FIRST_MS; }
+      if(!s.next_log_flush_at){ await setSettings(guild.id,{next_log_flush_at:new Date(next).toISOString()}); continue; }
+      if(Date.now()>=next) await flushGuildLogs(guild,false);
+    }catch(error){ console.error('scheduled log check error:',error?.message||error); }
+  }
 }
 async function deleteInvocation(message){ await message.delete().catch(()=>{}); }
 async function setTextSetting(message,key,value){ if(!isAdmin(message.member)) return; await setSettings(message.guild.id,{[key]:value}); await deleteInvocation(message); }
@@ -120,6 +212,9 @@ client.once('ready',async()=>{
   console.log(`Logged in as ${client.user.tag}`);
   for(const g of client.guilds.cache.values()) await ensureRoles(g);
   setInterval(endGiveaways,10000); setInterval(showStats,21600000);
+  // First automatic log report is 3 hours after setup, then every 6 hours.
+  setInterval(checkScheduledLogFlush,60000);
+  await checkScheduledLogFlush();
 });
 client.on('guildCreate',g=>ensureRoles(g));
 
@@ -165,8 +260,10 @@ client.on('messageCreate',async message=>{
     for(const er of roleRows||[]) await message.member.roles.remove(er.role_id).catch(()=>{});
     const er=(roleRows||[]).find(x=>x.level===newLevel);
     if(er) await message.member.roles.add(er.role_id).catch(()=>{});
-    const es=await getSettings(message.guild.id), ech=es.level_channel&&message.guild.channels.cache.get(es.level_channel);
-    if(ech) await ech.send(placeholders((es.xp_level_text||'🎉 [user] رسید به Level '+newLevel).replace('[level]',String(newLevel)), message.member,message.guild));
+    const es=await getSettings(message.guild.id), levelText=placeholders((es.xp_level_text||'🎉 [user] رسید به Level '+newLevel).replace('[level]',String(newLevel)), message.member,message.guild);
+    const ech=es.level_channel&&message.guild.channels.cache.get(es.level_channel);
+    if(ech) await ech.send(levelText).catch(()=>{});
+    await logTo(message.guild,'level_channel',`⬆️ Level Up | ${message.author.tag} | Level ${newLevel}`);
   }
 
   if(isBotOwner(message.author.id) && s.owner_relay_channel===message.channel.id){
@@ -184,14 +281,26 @@ client.on('messageCreate',async message=>{
 });
 
 async function endGiveaways(){
-  const {data:rows}=await supabase.from('giveaways').select('*').eq('ended',false).lte('end_at',new Date().toISOString());
+  const {data:rows,error}=await supabase.from('giveaways').select('*').eq('ended',false).lte('end_at',new Date().toISOString());
+  if(error){ console.error('giveaway expiry query error:',error.message); return; }
   for(const g of rows||[]){
-    const {data:entries}=await supabase.from('giveaway_entries').select('user_id').eq('giveaway_id',g.id);
-    const winner=entries?.length?entries[Math.floor(Math.random()*entries.length)].user_id:null;
-    await supabase.from('giveaways').update({ended:true,winner_id:winner}).eq('id',g.id).eq('ended',false);
-    const guild=client.guilds.cache.get(g.guild_id), ch=guild?.channels.cache.get(g.channel_id);
-    if(ch) await ch.send(`🎉 Giveaway تمام شد!\n🎁 جایزه: **${g.prize}**\n🏆 ${winner?`برنده: <@${winner}>`:'شرکت‌کننده‌ای نبود.'}`);
-    if(guild) await logTo(guild,'giveaway_winner_log_channel',`🎉 Giveaway winner | prize=${g.prize} | winner=${winner||'none'}`);
+    try{
+      const {data:entries, error:entryError}=await supabase.from('giveaway_entries').select('user_id').eq('giveaway_id',g.id);
+      if(entryError){ console.error('giveaway entries read error:',entryError.message); continue; }
+      const winner=entries?.length?entries[Math.floor(Math.random()*entries.length)].user_id:null;
+      const {data:endedRow,error:updateError}=await supabase.from('giveaways').update({ended:true,winner_id:winner}).eq('id',g.id).eq('ended',false).select('id').maybeSingle();
+      if(updateError || !endedRow) continue;
+      const guild=client.guilds.cache.get(g.guild_id), ch=guild?.channels.cache.get(g.channel_id);
+      if(ch) await ch.send({content:`🎉 Giveaway تمام شد!\n🎁 جایزه: **${g.prize}**\n🏆 ${winner?`برنده: <@${winner}>`:'شرکت‌کننده‌ای نبود.'}`,allowedMentions:{users:winner?[winner]:[],parse:[]}}).catch(err=>console.error('giveaway finish send error:',err.message));
+      if(guild) await logTo(guild,'giveaway_winner_log_channel',`🎉 Giveaway پایان یافت | prize=${g.prize} | winner=${winner||'none'}`);
+      if(ch && g.message_id){
+        const original=await ch.messages.fetch(g.message_id).catch(()=>null);
+        if(original){
+          const disabled=original.components.map(row=>new ActionRowBuilder().addComponents(row.components.map(component=>ButtonBuilder.from(component).setDisabled(true))));
+          await original.edit({components:disabled}).catch(()=>{});
+        }
+      }
+    }catch(err){ console.error('giveaway expiry error:',err?.message||err); }
   }
 }
 async function showStats(){
@@ -236,8 +345,33 @@ function slugifyTicketType(value){
   return slug || 'ticket';
 }
 function getPanelTypes(panel){
-  if(Array.isArray(panel?.ticket_types) && panel.ticket_types.length) return panel.ticket_types;
+  let raw=panel?.ticket_types;
+  // Supabase normally returns JSONB as an array, but older rows/migrations may
+  // contain it as a JSON string. Normalize both forms so list/edit/delete work.
+  if(typeof raw==='string'){
+    try{ raw=JSON.parse(raw); }catch{ raw=null; }
+  }
+  if(Array.isArray(raw) && raw.length){
+    return raw.map((t,i)=>({
+      name:clean(t?.name || `Ticket ${i+1}`).slice(0,80),
+      emoji:typeof t?.emoji==='string'?t.emoji:'🎫',
+      prefix:slugifyTicketType(t?.prefix || t?.name || `ticket-${i+1}`)
+    }));
+  }
   return defaultPanelTypes(panel);
+}
+async function loadPanelByNumber(guildId,num){
+  const n=Number(num);
+  if(!Number.isInteger(n) || n<1) return {data:null,error:new Error('Invalid panel number')};
+  return await supabase.from('ticket_panels').select('*').eq('guild_id',guildId).eq('panel_number',n).maybeSingle();
+}
+async function savePanelTypes(panel,types){
+  const normalized=types.map((t,i)=>({
+    name:clean(t?.name || `Ticket ${i+1}`).slice(0,80),
+    emoji:typeof t?.emoji==='string'?t.emoji:'🎫',
+    prefix:slugifyTicketType(t?.prefix || t?.name || `ticket-${i+1}`)
+  }));
+  return await supabase.from('ticket_panels').update({ticket_types:normalized}).eq('id',panel.id).eq('guild_id',panel.guild_id).select('*').single();
 }
 function selectedPanelType(panel,index){
   const types=getPanelTypes(panel);
@@ -511,6 +645,7 @@ client.on('interactionCreate',async interaction=>{
         if(existingFeedback) return interaction.reply({content:'این Ticket قبلاً Rating شده است.',ephemeral:true});
         const {error:feedbackInsertError}=await supabase.from('ticket_feedback').insert({ticket_id:id,user_id:interaction.user.id,stars});
         if(feedbackInsertError){ console.error('feedback insert error:',feedbackInsertError); return interaction.reply({content:'❌ ذخیره Rating انجام نشد. دوباره تلاش کنید.',ephemeral:true}); }
+        await logTo(interaction.guild,'ticket_feedback_channel',`⭐ Ticket Feedback | ${interaction.user.tag} | ${stars}/5 | Ticket ${id}`);
         const modal=new ModalBuilder().setCustomId(`feedbackmodal:${id}:${stars}`).setTitle(`${stars} ستاره`).addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('feedback').setLabel('نظر شما').setStyle(TextInputStyle.Paragraph).setRequired(false)));
         return interaction.showModal(modal);
       }
@@ -540,6 +675,7 @@ client.on('interactionCreate',async interaction=>{
         if(feedbackError) console.error('feedback save error:',feedbackError);
         const g=client.guilds.cache.get(t.guild_id);
         if(g){
+          await logTo(g,'ticket_feedback_channel',`⭐ Feedback | ${interaction.user.tag} | ${stars}/5 | ${text||'بدون متن'}`);
           const s=await getSettings(g.id), fb=s.ticket_feedback_channel && g.channels.cache.get(s.ticket_feedback_channel);
           if(fb?.isTextBased()){
             const owner=await g.members.fetch(t.opener_id).catch(()=>null);
@@ -600,16 +736,40 @@ client.on('interactionCreate',async interaction=>{
       return interaction.reply({content:'⛔ You are not authorized to use this bot command.',ephemeral:true});
     }
     if(['giveaway','giveawaysv','dropmatn','dropclick'].includes(commandName)){
-      if(!hasAccess(interaction.member,ACCESS.giveaway)) return interaction.reply({content:'دسترسی Giveaway نداری.',ephemeral:true});
+      // Authorized IDs/owners may use giveaway management directly; otherwise
+      // the dedicated giveaway access role is required. This keeps the command
+      // protected without locking out configured bot owners.
+      if(!isBotOwner(interaction.user.id) && !hasAccess(interaction.member,ACCESS.giveaway)) {
+        return interaction.reply({content:'⛔ شما دسترسی ساخت Giveaway را ندارید.',ephemeral:true});
+      }
       if(commandName==='giveaway'||commandName==='giveawaysv'){
-        const prize=interaction.options.getString('prize'), minutes=duration(interaction.options.getInteger('minutes')); if(!minutes) return interaction.reply({content:'تایم باید بیشتر از صفر دقیقه باشد.',ephemeral:true});
+        const prize=interaction.options.getString('prize'), minutes=duration(interaction.options.getInteger('minutes'));
+        if(!minutes) return interaction.reply({content:'❌ مدت زمان باید بیشتر از صفر دقیقه باشد.',ephemeral:true});
         const link=commandName==='giveawaysv'?interaction.options.getString('link'):null;
-        const {data:g,error:gError}=await supabase.from('giveaways').insert({guild_id:guild.id,channel_id:interaction.channel.id,prize,duration_minutes:minutes,end_at:new Date(Date.now()+minutes*60000).toISOString(),link}).select().single();
-        if(gError || !g) { console.error('giveaway insert error:', gError); return interaction.reply({content:'❌ ساخت Giveaway در دیتابیس انجام نشد. تنظیمات Supabase را بررسی کنید.',ephemeral:true}); }
-        const row=new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`gw:${g.id}`).setLabel('شرکت در Giveaway').setStyle(ButtonStyle.Success)); if(link) row.addComponents(new ButtonBuilder().setLabel('باز کردن لینک').setStyle(ButtonStyle.Link).setURL(link));
-        const msg=await interaction.channel.send({content:`🎉 **Giveaway**\n🎁 جایزه: **${prize}**\n⏱️ زمان: **${fmt(minutes*60000)}**`,components:[row]});
-        const {error:updateError}=await supabase.from('giveaways').update({message_id:msg.id}).eq('id',g.id); if(updateError) console.error('giveaway message update error:',updateError);
-        await logTo(guild,'giveaway_create_log_channel',`🎉 Giveaway ساخته شد | ${interaction.user.tag} | ${prize}`); return interaction.reply({content:'Giveaway ساخته شد.',ephemeral:true});
+        if(link){ try{ new URL(link); }catch{ return interaction.reply({content:'❌ لینک واردشده معتبر نیست.',ephemeral:true}); } }
+        if(!interaction.channel?.isTextBased()) return interaction.reply({content:'❌ این دستور باید داخل یک کانال متنی اجرا شود.',ephemeral:true});
+
+        const payload={guild_id:guild.id,channel_id:interaction.channel.id,prize,duration_minutes:minutes,end_at:new Date(Date.now()+minutes*60000).toISOString(),link};
+        const {data:g,error:gError}=await supabase.from('giveaways').insert(payload).select().single();
+        if(gError || !g) {
+          console.error('giveaway insert error:',gError);
+          const detail=gError?.message ? `\n${gError.message}` : '';
+          return interaction.reply({content:`❌ ساخت Giveaway در دیتابیس انجام نشد.${detail}`,ephemeral:true});
+        }
+        const row=new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`gw:${g.id}`).setLabel('شرکت در Giveaway').setStyle(ButtonStyle.Success));
+        if(link) row.addComponents(new ButtonBuilder().setLabel('باز کردن لینک').setStyle(ButtonStyle.Link).setURL(link));
+        let msg;
+        try{
+          msg=await interaction.channel.send({content:`🎉 **Giveaway**\n🎁 جایزه: **${prize}**\n⏱️ زمان: **${fmt(minutes*60000)}**`,components:[row]});
+        }catch(sendError){
+          console.error('giveaway channel send error:',sendError);
+          await supabase.from('giveaways').delete().eq('id',g.id).catch(()=>{});
+          return interaction.reply({content:`❌ ارسال Giveaway به کانال انجام نشد. دسترسی Send Messages را بررسی کنید.\n${sendError?.message||''}`,ephemeral:true});
+        }
+        const {error:updateError}=await supabase.from('giveaways').update({message_id:msg.id}).eq('id',g.id);
+        if(updateError) console.error('giveaway message update error:',updateError);
+        await logTo(guild,'giveaway_create_log_channel',`🎉 Giveaway ساخته شد | ${interaction.user.tag} | ${prize}`);
+        return interaction.reply({content:'✅ Giveaway با موفقیت ساخته شد.',ephemeral:true});
       }
       if(commandName==='dropmatn'||commandName==='dropclick'){
         const target=commandName==='dropmatn'?interaction.options.getString('text'):null;
@@ -647,21 +807,23 @@ client.on('interactionCreate',async interaction=>{
       const name=clean(interaction.options.getString('name',true)).slice(0,80);
       const emoji=interaction.options.getString('emoji') || '🎫';
       const prefix=slugifyTicketType(interaction.options.getString('prefix') || name);
-      const {data:p}=await supabase.from('ticket_panels').select('*').eq('guild_id',guild.id).eq('panel_number',num).maybeSingle();
-      if(!p) return interaction.reply({content:`❌ Panel #${num} پیدا نشد.`,ephemeral:true});
+      const {data:p,error:pLoadError}=await loadPanelByNumber(guild.id,num);
+      if(pLoadError) return interaction.reply({content:`❌ خواندن Panel انجام نشد: ${pLoadError.message}`,ephemeral:true});
+      if(!p) return interaction.reply({content:`❌ Panel #${num} پیدا نشد. ابتدا /panels را اجرا کنید.`,ephemeral:true});
       const types=getPanelTypes(p);
       if(types.length>=25) return interaction.reply({content:'❌ حداکثر 25 نوع تیکت برای هر پنل است.',ephemeral:true});
       if(types.some(t=>String(t.name).toLowerCase()===name.toLowerCase())) return interaction.reply({content:'❌ این نوع تیکت قبلاً در پنل وجود دارد.',ephemeral:true});
       types.push({name,emoji,prefix});
-      const {data:updated,error}=await supabase.from('ticket_panels').update({ticket_types:types}).eq('id',p.id).select().single();
+      const {data:updated,error}=await savePanelTypes(p,types);
       if(error) return interaction.reply({content:`❌ افزودن نوع تیکت انجام نشد: ${error.message}`,ephemeral:true});
       await refreshTicketPanelMessage(guild,updated);
       return interaction.reply({content:`✅ «${name}» به Panel #${num} اضافه شد.`,ephemeral:true});
     }
     if(commandName==='edittype'){
       const num=interaction.options.getInteger('num',true), index=interaction.options.getInteger('index',true)-1;
-      const {data:p}=await supabase.from('ticket_panels').select('*').eq('guild_id',guild.id).eq('panel_number',num).maybeSingle();
-      if(!p) return interaction.reply({content:`❌ Panel #${num} پیدا نشد.`,ephemeral:true});
+      const {data:p,error:pLoadError}=await loadPanelByNumber(guild.id,num);
+      if(pLoadError) return interaction.reply({content:`❌ خواندن Panel انجام نشد: ${pLoadError.message}`,ephemeral:true});
+      if(!p) return interaction.reply({content:`❌ Panel #${num} پیدا نشد. ابتدا /panels را اجرا کنید.`,ephemeral:true});
       const types=getPanelTypes(p); if(index<0 || index>=types.length) return interaction.reply({content:'❌ شماره نوع تیکت معتبر نیست.',ephemeral:true});
       const old={...types[index]}; const name=interaction.options.getString('name'); const emoji=interaction.options.getString('emoji'); const removeEmoji=interaction.options.getBoolean('remove_emoji')||false; const prefixInput=interaction.options.getString('prefix');
       if(name!==null) old.name=clean(name).slice(0,80);
@@ -672,54 +834,60 @@ client.on('interactionCreate',async interaction=>{
       if(!old.name) return interaction.reply({content:'❌ نام نوع تیکت نمی‌تواند خالی باشد.',ephemeral:true});
       types[index]=old;
       if(types.some((t,i)=>i!==index && String(t.name).toLowerCase()===String(old.name).toLowerCase())) return interaction.reply({content:'❌ این نام تیکت قبلاً وجود دارد.',ephemeral:true});
-      const {data:updated,error}=await supabase.from('ticket_panels').update({ticket_types:types}).eq('id',p.id).select().single();
+      const {data:updated,error}=await savePanelTypes(p,types);
       if(error) return interaction.reply({content:`❌ ویرایش نوع تیکت انجام نشد: ${error.message}`,ephemeral:true});
       await refreshTicketPanelMessage(guild,updated);
       return interaction.reply({content:`✅ نوع تیکت شماره ${index+1} در Panel #${num} ویرایش شد.`,ephemeral:true});
     }
     if(commandName==='listtypes'){
       const num=interaction.options.getInteger('num',true);
-      const {data:p}=await supabase.from('ticket_panels').select('*').eq('guild_id',guild.id).eq('panel_number',num).maybeSingle();
-      if(!p) return interaction.reply({content:`❌ Panel #${num} پیدا نشد.`,ephemeral:true});
+      const {data:p,error:pLoadError}=await loadPanelByNumber(guild.id,num);
+      if(pLoadError) return interaction.reply({content:`❌ خواندن Panel انجام نشد: ${pLoadError.message}`,ephemeral:true});
+      if(!p) return interaction.reply({content:`❌ Panel #${num} پیدا نشد. ابتدا /panels را اجرا کنید.`,ephemeral:true});
       const types=getPanelTypes(p);
-      return interaction.reply({content:types.map((t,i)=>`${i+1}. ${t.emoji||'▫️'} ${t.name} — prefix: \`${slugifyTicketType(t.prefix||t.name)}\``).join('\n'),ephemeral:true});
+      const lines=types.map((t,i)=>`${i+1}. ${t.emoji||'▫️'} **${t.name}** — prefix: \`${slugifyTicketType(t.prefix||t.name)}\``);
+      return interaction.reply({content:`🎫 **Panel #${num} — Ticket Types**\n${lines.join('\n')}\n\nتعداد: ${types.length}`,ephemeral:true});
     }
     if(commandName==='deltype'){
       const num=interaction.options.getInteger('num',true), index=interaction.options.getInteger('index',true)-1;
-      const {data:p}=await supabase.from('ticket_panels').select('*').eq('guild_id',guild.id).eq('panel_number',num).maybeSingle();
-      if(!p) return interaction.reply({content:`❌ Panel #${num} پیدا نشد.`,ephemeral:true});
+      const {data:p,error:pLoadError}=await loadPanelByNumber(guild.id,num);
+      if(pLoadError) return interaction.reply({content:`❌ خواندن Panel انجام نشد: ${pLoadError.message}`,ephemeral:true});
+      if(!p) return interaction.reply({content:`❌ Panel #${num} پیدا نشد. ابتدا /panels را اجرا کنید.`,ephemeral:true});
       const types=getPanelTypes(p); if(index<0 || index>=types.length) return interaction.reply({content:'❌ شماره نوع تیکت معتبر نیست.',ephemeral:true});
       if(types.length===1) return interaction.reply({content:'❌ نمی‌توان آخرین نوع تیکت پنل را حذف کرد. ابتدا نوع دیگری اضافه کنید.',ephemeral:true});
       const removed=types.splice(index,1)[0];
-      const {data:updated,error}=await supabase.from('ticket_panels').update({ticket_types:types}).eq('id',p.id).select().single();
+      const {data:updated,error}=await savePanelTypes(p,types);
       if(error) return interaction.reply({content:`❌ حذف نوع تیکت انجام نشد: ${error.message}`,ephemeral:true});
       await refreshTicketPanelMessage(guild,updated);
       return interaction.reply({content:`✅ «${removed.name}» از Panel #${num} حذف شد.`,ephemeral:true});
     }
     if(commandName==='reordertypes'){
       const num=interaction.options.getInteger('num',true); const order=interaction.options.getString('order',true).split(',').map(x=>Number(x.trim()));
-      const {data:p}=await supabase.from('ticket_panels').select('*').eq('guild_id',guild.id).eq('panel_number',num).maybeSingle();
-      if(!p) return interaction.reply({content:`❌ Panel #${num} پیدا نشد.`,ephemeral:true});
+      const {data:p,error:pLoadError}=await loadPanelByNumber(guild.id,num);
+      if(pLoadError) return interaction.reply({content:`❌ خواندن Panel انجام نشد: ${pLoadError.message}`,ephemeral:true});
+      if(!p) return interaction.reply({content:`❌ Panel #${num} پیدا نشد. ابتدا /panels را اجرا کنید.`,ephemeral:true});
       const types=getPanelTypes(p);
       if(order.length!==types.length || new Set(order).size!==types.length || order.some(n=>n<1||n>types.length)) return interaction.reply({content:`❌ ترتیب باید دقیقاً شامل شماره‌های 1 تا ${types.length} باشد؛ مثال: ${types.map((_,i)=>i+1).join(',')}`,ephemeral:true});
       const reordered=order.map(n=>types[n-1]);
-      const {data:updated,error}=await supabase.from('ticket_panels').update({ticket_types:reordered}).eq('id',p.id).select().single();
+      const {data:updated,error}=await savePanelTypes(p,reordered);
       if(error) return interaction.reply({content:`❌ تغییر ترتیب انجام نشد: ${error.message}`,ephemeral:true});
       await refreshTicketPanelMessage(guild,updated);
       return interaction.reply({content:`✅ ترتیب انواع Panel #${num} تغییر کرد.`,ephemeral:true});
     }
     if(commandName==='delpanel'){
       const num=interaction.options.getInteger('num',true);
-      const {data:p}=await supabase.from('ticket_panels').select('*').eq('guild_id',guild.id).eq('panel_number',num).maybeSingle();
-      if(!p) return interaction.reply({content:`❌ Panel #${num} پیدا نشد.`,ephemeral:true});
+      const {data:p,error:pLoadError}=await loadPanelByNumber(guild.id,num);
+      if(pLoadError) return interaction.reply({content:`❌ خواندن Panel انجام نشد: ${pLoadError.message}`,ephemeral:true});
+      if(!p) return interaction.reply({content:`❌ Panel #${num} پیدا نشد. ابتدا /panels را اجرا کنید.`,ephemeral:true});
       if(p.channel_id && p.message_id){ const ch=guild.channels.cache.get(p.channel_id); const msg=ch?await ch.messages.fetch(p.message_id).catch(()=>null):null; if(msg) await msg.delete().catch(()=>{}); }
       const {error}=await supabase.from('ticket_panels').delete().eq('id',p.id).eq('guild_id',guild.id); if(error) return interaction.reply({content:`❌ حذف Panel انجام نشد: ${error.message}`,ephemeral:true});
       return interaction.reply({content:`✅ Panel #${num} کاملاً حذف شد.`,ephemeral:true});
     }
     if(commandName==='editpanel'){
       const num=interaction.options.getInteger('num',true);
-      const {data:p}=await supabase.from('ticket_panels').select('*').eq('guild_id',guild.id).eq('panel_number',num).maybeSingle();
-      if(!p) return interaction.reply({content:`❌ Panel #${num} پیدا نشد.`,ephemeral:true});
+      const {data:p,error:pLoadError}=await loadPanelByNumber(guild.id,num);
+      if(pLoadError) return interaction.reply({content:`❌ خواندن Panel انجام نشد: ${pLoadError.message}`,ephemeral:true});
+      if(!p) return interaction.reply({content:`❌ Panel #${num} پیدا نشد. ابتدا /panels را اجرا کنید.`,ephemeral:true});
       const patch={};
       for(const k of ['name','text','welcome']){
         const v=interaction.options.getString(k); if(v!==null) patch[k==='text'?'description':k==='welcome'?'welcome_text':'name']=v;
@@ -782,7 +950,12 @@ client.on('interactionCreate',async interaction=>{
     if(['kick','ban','timeout','warn'].includes(commandName)){
       if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); const m=interaction.options.getMember('user'), reason=interaction.options.getString('reason')||'بدون دلیل'; if(!m) return interaction.reply({content:'ممبر پیدا نشد.',ephemeral:true});
       if(commandName==='warn'){ const {count}=await supabase.from('member_warns').select('*',{count:'exact',head:true}).eq('guild_id',guild.id).eq('user_id',m.id); await supabase.from('member_warns').insert({guild_id:guild.id,user_id:m.id,reason}); const n=(count||0)+1; if(n>=3) await m.timeout(2*60*60*1000,'3 warnings').catch(()=>{}); await logTo(guild,'member_warn_log_channel',`⚠️ Warn | ${m.user.tag} | ${n}/3 | ${reason}`); return interaction.reply({content:`Warn ثبت شد (${n}/3).`}); }
-      if(commandName==='kick') await m.kick(reason); if(commandName==='ban') await m.ban({reason}); if(commandName==='timeout') await m.timeout(2*60*60*1000,reason); await logTo(guild,'ban_kick_log_channel',`🛡️ ${commandName} | ${m.user.tag} | ${reason}`); return interaction.reply({content:`${commandName} انجام شد.`});
+      if(commandName==='kick') await m.kick(reason);
+      if(commandName==='ban') await m.ban({reason});
+      if(commandName==='timeout') await m.timeout(2*60*60*1000,reason);
+      const moderationLogKey=commandName==='timeout'?'timeout_log_channel':'ban_kick_log_channel';
+      await logTo(guild,moderationLogKey,`🛡️ ${commandName} | ${m.user.tag} | ${reason}`);
+      return interaction.reply({content:`${commandName} انجام شد.`});
     }
     if(['unwarn','unban','untimeout'].includes(commandName)){
       if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true});
@@ -839,6 +1012,22 @@ client.on('interactionCreate',async interaction=>{
     if(commandName==='settextwel'){ if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); await setSettings(guild.id,{welcome_text:interaction.options.getString('text')}); return interaction.reply({content:'متن Welcome ذخیره شد.'}); }
     if(commandName==='settextinc'){ if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); await setSettings(guild.id,{invite_text:interaction.options.getString('text')}); return interaction.reply({content:'متن Invite ذخیره شد.'}); }
     if(commandName==='setex'){ if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); await setSettings(guild.id,{exchange_channel:interaction.options.getChannel('channel').id}); return interaction.reply({content:'چنل Exchange ذخیره شد.'}); }
+    if(commandName==='setlogchannel'){
+      if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true});
+      const ch=interaction.options.getChannel('channel');
+      await setSettings(guild.id,{aggregated_log_channel:ch.id,next_log_flush_at:new Date(Date.now()+LOG_FLUSH_FIRST_MS).toISOString()});
+      await protectLogChannel(guild,ch.id);
+      return interaction.reply({content:`✅ کانال گزارش لاگ‌ها روی ${ch} تنظیم شد. اولین گزارش خودکار ۳ ساعت بعد ارسال می‌شود و سپس هر ۶ ساعت یک‌بار.`});
+    }
+    if(commandName==='sendlogs'){
+      if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true});
+      await interaction.deferReply({ephemeral:true});
+      const result=await flushGuildLogs(guild,true);
+      if(result.reason==='not-configured') return interaction.editReply({content:'❌ ابتدا با `/setlogchannel` کانال لاگ را تنظیم کنید.'});
+      if(result.reason==='invalid-channel') return interaction.editReply({content:'❌ کانال لاگ معتبر نیست یا دیگر وجود ندارد.'});
+      if(!result.sent) return interaction.editReply({content:'❌ ارسال گزارش لاگ انجام نشد. دسترسی Send Messages و Embed Links کانال را بررسی کنید.'});
+      return interaction.editReply({content:`✅ گزارش لاگ ارسال شد (${result.count} مورد) و زمان گزارش بعدی روی ۶ ساعت بعد تنظیم شد.`});
+    }
     if(commandName==='setexlog'){ if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); const ch=interaction.options.getChannel('channel'); await setSettings(guild.id,{exchange_log_channel:ch.id}); return interaction.reply({content:`Exchange Log روی ${ch} تنظیم شد.`}); }
     if(commandName==='setrate'){ if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); const ch=interaction.options.getChannel('channel'); await setSettings(guild.id,{ticket_feedback_channel:ch.id}); return interaction.reply({content:`Rating Channel روی ${ch} تنظیم شد.`}); }
     if(commandName==='setticketlog'){ const ch=interaction.options.getChannel('channel'); await setSettings(guild.id,{ticket_transcript_log_channel:ch.id}); return interaction.reply({content:`Transcript Log روی ${ch} تنظیم شد.`}); }
@@ -847,15 +1036,23 @@ client.on('interactionCreate',async interaction=>{
 
 client.on('guildMemberAdd',async member=>{
   const s=await getSettings(member.guild.id);
-  if(s.welcome_channel){ const ch=member.guild.channels.cache.get(s.welcome_channel); if(ch) await ch.send(placeholders(s.welcome_text||'خوش آمدی [user] ❤️\nتعداد اعضا: [Number]',member,member.guild)); }
+  const welcomeText=placeholders(s.welcome_text||'خوش آمدی [user] ❤️\nتعداد اعضا: [Number]',member,member.guild);
+  if(s.welcome_channel){ const ch=member.guild.channels.cache.get(s.welcome_channel); if(ch) await ch.send(welcomeText).catch(()=>{}); }
+  await logTo(member.guild,'welcome_channel',`👋 Welcome | ${member.user.tag} (${member.id})`);
   const before=inviteCache.get(member.guild.id)||new Map(), after=await member.guild.invites.fetch().catch(()=>new Map());
   let used=null; for(const i of after.values()){ if((i.uses||0)>(before.get(i.code)||0)){used=i;break;} }
   await cacheInvites(member.guild).catch(()=>{});
-  if(used){ await supabase.from('invite_stats').upsert({guild_id:member.guild.id,inviter_id:used.inviter?.id||'unknown',invited_id:member.id}); const {count}=await supabase.from('invite_stats').select('*',{count:'exact',head:true}).eq('guild_id',member.guild.id).eq('inviter_id',used.inviter?.id||'unknown'); if(s.invite_log_channel){ const ch=member.guild.channels.cache.get(s.invite_log_channel); if(ch) await ch.send(placeholders(s.invite_text||'👋 [user] با دعوت <inv> وارد شد. تعداد دعوت: [invnum]',member,member.guild,used.inviter?.id||'',count||0).replace('[inv]',used.inviter?.id||'')); } }
+  if(used){ await supabase.from('invite_stats').upsert({guild_id:member.guild.id,inviter_id:used.inviter?.id||'unknown',invited_id:member.id}); const {count}=await supabase.from('invite_stats').select('*',{count:'exact',head:true}).eq('guild_id',member.guild.id).eq('inviter_id',used.inviter?.id||'unknown'); const inviteText=placeholders(s.invite_text||'👋 [user] با دعوت <inv> وارد شد. تعداد دعوت: [invnum]',member,member.guild,used.inviter?.id||'',count||0).replace('[inv]',used.inviter?.id||''); if(s.invite_log_channel){ const ch=member.guild.channels.cache.get(s.invite_log_channel); if(ch) await ch.send(inviteText).catch(()=>{}); } await logTo(member.guild,'invite_log_channel',`📨 Invite | ${member.user.tag} | inviter=${used.inviter?.tag||used.inviter?.id||'unknown'} | total=${count||0}`); }
 });
 client.on('voiceStateUpdate',async(oldS,newS)=>{ if(!newS.guild) return; if(!oldS.channelId&&newS.channelId) await logTo(newS.guild,'voice_log_channel',`🔊 <@${newS.id}> وارد ${newS.channel?.name} شد.`); else if(oldS.channelId&&!newS.channelId) await logTo(newS.guild,'voice_log_channel',`🔇 <@${newS.id}> از ${oldS.channel?.name} خارج شد.`); });
 client.on('messageDelete',async m=>{ if(m.guild&&!m.author?.bot) await logTo(m.guild,'message_log_channel',`🗑️ پیام حذف شد | ${m.author?.tag||'نامشخص'} | ${m.content||'بدون متن'}`); });
 client.on('messageUpdate',async(oldM,newM)=>{ if(oldM.guild&&oldM.content!==newM.content&&!newM.author?.bot) await logTo(oldM.guild,'message_log_channel',`✏️ پیام ویرایش شد | ${newM.author?.tag||'نامشخص'}\nقبل: ${oldM.content||''}\nبعد: ${newM.content||''}`); });
+client.on('guildUpdate',async(oldG,newG)=>{
+  const changes=[];
+  if(oldG.name!==newG.name) changes.push(`نام: ${oldG.name} → ${newG.name}`);
+  if(oldG.icon!==newG.icon) changes.push('آیکن سرور تغییر کرد');
+  if(changes.length) await logTo(newG,'server_update_log_channel',`🏠 Server Update | ${changes.join(' | ')}`);
+});
 client.on('roleCreate',r=>logTo(r.guild,'server_update_log_channel',`➕ Role ساخته شد: ${r.name}`));
 client.on('roleDelete',r=>logTo(r.guild,'server_update_log_channel',`➖ Role حذف شد: ${r.name}`));
 client.on('channelCreate',c=>c.guild&&logTo(c.guild,'server_update_log_channel',`➕ Channel ساخته شد: ${c.name}`));
