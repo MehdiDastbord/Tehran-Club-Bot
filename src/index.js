@@ -35,16 +35,23 @@ function stripMentions(text){
 function displayUser(memberOrUser){
   return memberOrUser?.user?.tag || memberOrUser?.tag || memberOrUser?.username || memberOrUser?.id || 'Unknown';
 }
+const EXACT_EXCHANGE_MENTION_USERNAMES = ['amir_gholizadeh22', 'itskingpubgyt'];
+
 async function resolveExchangeLogMentions(guild){
-  const configured=String(process.env.EXCHANGE_LOG_MENTION_USERS || 'amir_gholizadeh22,itskingpubgyt').split(',').map(x=>x.trim()).filter(Boolean);
+  // These are the exact accounts requested for the Exchange Log. IDs may be
+  // supplied for extra reliability, but the username defaults remain fixed.
+  const configured=String(process.env.EXCHANGE_LOG_MENTION_USERS || EXACT_EXCHANGE_MENTION_USERNAMES.join(','))
+    .split(',').map(x=>x.trim()).filter(Boolean);
   const ids=[];
-  for(const name of configured){
-    if(/^\d{15,25}$/.test(name)){ ids.push(name); continue; }
-    const found=guild.members.cache.find(m=>m.user.username.toLowerCase()===name.toLowerCase() || m.user.tag.toLowerCase()===name.toLowerCase() || m.displayName.toLowerCase()===name.toLowerCase());
-    if(found){ ids.push(found.user.id); continue; }
-    const fetched=await guild.members.fetch({query:name,limit:10}).catch(()=>null);
-    const match=fetched?.find(m=>m.user.username.toLowerCase()===name.toLowerCase() || m.user.tag.toLowerCase()===name.toLowerCase() || m.displayName.toLowerCase()===name.toLowerCase());
-    if(match) ids.push(match.user.id);
+  for(const target of configured){
+    if(/^\d{15,25}$/.test(target)) { ids.push(target); continue; }
+    const username=target.toLowerCase();
+    let member=guild.members.cache.find(m=>m.user.username.toLowerCase()===username);
+    if(!member) {
+      const fetched=await guild.members.fetch({query:target,limit:10}).catch(()=>null);
+      member=fetched?.find(m=>m.user.username.toLowerCase()===username) || null;
+    }
+    if(member) ids.push(member.user.id);
   }
   return [...new Set(ids)];
 }
@@ -228,17 +235,28 @@ async function claimTicket(interaction,t){
 }
 async function closeTicket(interaction,t,reason){
   if(!hasAccess(interaction.member,ACCESS.ticket)) return interaction.reply({content:'دسترسی Ticket نداری.',ephemeral:true});
-  await supabase.from('tickets').update({status:'closed',closed_at:new Date().toISOString()}).eq('id',t.id);
-  await interaction.channel.permissionOverwrites.edit(t.opener_id,{SendMessages:false,ViewChannel:true});
-  if(t.claimed_by) await interaction.channel.permissionOverwrites.edit(t.claimed_by,{SendMessages:false,ViewChannel:true});
-  const msgs=[]; const fetched=await interaction.channel.messages.fetch({limit:100}).catch(()=>null); if(fetched) for(const m of fetched.sort((a,b)=>a.createdTimestamp-b.createdTimestamp).values()) msgs.push(`[${m.createdAt.toISOString()}] ${m.author.tag}: ${m.content||'[attachment/embed]'}`);
-  const transcript=`Ticket #${t.id}\nOpened by: ${t.opener_id}\nClaimed by: ${t.claimed_by||'none'}\nClosed by: ${interaction.user.id}\nReason: ${reason||'بدون دلیل'}\nClosed at: ${new Date().toISOString()}\n\n--- Messages (latest 100) ---\n${msgs.join('\n')}`;
+  if(!t || t.status!=='open') return interaction.reply({content:'این Ticket قبلاً بسته شده یا پیدا نشد.',ephemeral:true});
+  await interaction.deferReply({ephemeral:false});
+  const closedAt=new Date().toISOString();
+  const {data:closed,error:closeError}=await supabase.from('tickets').update({status:'closed',closed_at:closedAt}).eq('id',t.id).eq('status','open').select('id,status,opener_id,claimed_by').maybeSingle();
+  if(closeError || !closed){
+    console.error('ticket close error:',closeError);
+    return interaction.editReply({content:'❌ بستن Ticket انجام نشد. اگر شخص دیگری همزمان آن را بسته باشد، Ticket دیگر باز نیست.'});
+  }
+  await interaction.channel.permissionOverwrites.edit(t.opener_id,{SendMessages:false,ViewChannel:true}).catch(()=>{});
+  if(t.claimed_by) await interaction.channel.permissionOverwrites.edit(t.claimed_by,{SendMessages:false,ViewChannel:true}).catch(()=>{});
+  const msgs=[]; const fetched=await interaction.channel.messages.fetch({limit:100}).catch(()=>null);
+  if(fetched) for(const m of fetched.sort((a,b)=>a.createdTimestamp-b.createdTimestamp).values()) msgs.push(`[${m.createdAt.toISOString()}] ${m.author.tag}: ${m.content||'[attachment/embed]'}`);
+  const transcript=`Ticket #${t.id}\nOpened by: ${t.opener_id}\nClaimed by: ${t.claimed_by||'none'}\nClosed by: ${interaction.user.id}\nReason: ${reason||'بدون دلیل'}\nClosed at: ${closedAt}\n\n--- Messages (latest 100) ---\n${msgs.join('\n')}`;
   await supabase.from('tickets').update({transcript}).eq('id',t.id);
   const feedbackRow=new ActionRowBuilder().addComponents([1,2,3,4,5].map(n=>new ButtonBuilder().setCustomId(`feedback:${t.id}:${n}`).setLabel(`${n} ⭐`).setStyle(ButtonStyle.Secondary)));
   const user=await interaction.guild.members.fetch(t.opener_id).catch(()=>null);
-  if(user) await user.send({content:`🎫 تیکت شما بسته شد. دلیل: ${reason||'بدون دلیل'}\nلطفاً امتیاز بده:`,components:[feedbackRow]}).catch(()=>{});
+  let dmSent=false;
+  if(user){
+    dmSent=!!await user.send({content:`🎫 تیکت شما بسته شد. دلیل: ${reason||'بدون دلیل'}\nلطفاً امتیاز بده:`,components:[feedbackRow],allowedMentions:{parse:[]}}).then(()=>true).catch(err=>{ console.warn('ticket rating DM failed:',err?.message||err); return false; });
+  }
   await logTo(interaction.guild,'ticket_log_channel',`🔒 Ticket بسته شد | ${interaction.channel.name} | توسط ${interaction.user.tag} | دلیل: ${reason||'بدون دلیل'}`);
-  return interaction.reply({content:'تیکت بسته شد و Feedback برای صاحب تیکت ارسال شد.',ephemeral:false});
+  return interaction.editReply({content:dmSent?'تیکت بسته شد و Feedback برای صاحب تیکت ارسال شد.':'تیکت بسته شد، اما DM صاحب تیکت قابل ارسال نبود (احتمالاً DM بسته است).'});
 }
 
 client.on('interactionCreate',async interaction=>{
@@ -271,18 +289,19 @@ client.on('interactionCreate',async interaction=>{
       }
       if(type==='exapprove'||type==='exreject'){
         if(!hasAccess(interaction.member,ACCESS.exchange)) return interaction.reply({content:'فقط رول Exchange می‌تواند این دکمه را استفاده کند.',ephemeral:true});
+        await interaction.deferReply({ephemeral:true});
         const status=type==='exapprove'?'approved':'rejected';
         const {data:e,error:eError}=await supabase.from('exchange_requests').update({status,reviewer_id:interaction.user.id}).eq('id',id).eq('status','pending').select().maybeSingle();
-        if(eError){ console.error('exchange review error:',eError); return interaction.reply({content:'❌ خطا در ثبت بررسی Exchange.',ephemeral:true}); }
-        if(!e) return interaction.reply({content:'این درخواست قبلاً بررسی شده.',ephemeral:true});
+        if(eError){ console.error('exchange review error:',eError); return interaction.editReply({content:'❌ خطا در ثبت بررسی Exchange.'}); }
+        if(!e) return interaction.editReply({content:'این درخواست قبلاً بررسی شده.'});
         if(status==='rejected'){
-          await interaction.message.delete().catch(()=>interaction.message.edit({content:`❌ Exchange رد شد توسط <@${interaction.user.id}>`,components:[]}));
-          return interaction.reply({content:'Exchange رد شد و از Exchange Log حذف شد.',ephemeral:true});
+          await interaction.message.delete().catch(()=>interaction.message.edit({content:`❌ Exchange رد شد توسط ${stripMentions(interaction.user.tag)}`,components:[],allowedMentions:{parse:[]}}));
+          return interaction.editReply({content:'Exchange رد شد و از Exchange Log حذف شد.'});
         }
         const guild=interaction.guild; const s=await getSettings(guild.id), ch=s.exchange_channel && guild.channels.cache.get(s.exchange_channel);
         if(!ch?.isTextBased()){
           await supabase.from('exchange_requests').update({status:'pending',reviewer_id:null}).eq('id',id);
-          return interaction.reply({content:'❌ /setex تنظیم نشده یا کانال مقصد معتبر نیست. درخواست دوباره در حالت Pending قرار گرفت.',ephemeral:true});
+          return interaction.editReply({content:'❌ /setex تنظیم نشده یا کانال مقصد معتبر نیست. درخواست دوباره در حالت Pending قرار گرفت.'});
         }
         const safeBanner=stripMentions(e.banner);
         const finalMessage=`Exchange\n${safeBanner}`.trim();
@@ -291,10 +310,10 @@ client.on('interactionCreate',async interaction=>{
         }catch(err){
           console.error('exchange final send error:',err);
           await supabase.from('exchange_requests').update({status:'pending',reviewer_id:null}).eq('id',id);
-          return interaction.reply({content:'❌ ارسال به Exchange Tab انجام نشد؛ درخواست دوباره Pending شد.',ephemeral:true});
+          return interaction.editReply({content:'❌ ارسال به Exchange Tab انجام نشد؛ درخواست دوباره Pending شد.'});
         }
         await interaction.message.delete().catch(()=>interaction.message.edit({content:`✅ Exchange تایید و ارسال شد توسط <@${interaction.user.id}>`,components:[]}));
-        return interaction.reply({content:'Exchange تایید شد و بدون هیچ Mention به Exchange Tab ارسال شد.',ephemeral:true});
+        return interaction.editReply({content:'Exchange تایید شد و بدون هیچ Mention به Exchange Tab ارسال شد.'});
       }
       if(type==='claim') return claimTicket(interaction,await getTicket(interaction.channel));
       if(type==='close'){
@@ -308,7 +327,10 @@ client.on('interactionCreate',async interaction=>{
         const stars=Number(extra); const {data:t}=await supabase.from('tickets').select('*').eq('id',id).maybeSingle();
         if(!t) return interaction.reply({content:'Ticket پیدا نشد.',ephemeral:true});
         if(t.status!=='closed' || interaction.user.id!==t.opener_id) return interaction.reply({content:'این Feedback فقط برای صاحب تیکت بسته‌شده قابل ثبت است.',ephemeral:true});
-        await supabase.from('ticket_feedback').upsert({ticket_id:id,user_id:interaction.user.id,stars});
+        const {data:existingFeedback}=await supabase.from('ticket_feedback').select('id').eq('ticket_id',id).eq('user_id',interaction.user.id).maybeSingle();
+        if(existingFeedback) return interaction.reply({content:'این Ticket قبلاً Rating شده است.',ephemeral:true});
+        const {error:feedbackInsertError}=await supabase.from('ticket_feedback').insert({ticket_id:id,user_id:interaction.user.id,stars});
+        if(feedbackInsertError){ console.error('feedback insert error:',feedbackInsertError); return interaction.reply({content:'❌ ذخیره Rating انجام نشد. دوباره تلاش کنید.',ephemeral:true}); }
         const modal=new ModalBuilder().setCustomId(`feedbackmodal:${id}:${stars}`).setTitle(`${stars} ستاره`).addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('feedback').setLabel('نظر شما').setStyle(TextInputStyle.Paragraph).setRequired(false)));
         return interaction.showModal(modal);
       }
@@ -329,9 +351,11 @@ client.on('interactionCreate',async interaction=>{
       if(interaction.customId.startsWith('closemodal:')){ const t=await getTicket(interaction.channel); return closeTicket(interaction,t,interaction.fields.getTextInputValue('reason')); }
       if(interaction.customId.startsWith('feedbackmodal:')){
         const [,id,stars]=interaction.customId.split(':'); const text=interaction.fields.getTextInputValue('feedback')||'';
-        await supabase.from('ticket_feedback').update({text}).eq('ticket_id',id).eq('user_id',interaction.user.id).eq('stars',Number(stars));
+        await interaction.deferReply({ephemeral:true});
         const t=(await supabase.from('tickets').select('guild_id,opener_id,claimed_by,status').eq('id',id).maybeSingle()).data;
-        if(!t || t.status!=='closed' || interaction.user.id!==t.opener_id) return interaction.reply({content:'این Feedback معتبر نیست.',ephemeral:true});
+        if(!t || t.status!=='closed' || interaction.user.id!==t.opener_id) return interaction.editReply({content:'این Feedback معتبر نیست.'});
+        const {error:feedbackError}=await supabase.from('ticket_feedback').update({text}).eq('ticket_id',id).eq('user_id',interaction.user.id).eq('stars',Number(stars));
+        if(feedbackError) console.error('feedback save error:',feedbackError);
         const g=client.guilds.cache.get(t.guild_id);
         if(g){
           const s=await getSettings(g.id), fb=s.ticket_feedback_channel && g.channels.cache.get(s.ticket_feedback_channel);
@@ -347,7 +371,7 @@ client.on('interactionCreate',async interaction=>{
             await fb.send({embeds:[embed],allowedMentions:{parse:[]}}).catch(err=>console.error('rating log error:',err));
           }
         }
-        return interaction.reply({content:'ممنون بابت Feedback ❤️',ephemeral:true});
+        return interaction.editReply({content:'ممنون بابت Feedback ❤️'});
       }
       if(interaction.customId.startsWith('ticketform:')){
         const panel=(await supabase.from('ticket_panels').select('*').eq('id',interaction.customId.split(':')[1]).maybeSingle()).data;
@@ -356,24 +380,31 @@ client.on('interactionCreate',async interaction=>{
       }
       if(interaction.customId==='exchange'){
         const banner=interaction.fields.getTextInputValue('banner');
+        await interaction.deferReply({ephemeral:true});
         const settings=await getSettings(interaction.guild.id);
-        if(!settings.exchange_log_channel) return interaction.reply({content:'❌ Exchange Log تنظیم نشده. لطفاً /setexlog را تنظیم کنید.',ephemeral:true});
+        if(!settings.exchange_log_channel) return interaction.editReply({content:'❌ Exchange Log تنظیم نشده. لطفاً /setexlog را تنظیم کنید.'});
         const logChannel=interaction.guild.channels.cache.get(settings.exchange_log_channel);
-        if(!logChannel?.isTextBased()) return interaction.reply({content:'❌ کانال Exchange Log معتبر نیست. دوباره /setexlog را تنظیم کنید.',ephemeral:true});
+        if(!logChannel?.isTextBased()) return interaction.editReply({content:'❌ کانال Exchange Log معتبر نیست. دوباره /setexlog را تنظیم کنید.'});
         const {data:e,error:eError}=await supabase.from('exchange_requests').insert({guild_id:interaction.guild.id,user_id:interaction.user.id,banner,status:'pending'}).select().single();
-        if(eError || !e) { console.error('exchange insert error:',eError); return interaction.reply({content:'❌ درخواست Exchange ذخیره نشد. تنظیمات Supabase را بررسی کنید.',ephemeral:true}); }
+        if(eError || !e) { console.error('exchange insert error:',eError); return interaction.editReply({content:'❌ درخواست Exchange ذخیره نشد. تنظیمات Supabase را بررسی کنید.'}); }
         const logMentionUsers=await resolveExchangeLogMentions(interaction.guild);
+        if(logMentionUsers.length < 2){
+          await supabase.from('exchange_requests').delete().eq('id',e.id);
+          return interaction.editReply({content:'❌ هر دو اکانت Exchange Log پیدا نشدند. باید دقیقاً amir_gholizadeh22 و itskingpubgyt در همین سرور باشند (یا ID آن‌ها در EXCHANGE_LOG_MENTION_USERS تنظیم شود).'});
+        }
         const mentions=logMentionUsers.map(id=>`<@${id}>`).join(' ');
         const row=new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId(`exapprove:${e.id}`).setLabel('ACCEPT').setStyle(ButtonStyle.Success),
           new ButtonBuilder().setCustomId(`exreject:${e.id}`).setLabel('DECLINE').setStyle(ButtonStyle.Danger)
         );
-        await logChannel.send({content:`${mentions}\n📥 **Exchange Request**\nUser: <@${interaction.user.id}>\n\n${banner}`,components:[row],allowedMentions:{users:[...logMentionUsers,interaction.user.id]}}).catch(async err=>{
+        try{
+          await logChannel.send({content:`${mentions}\n📥 **Exchange Request**\nUser: <@${interaction.user.id}>\n\n${banner}`,components:[row],allowedMentions:{users:[...logMentionUsers,interaction.user.id]}});
+        }catch(err){
           console.error('exchange log send error:',err);
           await supabase.from('exchange_requests').delete().eq('id',e.id);
-          throw err;
-        });
-        return interaction.reply({content:'فرم Exchange به Exchange Log ارسال شد و منتظر تایید است.',ephemeral:true});
+          return interaction.editReply({content:'❌ ارسال فرم به Exchange Log انجام نشد. دسترسی بات به کانال را بررسی کنید.'});
+        }
+        return interaction.editReply({content:'فرم Exchange به Exchange Log ارسال شد و منتظر تایید است.'});
       }
     }
     if(!interaction.isChatInputCommand()) return;
