@@ -1,4 +1,11 @@
 
+const WebSocket = require('ws');
+
+// Supabase Realtime requires a WebSocket implementation on Node.js < 22.
+// Railway may still run Node 20 depending on the deployment image, so provide
+// ws explicitly before Supabase creates its Realtime client.
+global.WebSocket = WebSocket;
+
 const { createClient } = require('@supabase/supabase-js');
 
 const supabase = createClient(
