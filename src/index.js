@@ -36,6 +36,7 @@ function displayUser(memberOrUser){
   return memberOrUser?.user?.tag || memberOrUser?.tag || memberOrUser?.username || memberOrUser?.id || 'Unknown';
 }
 const EXACT_EXCHANGE_MENTION_USERNAMES = ['amir_gholizadeh22', 'itskingpubgyt'];
+const EXCHANGE_LOG_CHANNEL_ID = String(process.env.EXCHANGE_LOG_CHANNEL_ID || '').trim();
 
 async function resolveExchangeLogMentions(guild){
   // These are the exact accounts requested for the Exchange Log. IDs may be
@@ -290,30 +291,43 @@ client.on('interactionCreate',async interaction=>{
       if(type==='exapprove'||type==='exreject'){
         if(!hasAccess(interaction.member,ACCESS.exchange)) return interaction.reply({content:'فقط رول Exchange می‌تواند این دکمه را استفاده کند.',ephemeral:true});
         await interaction.deferReply({ephemeral:true});
-        const status=type==='exapprove'?'approved':'rejected';
-        const {data:e,error:eError}=await supabase.from('exchange_requests').update({status,reviewer_id:interaction.user.id}).eq('id',id).eq('status','pending').select().maybeSingle();
-        if(eError){ console.error('exchange review error:',eError); return interaction.editReply({content:'❌ خطا در ثبت بررسی Exchange.'}); }
-        if(!e) return interaction.editReply({content:'این درخواست قبلاً بررسی شده.'});
-        if(status==='rejected'){
-          await interaction.message.delete().catch(()=>interaction.message.edit({content:`❌ Exchange رد شد توسط ${stripMentions(interaction.user.tag)}`,components:[],allowedMentions:{parse:[]}}));
-          return interaction.editReply({content:'Exchange رد شد و از Exchange Log حذف شد.'});
+        const {data:e,error:fetchError}=await supabase.from('exchange_requests').select('*').eq('id',id).maybeSingle();
+        if(fetchError){ console.error('exchange fetch error:',fetchError); return interaction.editReply({content:'❌ خطا در خواندن درخواست Exchange از Supabase.'}); }
+        if(!e) return interaction.editReply({content:'این درخواست دیگر وجود ندارد.'});
+        if(e.status && e.status!=='pending') return interaction.editReply({content:'این درخواست قبلاً بررسی شده است.'});
+
+        if(type==='exreject'){
+          const {error:deleteError}=await supabase.from('exchange_requests').delete().eq('id',id);
+          if(deleteError){ console.error('exchange decline delete error:',deleteError); return interaction.editReply({content:'❌ درخواست رد شد اما حذف آن از Supabase انجام نشد.'}); }
+          try{
+            const user=await interaction.client.users.fetch(e.user_id);
+            await user.send({content:'Banner declined',allowedMentions:{parse:[]}});
+          }catch(err){ console.error('exchange decline DM error:',err); }
+          await interaction.message.delete().catch(()=>interaction.message.edit({content:'❌ Banner declined',components:[],allowedMentions:{parse:[]}}));
+          return interaction.editReply({content:'Banner declined. پیام به کاربر ارسال شد و درخواست از Supabase حذف شد.'});
         }
-        const guild=interaction.guild; const s=await getSettings(guild.id), ch=s.exchange_channel && guild.channels.cache.get(s.exchange_channel);
+
+        const guild=interaction.guild;
+        const settings=await getSettings(guild.id);
+        const chId=settings.exchange_channel;
+        const ch=chId ? (guild.channels.cache.get(chId) || await guild.channels.fetch(chId).catch(()=>null)) : null;
         if(!ch?.isTextBased()){
-          await supabase.from('exchange_requests').update({status:'pending',reviewer_id:null}).eq('id',id);
-          return interaction.editReply({content:'❌ /setex تنظیم نشده یا کانال مقصد معتبر نیست. درخواست دوباره در حالت Pending قرار گرفت.'});
+          return interaction.editReply({content:'❌ /setex تنظیم نشده یا کانال Exchange مقصد معتبر نیست.'});
         }
         const safeBanner=stripMentions(e.banner);
-        const finalMessage=`Exchange\n${safeBanner}`.trim();
         try{
-          await ch.send({content:finalMessage,allowedMentions:{parse:[]}});
+          await ch.send({content:safeBanner,allowedMentions:{parse:[],users:[],roles:[],repliedUser:false}});
         }catch(err){
           console.error('exchange final send error:',err);
-          await supabase.from('exchange_requests').update({status:'pending',reviewer_id:null}).eq('id',id);
-          return interaction.editReply({content:'❌ ارسال به Exchange Tab انجام نشد؛ درخواست دوباره Pending شد.'});
+          return interaction.editReply({content:`❌ ارسال به Exchange انجام نشد: ${err?.message || err}`});
         }
-        await interaction.message.delete().catch(()=>interaction.message.edit({content:`✅ Exchange تایید و ارسال شد توسط <@${interaction.user.id}>`,components:[]}));
-        return interaction.editReply({content:'Exchange تایید شد و بدون هیچ Mention به Exchange Tab ارسال شد.'});
+        const {error:deleteError}=await supabase.from('exchange_requests').delete().eq('id',id);
+        if(deleteError){
+          console.error('exchange accept delete error:',deleteError);
+          return interaction.editReply({content:'⚠️ Banner به Exchange ارسال شد، اما حذف درخواست از Supabase انجام نشد. بررسی کنید.'});
+        }
+        await interaction.message.delete().catch(()=>interaction.message.edit({content:'✅ Exchange accepted.',components:[],allowedMentions:{parse:[]}}));
+        return interaction.editReply({content:'Exchange accepted, sent, and removed from Supabase.'});
       }
       if(type==='claim') return claimTicket(interaction,await getTicket(interaction.channel));
       if(type==='close'){
@@ -382,9 +396,10 @@ client.on('interactionCreate',async interaction=>{
         const banner=interaction.fields.getTextInputValue('banner');
         await interaction.deferReply({ephemeral:true});
         const settings=await getSettings(interaction.guild.id);
-        if(!settings.exchange_log_channel) return interaction.editReply({content:'❌ Exchange Log تنظیم نشده. لطفاً /setexlog را تنظیم کنید.'});
-        const logChannel=interaction.guild.channels.cache.get(settings.exchange_log_channel);
-        if(!logChannel?.isTextBased()) return interaction.editReply({content:'❌ کانال Exchange Log معتبر نیست. دوباره /setexlog را تنظیم کنید.'});
+        const logChannelId=String(settings.exchange_log_channel || EXCHANGE_LOG_CHANNEL_ID || '').trim();
+        if(!logChannelId) return interaction.editReply({content:'❌ Exchange Log تنظیم نشده. /setexlog را تنظیم کنید یا EXCHANGE_LOG_CHANNEL_ID را در Railway قرار دهید.'});
+        const logChannel=interaction.guild.channels.cache.get(logChannelId) || await interaction.guild.channels.fetch(logChannelId).catch(()=>null);
+        if(!logChannel?.isTextBased()) return interaction.editReply({content:'❌ کانال Exchange Log معتبر نیست. ID کانال را بررسی کنید.'});
         const {data:e,error:eError}=await supabase.from('exchange_requests').insert({guild_id:interaction.guild.id,user_id:interaction.user.id,banner,status:'pending'}).select().single();
         if(eError || !e) { console.error('exchange insert error:',eError); return interaction.editReply({content:'❌ درخواست Exchange ذخیره نشد. تنظیمات Supabase را بررسی کنید.'}); }
         const logMentionUsers=await resolveExchangeLogMentions(interaction.guild);
@@ -398,11 +413,11 @@ client.on('interactionCreate',async interaction=>{
           new ButtonBuilder().setCustomId(`exreject:${e.id}`).setLabel('DECLINE').setStyle(ButtonStyle.Danger)
         );
         try{
-          await logChannel.send({content:`${mentions}\n📥 **Exchange Request**\nUser: <@${interaction.user.id}>\n\n${banner}`,components:[row],allowedMentions:{users:[...logMentionUsers,interaction.user.id]}});
+          await logChannel.send({content:`${mentions}\n📥 **Exchange Request**\nUser: <@${interaction.user.id}>\n\n${banner}`,components:[row],allowedMentions:{users:[...logMentionUsers,interaction.user.id],parse:[]}});
         }catch(err){
           console.error('exchange log send error:',err);
           await supabase.from('exchange_requests').delete().eq('id',e.id);
-          return interaction.editReply({content:'❌ ارسال فرم به Exchange Log انجام نشد. دسترسی بات به کانال را بررسی کنید.'});
+          return interaction.editReply({content:`❌ ارسال فرم به Exchange Log انجام نشد: ${err?.message || err}`});
         }
         return interaction.editReply({content:'فرم Exchange به Exchange Log ارسال شد و منتظر تایید است.'});
       }
