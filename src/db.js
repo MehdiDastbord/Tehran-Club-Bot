@@ -1,7 +1,3 @@
-if (typeof global.WebSocket === 'undefined') {
-  try { global.WebSocket = require('ws'); } catch {}
-}
-
 
 const { createClient } = require('@supabase/supabase-js');
 
