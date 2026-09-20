@@ -8,6 +8,7 @@ add(new SlashCommandBuilder().setName('exchange').setDescription('باز کرد�
 add(new SlashCommandBuilder().setName('banner').setDescription('نمایش بنر سرور'));
 add(new SlashCommandBuilder().setName('level').setDescription('نمایش سطح تجربه شما'));
 add(new SlashCommandBuilder().setName('leaderboard').setDescription('نمایش جدول رتبه‌بندی تجربه'));
+add(new SlashCommandBuilder().setName('setwelcome').setDescription('انتخاب کانال خوشامدگویی').addChannelOption(o=>o.setName('channel').setDescription('کانال ارسال پیام خوشامدگویی').addChannelTypes(ChannelType.GuildText).setRequired(true)));
 
 // Giveaway / drops (authorized IDs only)
 add(new SlashCommandBuilder().setName('giveaway').setDescription('ایجاد یک قرعه‌کشی').addStringOption(o=>o.setName('prize').setDescription('جایزه').setRequired(true)).addIntegerOption(o=>o.setName('minutes').setDescription('مدت زمان به دقیقه').setRequired(true).setMinValue(1)));

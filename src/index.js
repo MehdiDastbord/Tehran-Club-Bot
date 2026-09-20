@@ -866,6 +866,18 @@ client.on('interactionCreate',async interaction=>{
     if(!PUBLIC_COMMANDS.has(commandName) && !isBotOwner(interaction.user.id) && !TICKET_STAFF_COMMANDS.has(commandName)){
       return interaction.reply({content:'⛔ You are not authorized to use this bot command.',ephemeral:true});
     }
+    if(commandName==='setwelcome'){
+      if(!isBotOwner(interaction.user.id)){
+        return interaction.reply({content:'⛔ فقط Owner بات می‌تواند کانال خوشامدگویی را تنظیم کند.',ephemeral:true});
+      }
+      const channel=interaction.options.getChannel('channel',true);
+      const {error}=await setSettings(guild.id,{welcome_channel:channel.id});
+      if(error){
+        console.error('setwelcome error:',error);
+        return interaction.reply({content:`❌ ذخیره کانال خوشامدگویی انجام نشد: ${error.message||error}`,ephemeral:true});
+      }
+      return interaction.reply({content:`✅ کانال خوشامدگویی روی ${channel} تنظیم شد.`,ephemeral:true});
+    }
     if(['giveaway','giveawaysv','dropmatn','dropclick'].includes(commandName)){
       // Authorized IDs/owners may use giveaway management directly; otherwise
       // the dedicated giveaway access role is required. This keeps the command
