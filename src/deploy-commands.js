@@ -63,6 +63,7 @@ add(new SlashCommandBuilder().setName('setex').setDescription('تنظیم کان
 add(new SlashCommandBuilder().setName('setexlog').setDescription('تنظیم کانال لاگ تبادل').addChannelOption(o=>o.setName('channel').setDescription('کانال').addChannelTypes(ChannelType.GuildText).setRequired(true)));
 add(new SlashCommandBuilder().setName('setrate').setDescription('تنظیم کانال امتیازدهی تیکت').addChannelOption(o=>o.setName('channel').setDescription('کانال').addChannelTypes(ChannelType.GuildText).setRequired(true)));
 add(new SlashCommandBuilder().setName('setticketlog').setDescription('تنظیم کانال لاگ ترنسکریپت تیکت').addChannelOption(o=>o.setName('channel').setDescription('کانال').addChannelTypes(ChannelType.GuildText).setRequired(true)));
+add(new SlashCommandBuilder().setName('setclaimlog').setDescription('تنظیم کانال لاگ Claim تیکت').addChannelOption(o=>o.setName('channel').setDescription('کانال Claim Log').addChannelTypes(ChannelType.GuildText).setRequired(true)));
 add(new SlashCommandBuilder().setName('textowner').setDescription('تنظیم کانال ارسال پیام مالک').addChannelOption(o=>o.setName('channel').setDescription('کانال').setRequired(true)));
 add(new SlashCommandBuilder().setName('untextowner').setDescription('غیرفعال کردن ارسال پیام مالک'));
 add(new SlashCommandBuilder().setName('createcmd').setDescription('ایجاد یک دستور متنی عمومی سفارشی').addStringOption(o=>o.setName('keyword').setDescription('کلمه کلیدی').setRequired(true)).addStringOption(o=>o.setName('text').setDescription('پاسخ').setRequired(true)));

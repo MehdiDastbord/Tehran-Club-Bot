@@ -1172,6 +1172,7 @@ client.on('interactionCreate',async interaction=>{
     if(commandName==='setexlog'){ if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); const ch=interaction.options.getChannel('channel'); await setSettings(guild.id,{exchange_log_channel:ch.id}); return interaction.reply({content:`Exchange Log روی ${ch} تنظیم شد.`}); }
     if(commandName==='setrate'){ if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); const ch=interaction.options.getChannel('channel'); await setSettings(guild.id,{ticket_feedback_channel:ch.id}); return interaction.reply({content:`Rating Channel روی ${ch} تنظیم شد.`}); }
     if(commandName==='setticketlog'){ const ch=interaction.options.getChannel('channel'); await setSettings(guild.id,{ticket_transcript_log_channel:ch.id}); return interaction.reply({content:`Transcript Log روی ${ch} تنظیم شد.`}); }
+    if(commandName==='setclaimlog'){ if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); const ch=interaction.options.getChannel('channel'); await setSettings(guild.id,{ticket_log_channel:ch.id}); await protectLogChannel(guild,ch.id); return interaction.reply({content:`Claim Log روی ${ch} تنظیم شد.`}); }
   }catch(e){ console.error(e); if(!interaction.replied&&!interaction.deferred) await interaction.reply({content:'❌ خطایی رخ داد. کنسول VPS را بررسی کنید.',ephemeral:true}).catch(()=>{}); }
 });
 
