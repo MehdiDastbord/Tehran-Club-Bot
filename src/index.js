@@ -45,21 +45,29 @@ function stripMentions(text){
 function displayUser(memberOrUser){
   return memberOrUser?.user?.tag || memberOrUser?.tag || memberOrUser?.username || memberOrUser?.id || 'Unknown';
 }
-const EXCHANGE_ROLE_NAME = 'Exchange';
+const EXACT_EXCHANGE_MENTION_USERNAMES = ['amir_gholizadeh22', 'itskingpubgyt'];
 const EXCHANGE_LOG_CHANNEL_ID = String(process.env.EXCHANGE_LOG_CHANNEL_ID || '').trim();
-async function resolveExchangeRole(guild){
-  return guild.roles.cache.find(r=>r.name.toLowerCase()===EXCHANGE_ROLE_NAME.toLowerCase()) || null;
+
+async function resolveExchangeLogMentions(guild){
+  // These are the exact accounts requested for the Exchange Log. IDs may be
+  // supplied for extra reliability, but the username defaults remain fixed.
+  const configured=String(process.env.EXCHANGE_LOG_MENTION_USERS || EXACT_EXCHANGE_MENTION_USERNAMES.join(','))
+    .split(',').map(x=>x.trim()).filter(Boolean);
+  const ids=[];
+  for(const target of configured){
+    if(/^\d{15,25}$/.test(target)) { ids.push(target); continue; }
+    const username=target.toLowerCase();
+    let member=guild.members.cache.find(m=>m.user.username.toLowerCase()===username);
+    if(!member) {
+      const fetched=await guild.members.fetch({query:target,limit:10}).catch(()=>null);
+      member=fetched?.find(m=>m.user.username.toLowerCase()===username) || null;
+    }
+    if(member) ids.push(member.user.id);
+  }
+  return [...new Set(ids)];
 }
 function duration(minutes){ const n=Number(minutes); return Number.isFinite(n)&&n>0 ? n : null; }
 function fmt(ms){ const m=Math.max(1,Math.ceil(ms/60000)); return `${m} دقیقه`; }
-const giveawayTimers=new Map();
-function scheduleGiveawayEnd(g){
-  if(!g?.id || g.ended) return;
-  const existing=giveawayTimers.get(String(g.id)); if(existing) clearTimeout(existing);
-  const delay=Math.max(0, new Date(g.end_at).getTime()-Date.now());
-  const timer=setTimeout(async()=>{ giveawayTimers.delete(String(g.id)); await endGiveaways(); }, Math.min(delay, 2147483647));
-  giveawayTimers.set(String(g.id),timer);
-}
 function placeholders(text, member, guild, inv, invnum){
   return String(text||'').replaceAll('[user]', `<@${member.id}>`).replaceAll('[Number]', String(guild.memberCount))
     .replaceAll('[inv]', inv||'').replaceAll('[invnum]', String(invnum??0));
@@ -318,9 +326,6 @@ async function handleSetCh(message, parts){
 client.once('ready',async()=>{
   console.log(`Logged in as ${client.user.tag}`);
   for(const g of client.guilds.cache.values()) await ensureRoles(g);
-  await endGiveaways().catch(err=>console.error('initial giveaway check error:',err));
-  const activeGiveaways=await supabase.from('giveaways').select('*').eq('ended',false).catch(()=>({data:[]}));
-  for(const g of activeGiveaways.data||[]) scheduleGiveawayEnd(g);
   setInterval(endGiveaways,10000); setInterval(showStats,21600000);
   // First automatic log report is 3 hours after setup, then every 6 hours.
   setInterval(checkScheduledLogFlush,60000);
@@ -391,28 +396,23 @@ client.on('messageCreate',async message=>{
 });
 
 async function endGiveaways(){
-  const {data:allRows,error}=await supabase.from('giveaways').select('*').eq('ended',false);
-  const rows=(allRows||[]).filter(g=>Number.isFinite(new Date(g.end_at).getTime()) && new Date(g.end_at).getTime()<=Date.now());
+  const {data:rows,error}=await supabase.from('giveaways').select('*').eq('ended',false).lte('end_at',new Date().toISOString());
   if(error){ console.error('giveaway expiry query error:',error.message); return; }
   for(const g of rows||[]){
     try{
       const {data:entries, error:entryError}=await supabase.from('giveaway_entries').select('user_id').eq('giveaway_id',g.id);
       if(entryError){ console.error('giveaway entries read error:',entryError.message); continue; }
-      const joinedCount=entries?.length||0;
-      const winner=joinedCount?entries[Math.floor(Math.random()*joinedCount)].user_id:null;
+      const winner=entries?.length?entries[Math.floor(Math.random()*entries.length)].user_id:null;
       const {data:endedRow,error:updateError}=await supabase.from('giveaways').update({ended:true,winner_id:winner}).eq('id',g.id).eq('ended',false).select('id').maybeSingle();
       if(updateError || !endedRow) continue;
-      const timer=giveawayTimers.get(String(g.id)); if(timer) clearTimeout(timer); giveawayTimers.delete(String(g.id));
       const guild=client.guilds.cache.get(g.guild_id), ch=guild?.channels.cache.get(g.channel_id);
-      if(ch) await ch.send({content:`🎉 Giveaway تمام شد!\n👥 Joined: **${joinedCount}**\n🎁 جایزه: **${g.prize}**\n🏆 ${winner?`برنده: <@${winner}>`:'شرکت‌کننده‌ای نبود.'}`,allowedMentions:{users:winner?[winner]:[],parse:[]}}).catch(err=>console.error('giveaway finish send error:',err.message));
+      if(ch) await ch.send({content:`🎉 Giveaway تمام شد!\n🎁 جایزه: **${g.prize}**\n🏆 ${winner?`برنده: <@${winner}>`:'شرکت‌کننده‌ای نبود.'}`,allowedMentions:{users:winner?[winner]:[],parse:[]}}).catch(err=>console.error('giveaway finish send error:',err.message));
       if(guild) await logTo(guild,'giveaway_winner_log_channel',`🎉 Giveaway پایان یافت | prize=${g.prize} | winner=${winner||'none'}`);
       if(ch && g.message_id){
         const original=await ch.messages.fetch(g.message_id).catch(()=>null);
         if(original){
           const disabled=original.components.map(row=>new ActionRowBuilder().addComponents(row.components.map(component=>ButtonBuilder.from(component).setDisabled(true))));
-          const base=original.content.replace(/\n👥 Joined: \*\*\d+\*\*/,'').replace(/\n\n🎉 Giveaway تمام شد![\s\S]*$/,'');
-          const endedContent=`${base}\n👥 Joined: **${joinedCount}**\n\n🎉 **Giveaway Ended**\n🏆 ${winner?`Winner: <@${winner}>`:'No participants.'}`;
-          await original.edit({content:endedContent,components:disabled,allowedMentions:{users:winner?[winner]:[],parse:[]}}).catch(err=>console.error('giveaway final message update error:',err?.message||err));
+          await original.edit({components:disabled}).catch(()=>{});
         }
       }
     }catch(err){ console.error('giveaway expiry error:',err?.message||err); }
@@ -438,6 +438,7 @@ function ticketRows(ticketId, panel){
 function closedTicketRows(ticketId){
   return [new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`ticketdelete:${ticketId}`).setLabel('Delete').setStyle(ButtonStyle.Danger),
+    new ButtonBuilder().setCustomId(`transcript:${ticketId}`).setLabel('Transcript').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`ticketreopen:${ticketId}`).setLabel('Reopen').setStyle(ButtonStyle.Success)
   )];
 }
@@ -566,12 +567,8 @@ async function claimTicket(interaction,t){
   if(t.claimed_by) return interaction.reply({content:`این Ticket قبلاً توسط <@${t.claimed_by}> Claim شده است.`,ephemeral:true});
   const {data:claimed,error}=await supabase.from('tickets').update({claimed_by:interaction.user.id}).eq('id',t.id).eq('status','open').is('claimed_by',null).select('id,claimed_by').maybeSingle();
   if(error || !claimed) return interaction.reply({content:'❌ این Ticket همین الان توسط شخص دیگری Claim شد.',ephemeral:true});
-  const {error:historyError}=await supabase.from('ticket_claim_history').insert({ticket_id:t.id,guild_id:interaction.guild.id,user_id:interaction.user.id,action:'claim'});
-  if(historyError) console.error('ticket claim history error:',historyError.message||historyError);
-  await logTo(interaction.guild,'ticket_log_channel',`🎫 Ticket Claim | <@${interaction.user.id}> | Ticket #${t.id} | ${interaction.channel.name}`);
-  const settings=await getSettings(interaction.guild.id).catch(()=>({}));
-  const claimLogId=settings.ticket_log_channel;
-  if(claimLogId){ const claimLog=interaction.guild.channels.cache.get(claimLogId)||await interaction.guild.channels.fetch(claimLogId).catch(()=>null); if(claimLog?.isTextBased()) await claimLog.send({content:`🎫 **Ticket Claim**\n👤 Staff: <@${interaction.user.id}>\n🎫 Ticket: ${interaction.channel}\n🕐 ${new Date().toLocaleString('en-GB',{timeZone:'Asia/Dubai',hour12:false})}`,allowedMentions:{users:[interaction.user.id]}}).catch(err=>console.error('direct claim log error:',err?.message||err)); }
+  const {error:claimHistoryError}=await supabase.from('ticket_claim_history').insert({ticket_id:t.id,guild_id:interaction.guild.id,user_id:interaction.user.id,action:'claim'});
+  if(claimHistoryError) console.error('ticket claim history error:',claimHistoryError?.message||claimHistoryError);
   return interaction.reply({content:`🎫 Ticket توسط <@${interaction.user.id}> Claim شد.`,allowedMentions:{users:[interaction.user.id]}});
 }
 async function buildTranscript(interaction,t){
@@ -589,20 +586,17 @@ async function buildTranscript(interaction,t){
   msgs.reverse();
   return `Tehran Club Ticket Transcript\nTicket ID: ${t.id}\nChannel: ${interaction.channel.name}\nOpened By: ${t.opener_id}\nClaimed By: ${t.claimed_by||'none'}\nStatus: ${t.status}\n\n--- Messages ---\n${msgs.join('\n')||'(no messages)'}`;
 }
-async function sendTranscriptToChannel(interaction,t){
+async function sendTranscript(interaction,t){
   const text=await buildTranscript(interaction,t);
-  await supabase.from('tickets').update({transcript:text}).eq('id',t.id).catch(err=>console.error('transcript db save error:',err?.message||err));
+  const {error:transcriptSaveError}=await supabase.from('tickets').update({transcript:text}).eq('id',t.id);
+  if(transcriptSaveError) console.error('ticket transcript save error:',transcriptSaveError?.message||transcriptSaveError);
   const s=await getSettings(interaction.guild.id), logId=s.ticket_transcript_log_channel || s.ticket_log_channel;
   const ch=logId ? (interaction.guild.channels.cache.get(logId)||await interaction.guild.channels.fetch(logId).catch(()=>null)) : null;
-  if(!ch?.isTextBased()) throw new Error('Transcript Log تنظیم نشده. از /setticketlog استفاده کنید.');
+  if(!ch?.isTextBased()) return interaction.reply({content:'❌ Transcript Log تنظیم نشده. از /setticketlog استفاده کنید.',ephemeral:true});
   const safeName=String(interaction.channel.name||'ticket').replace(/[^a-z0-9-_]/gi,'-').slice(0,60);
   const file=new AttachmentBuilder(Buffer.from(text,'utf8'),{name:`${safeName}-${t.id}.txt`});
   await ch.send({content:`📄 Transcript | ${interaction.channel} | <@${t.opener_id}>`,files:[file],allowedMentions:{users:[t.opener_id]}});
-  return ch;
-}
-async function sendTranscript(interaction,t){
-  try{ const ch=await sendTranscriptToChannel(interaction,t); return interaction.reply({content:`✅ Transcript به ${ch} ارسال شد.`,ephemeral:true}); }
-  catch(err){ return interaction.reply({content:`❌ ارسال Transcript انجام نشد: ${err?.message||err}`,ephemeral:true}); }
+  return interaction.reply({content:`✅ Transcript به ${ch} ارسال شد.`,ephemeral:true});
 }
 async function closeTicket(interaction,t,reason){
   if(!isTicketStaff(interaction.member)) return interaction.reply({content:'فقط Tickets Support می‌تواند Ticket را ببندد.',ephemeral:true});
@@ -638,22 +632,7 @@ client.on('interactionCreate',async interaction=>{
         const {data:already}=await supabase.from('giveaway_entries').select('id').eq('giveaway_id',id).eq('user_id',interaction.user.id).maybeSingle();
         if(already) return interaction.reply({content:'قبلاً در این Giveaway شرکت کرده‌ای ✅',ephemeral:true});
         const {error}=await supabase.from('giveaway_entries').insert({giveaway_id:id,user_id:interaction.user.id});
-        if(error){
-          const {data:exists}=await supabase.from('giveaway_entries').select('id').eq('giveaway_id',id).eq('user_id',interaction.user.id).maybeSingle();
-          if(exists) return interaction.reply({content:'قبلاً در این Giveaway شرکت کردی ✅',ephemeral:true});
-          console.error('giveaway entry insert error:',error);
-          return interaction.reply({content:`❌ ثبت ورود Giveaway انجام نشد: ${error.message}`,ephemeral:true});
-        }
-        const {count}=await supabase.from('giveaway_entries').select('*',{count:'exact',head:true}).eq('giveaway_id',id);
-        const countValue=count||0;
-        const channel=interaction.guild.channels.cache.get(interaction.channel.id);
-        const original=channel?.messages ? await channel.messages.fetch((await supabase.from('giveaways').select('message_id').eq('id',id).maybeSingle()).data?.message_id).catch(()=>null) : null;
-        if(original){
-          const content=original.content.replace(/👥 Joined: \*\*\d+\*\*/,'👥 Joined: **'+countValue+'**');
-          const next=content.includes('👥 Joined:') ? content : content+'\n👥 Joined: **'+countValue+'**';
-          await original.edit({content:next}).catch(err=>console.error('giveaway count update error:',err?.message||err));
-        }
-        return interaction.reply({content:`وارد Giveaway شدی ✅ | Joined: ${countValue}`,ephemeral:true});
+        return interaction.reply({content:error?'❌ خطا در ثبت ورود Giveaway.':'وارد Giveaway شدی ✅',ephemeral:true});
       }
       if(type==='drop'){
         const {data:d}=await supabase.from('drops').select('*').eq('id',id).eq('ended',false).maybeSingle();
@@ -719,22 +698,42 @@ client.on('interactionCreate',async interaction=>{
       if(type==='ticketdelete'){
         if(!isTicketStaff(interaction.member)) return interaction.reply({content:'فقط Tickets Support می‌تواند Ticket را حذف کند.',ephemeral:true});
         const t=await getTicket(interaction.channel); if(!t || t.id!==id) return interaction.reply({content:'Ticket پیدا نشد.',ephemeral:true});
-        if(interaction.channel.__ticketDeleteScheduled) return interaction.reply({content:'🗑️ حذف این Ticket قبلاً زمان‌بندی شده است.',ephemeral:true});
-        interaction.channel.__ticketDeleteScheduled=true;
-        await interaction.deferReply({ephemeral:true});
-        try{
-          const transcriptChannel=await sendTranscriptToChannel(interaction,t);
-          await interaction.editReply({content:`📄 Transcript به ${transcriptChannel} ارسال شد.\n🗑️ Ticket در 3 ثانیه حذف می‌شود...`});
-        }catch(err){
-          interaction.channel.__ticketDeleteScheduled=false;
-          return interaction.editReply({content:`❌ Transcript ارسال نشد؛ Ticket حذف نشد.\n${err?.message||err}`});
+
+        // Prevent two staff members from triggering the same deletion at once.
+        if(interaction.channel.__ticketDeleteScheduled) {
+          return interaction.reply({content:'🗑️ حذف این Ticket قبلاً زمان‌بندی شده است.',ephemeral:true});
         }
+        interaction.channel.__ticketDeleteScheduled=true;
+
+        await interaction.reply({content:'🗑️ Ticket در 3 ثانیه حذف می‌شود...',ephemeral:true});
+
+        // Keep the channel alive for exactly 3 seconds after the delete action.
         await new Promise(resolve=>setTimeout(resolve,3000));
-        await supabase.from('ticket_answers').delete().eq('ticket_id',t.id).catch(err=>console.error('ticket answers cleanup error:',err?.message||err));
-        await supabase.from('ticket_members').delete().eq('ticket_id',t.id).catch(err=>console.error('ticket members cleanup error:',err?.message||err));
-        try{ await interaction.channel.delete(`Ticket deleted by ${interaction.user.tag}`); }
-        catch(err){ interaction.channel.__ticketDeleteScheduled=false; console.error('ticket channel delete error:',err); }
+
+        // IMPORTANT: keep the ticket row and feedback forever. The Discord channel
+        // can be deleted, but claim/rating history must remain available for the
+        // cumulative log report. Only transient ticket members/answers are removed.
+        const cleanupResults=await Promise.all([
+          supabase.from('ticket_answers').delete().eq('ticket_id',t.id),
+          supabase.from('ticket_members').delete().eq('ticket_id',t.id)
+        ]);
+        for(const result of cleanupResults){
+          if(result?.error) console.error('ticket delete cleanup error:',result);
+        }
+
+        try{
+          await interaction.channel.delete(`Ticket deleted by ${interaction.user.tag}`);
+        }catch(err){
+          console.error('ticket channel delete error:',err);
+          // If Discord temporarily failed, allow another click/retry instead of leaving the handler locked.
+          interaction.channel.__ticketDeleteScheduled=false;
+        }
         return;
+      }
+      if(type==='transcript'){
+        if(!isTicketStaff(interaction.member)) return interaction.reply({content:'فقط Tickets Support می‌تواند Transcript بگیرد.',ephemeral:true});
+        const t=await getTicket(interaction.channel); if(!t || t.id!==id) return interaction.reply({content:'Ticket پیدا نشد.',ephemeral:true});
+        return sendTranscript(interaction,t);
       }
       if(type==='ticketreopen'){
         if(!isTicketStaff(interaction.member)) return interaction.reply({content:'فقط Tickets Support می‌تواند Ticket را باز کند.',ephemeral:true});
@@ -828,17 +827,18 @@ client.on('interactionCreate',async interaction=>{
         if(!logChannel?.isTextBased()) return interaction.editReply({content:'❌ کانال Exchange Log معتبر نیست. ID کانال را بررسی کنید.'});
         const {data:e,error:eError}=await supabase.from('exchange_requests').insert({guild_id:interaction.guild.id,user_id:interaction.user.id,banner,status:'pending'}).select().single();
         if(eError || !e) { console.error('exchange insert error:',eError); return interaction.editReply({content:'❌ درخواست Exchange ذخیره نشد. تنظیمات Supabase را بررسی کنید.'}); }
-        const exchangeRole=await resolveExchangeRole(interaction.guild);
-        if(!exchangeRole){
+        const logMentionUsers=await resolveExchangeLogMentions(interaction.guild);
+        if(logMentionUsers.length < 2){
           await supabase.from('exchange_requests').delete().eq('id',e.id);
-          return interaction.editReply({content:'❌ Role `Exchange` در سرور پیدا نشد. ابتدا Role را بسازید.'});
+          return interaction.editReply({content:'❌ هر دو اکانت Exchange Log پیدا نشدند. باید دقیقاً amir_gholizadeh22 و itskingpubgyt در همین سرور باشند (یا ID آن‌ها در EXCHANGE_LOG_MENTION_USERS تنظیم شود).'});
         }
+        const mentions=logMentionUsers.map(id=>`<@${id}>`).join(' ');
         const row=new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId(`exapprove:${e.id}`).setLabel('ACCEPT').setStyle(ButtonStyle.Success),
           new ButtonBuilder().setCustomId(`exreject:${e.id}`).setLabel('DECLINE').setStyle(ButtonStyle.Danger)
         );
         try{
-          await logChannel.send({content:`<@&${exchangeRole.id}>\n📥 **Exchange Request**\nUser: <@${interaction.user.id}>\n\n${banner}`,components:[row],allowedMentions:{roles:[exchangeRole.id],users:[interaction.user.id],parse:[]}});
+          await logChannel.send({content:`${mentions}\n📥 **Exchange Request**\nUser: <@${interaction.user.id}>\n\n${banner}`,components:[row],allowedMentions:{users:[...new Set([...logMentionUsers, interaction.user.id])],parse:[]}});
         }catch(err){
           console.error('exchange log send error:',err);
           await supabase.from('exchange_requests').delete().eq('id',e.id);
@@ -878,7 +878,7 @@ client.on('interactionCreate',async interaction=>{
         if(link) row.addComponents(new ButtonBuilder().setLabel('باز کردن لینک').setStyle(ButtonStyle.Link).setURL(link));
         let msg;
         try{
-          msg=await interaction.channel.send({content:`🎉 **Giveaway**\n🎁 جایزه: **${prize}**\n⏱️ زمان: **${fmt(minutes*60000)}**\n👥 Joined: **0**`,components:[row]});
+          msg=await interaction.channel.send({content:`🎉 **Giveaway**\n🎁 جایزه: **${prize}**\n⏱️ زمان: **${fmt(minutes*60000)}**`,components:[row]});
         }catch(sendError){
           console.error('giveaway channel send error:',sendError);
           await supabase.from('giveaways').delete().eq('id',g.id).catch(()=>{});
@@ -886,7 +886,6 @@ client.on('interactionCreate',async interaction=>{
         }
         const {error:updateError}=await supabase.from('giveaways').update({message_id:msg.id}).eq('id',g.id);
         if(updateError) console.error('giveaway message update error:',updateError);
-        scheduleGiveawayEnd({...g,message_id:msg.id});
         await logTo(guild,'giveaway_create_log_channel',`🎉 Giveaway ساخته شد | ${interaction.user.tag} | ${prize}`);
         return interaction.reply({content:'✅ Giveaway با موفقیت ساخته شد.',ephemeral:true});
       }
@@ -1071,10 +1070,10 @@ client.on('interactionCreate',async interaction=>{
     }
     if(['kick','ban','timeout','warn'].includes(commandName)){
       if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); const m=interaction.options.getMember('user'), reason=interaction.options.getString('reason')||'بدون دلیل'; if(!m) return interaction.reply({content:'ممبر پیدا نشد.',ephemeral:true});
-      if(commandName==='warn'){ const {count}=await supabase.from('member_warns').select('*',{count:'exact',head:true}).eq('guild_id',guild.id).eq('user_id',m.id); const {error:warnError}=await supabase.from('member_warns').insert({guild_id:guild.id,user_id:m.id,reason}); if(warnError) return interaction.reply({content:`❌ Warn ثبت نشد: ${warnError.message}`,ephemeral:true}); const n=(count||0)+1; if(n>=3) await m.timeout(2*60*60*1000,'3 warnings').catch(()=>{}); await logTo(guild,'member_warn_log_channel',`⚠️ Warn | <@${m.id}> | ${n} total warns | ${reason} | by ${interaction.user.tag}`); return interaction.reply({content:`⚠️ <@${m.id}> Warn شد.\n📝 دلیل: **${reason}**\n🔢 Total warns: **${n}**`,allowedMentions:{users:[m.id]}}); }
+      if(commandName==='warn'){ const {count}=await supabase.from('member_warns').select('*',{count:'exact',head:true}).eq('guild_id',guild.id).eq('user_id',m.id); await supabase.from('member_warns').insert({guild_id:guild.id,user_id:m.id,reason}); const n=(count||0)+1; if(n>=3) await m.timeout(2*60*60*1000,'3 warnings').catch(()=>{}); await logTo(guild,'member_warn_log_channel',`⚠️ Warn | ${m.user.tag} | ${n}/3 | ${reason}`); return interaction.reply({content:`Warn ثبت شد (${n}/3).`}); }
       if(commandName==='kick') await m.kick(reason);
       if(commandName==='ban') await m.ban({reason});
-      if(commandName==='timeout'){ const timeoutMinutes=interaction.options.getInteger('minutes')||120; await m.timeout(timeoutMinutes*60*1000,reason); }
+      if(commandName==='timeout') await m.timeout(2*60*60*1000,reason);
       const moderationLogKey=commandName==='timeout'?'timeout_log_channel':'ban_kick_log_channel';
       await logTo(guild,moderationLogKey,`🛡️ ${commandName} | ${m.user.tag} | ${reason}`);
       return interaction.reply({content:`${commandName} انجام شد.`});
@@ -1131,8 +1130,6 @@ client.on('interactionCreate',async interaction=>{
     if(commandName==='setbanner'){ if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); await setSettings(guild.id,{server_banner:interaction.options.getString('banner')}); return interaction.reply({content:'بنر ذخیره شد.'}); }
     if(commandName==='settextxp'){ if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); await setSettings(guild.id,{xp_level_text:interaction.options.getString('text')}); return interaction.reply({content:'متن Level Up ذخیره شد.'}); }
     if(commandName==='level'){ const u=(await supabase.from('xp_users').select('*').eq('guild_id',guild.id).eq('user_id',interaction.user.id).maybeSingle()).data||{xp:0,level:0}; return interaction.reply({content:`⭐ Level: ${u.level} | تعداد پیام: ${u.xp}`}); }
-    if(commandName==='setwelcomechannel'){ if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); const ch=interaction.options.getChannel('channel'); await setSettings(guild.id,{welcome_channel:ch.id}); return interaction.reply({content:`✅ Welcome Channel روی ${ch} تنظیم شد.`}); }
-    if(commandName==='setinvitelog'){ if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); const ch=interaction.options.getChannel('channel'); await setSettings(guild.id,{invite_log_channel:ch.id}); return interaction.reply({content:`✅ Invite Logs روی ${ch} تنظیم شد.`}); }
     if(commandName==='settextwel'){ if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); await setSettings(guild.id,{welcome_text:interaction.options.getString('text')}); return interaction.reply({content:'متن Welcome ذخیره شد.'}); }
     if(commandName==='settextinc'){ if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); await setSettings(guild.id,{invite_text:interaction.options.getString('text')}); return interaction.reply({content:'متن Invite ذخیره شد.'}); }
     if(commandName==='setex'){ if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); await setSettings(guild.id,{exchange_channel:interaction.options.getChannel('channel').id}); return interaction.reply({content:'چنل Exchange ذخیره شد.'}); }
@@ -1166,15 +1163,7 @@ client.on('guildMemberAdd',async member=>{
   const before=inviteCache.get(member.guild.id)||new Map(), after=await member.guild.invites.fetch().catch(()=>new Map());
   let used=null; for(const i of after.values()){ if((i.uses||0)>(before.get(i.code)||0)){used=i;break;} }
   await cacheInvites(member.guild).catch(()=>{});
-  if(used && used.inviter?.id){
-    const inviterId=used.inviter.id;
-    const {error:inviteSaveError}=await supabase.from('invite_stats').upsert({guild_id:member.guild.id,inviter_id:inviterId,invited_id:member.id},{onConflict:'guild_id,invited_id'});
-    if(inviteSaveError) console.error('invite stats save error:',inviteSaveError.message);
-    const {count}=await supabase.from('invite_stats').select('*',{count:'exact',head:true}).eq('guild_id',member.guild.id).eq('inviter_id',inviterId);
-    const inviteText=placeholders(s.invite_text||'👋 [user] با دعوت <inv> وارد شد. تعداد دعوت: [invnum]',member,member.guild,`<@${inviterId}>`,count||0);
-    if(s.invite_log_channel){ const ch=member.guild.channels.cache.get(s.invite_log_channel); if(ch) await ch.send({content:inviteText,allowedMentions:{users:[member.id,inviterId]}}).catch(err=>console.error('invite channel send error:',err?.message||err)); }
-    await logTo(member.guild,'invite_log_channel',`📨 Invite | <@${member.id}> invited by <@${inviterId}> | total invites=${count||0}`);
-  }
+  if(used){ await supabase.from('invite_stats').upsert({guild_id:member.guild.id,inviter_id:used.inviter?.id||'unknown',invited_id:member.id}); const {count}=await supabase.from('invite_stats').select('*',{count:'exact',head:true}).eq('guild_id',member.guild.id).eq('inviter_id',used.inviter?.id||'unknown'); const inviteText=placeholders(s.invite_text||'👋 [user] با دعوت <inv> وارد شد. تعداد دعوت: [invnum]',member,member.guild,used.inviter?.id||'',count||0).replace('[inv]',used.inviter?.id||''); if(s.invite_log_channel){ const ch=member.guild.channels.cache.get(s.invite_log_channel); if(ch) await ch.send(inviteText).catch(()=>{}); } await logTo(member.guild,'invite_log_channel',`📨 Invite | ${member.user.tag} | inviter=${used.inviter?.tag||used.inviter?.id||'unknown'} | total=${count||0}`); }
 });
 client.on('voiceStateUpdate',async(oldS,newS)=>{ if(!newS.guild) return; if(!oldS.channelId&&newS.channelId) await logTo(newS.guild,'voice_log_channel',`🔊 <@${newS.id}> وارد ${newS.channel?.name} شد.`); else if(oldS.channelId&&!newS.channelId) await logTo(newS.guild,'voice_log_channel',`🔇 <@${newS.id}> از ${oldS.channel?.name} خارج شد.`); });
 client.on('messageDelete',async m=>{ if(m.guild&&!m.author?.bot) await logTo(m.guild,'message_log_channel',`🗑️ پیام حذف شد | ${m.author?.tag||'نامشخص'} | ${m.content||'بدون متن'}`); });
