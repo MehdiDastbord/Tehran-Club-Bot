@@ -68,6 +68,28 @@ async function resolveExchangeLogMentions(guild){
 }
 function duration(minutes){ const n=Number(minutes); return Number.isFinite(n)&&n>0 ? n : null; }
 function fmt(ms){ const m=Math.max(1,Math.ceil(ms/60000)); return `${m} دقیقه`; }
+async function getGiveawayParticipantCount(giveawayId){
+  const {data,error}=await supabase.from('giveaway_entries').select('user_id').eq('giveaway_id',giveawayId);
+  if(error){ console.error('giveaway participant count error:',error.message); return {count:0,users:[]}; }
+  const users=[...new Set((data||[]).map(x=>String(x.user_id)).filter(Boolean))];
+  return {count:users.length,users};
+}
+async function updateGiveawayMessage(g){
+  if(!g?.guild_id || !g?.channel_id || !g?.message_id) return;
+  const guild=client.guilds.cache.get(g.guild_id);
+  const ch=guild?.channels.cache.get(g.channel_id);
+  if(!ch?.isTextBased()) return;
+  const original=await ch.messages.fetch(g.message_id).catch(()=>null);
+  if(!original) return;
+  const {count}=await getGiveawayParticipantCount(g.id);
+  const components=original.components.map(row=>new ActionRowBuilder().addComponents(
+    row.components.map(component=>{
+      if(component.customId===`gw:${g.id}`) return ButtonBuilder.from(component).setLabel(`Joined: ${count}`);
+      return ButtonBuilder.from(component);
+    })
+  ));
+  await original.edit({components}).catch(err=>console.error('giveaway participant update error:',err.message));
+}
 function placeholders(text, member, guild, inv, invnum){
   return String(text||'').replaceAll('[user]', `<@${member.id}>`).replaceAll('[Number]', String(guild.memberCount))
     .replaceAll('[inv]', inv||'').replaceAll('[invnum]', String(invnum??0));
@@ -390,29 +412,58 @@ client.on('messageCreate',async message=>{
   const {data:drops}=await supabase.from('drops').select('*').eq('guild_id',message.guild.id).eq('ended',false).eq('kind','text');
   for(const d of drops||[]) if(d.target_text && message.content.trim()===d.target_text){
     const {data:updated}=await supabase.from('drops').update({ended:true,winner_id:message.author.id}).eq('id',d.id).eq('ended',false).select().maybeSingle();
-    if(updated){ await message.channel.send(`🏆 <@${message.author.id}> برنده Drop شد! متن برنده: **${d.target_text}**`); await logTo(message.guild,'drop_winner_log_channel',`🏆 Drop winner: ${message.author.tag}`); }
+    if(updated){
+      await message.channel.send({content:`🏆 <@${message.author.id}> برنده Drop شد! متن برنده: **${d.target_text}**`,allowedMentions:{users:[message.author.id],parse:[]}});
+      const ds=await getSettings(message.guild.id);
+      const logId=ds.drop_winner_log_channel||ds.drop_create_log_channel||ds.giveaway_winner_log_channel||ds.giveaway_create_log_channel;
+      const logCh=logId ? (message.guild.channels.cache.get(logId)||await message.guild.channels.fetch(logId).catch(()=>null)) : null;
+      if(logCh?.isTextBased()) await logCh.send(`⚡ **Drop Log**\n🎁 Prize: **${d.prize||'Unknown'}**\n🏆 Winner: <@${message.author.id}>\n🕐 Finished: <t:${Math.floor(Date.now()/1000)}:F>`,{allowedMentions:{users:[message.author.id],parse:[]}}).catch(()=>{});
+      await logTo(message.guild,'drop_winner_log_channel',`🏆 Drop winner: ${message.author.tag}`);
+    }
     break;
   }
 });
 
 async function endGiveaways(){
-  const {data:rows,error}=await supabase.from('giveaways').select('*').eq('ended',false).lte('end_at',new Date().toISOString());
+  const {data:rows,error}=await supabase.from('giveaways').select('*').eq('ended',0).lte('end_at',new Date().toISOString());
   if(error){ console.error('giveaway expiry query error:',error.message); return; }
   for(const g of rows||[]){
     try{
       const {data:entries, error:entryError}=await supabase.from('giveaway_entries').select('user_id').eq('giveaway_id',g.id);
       if(entryError){ console.error('giveaway entries read error:',entryError.message); continue; }
-      const winner=entries?.length?entries[Math.floor(Math.random()*entries.length)].user_id:null;
-      const {data:endedRow,error:updateError}=await supabase.from('giveaways').update({ended:true,winner_id:winner}).eq('id',g.id).eq('ended',false).select('id').maybeSingle();
+      const users=[...new Set((entries||[]).map(x=>String(x.user_id)).filter(Boolean))];
+      const winner=users.length?users[Math.floor(Math.random()*users.length)]:null;
+      const {data:endedRow,error:updateError}=await supabase.from('giveaways').update({ended:1,winner_id:winner}).eq('id',g.id).eq('ended',0).select('id').maybeSingle();
       if(updateError || !endedRow) continue;
-      const guild=client.guilds.cache.get(g.guild_id), ch=guild?.channels.cache.get(g.channel_id);
-      if(ch) await ch.send({content:`🎉 Giveaway تمام شد!\n🎁 جایزه: **${g.prize}**\n🏆 ${winner?`برنده: <@${winner}>`:'شرکت‌کننده‌ای نبود.'}`,allowedMentions:{users:winner?[winner]:[],parse:[]}}).catch(err=>console.error('giveaway finish send error:',err.message));
-      if(guild) await logTo(guild,'giveaway_winner_log_channel',`🎉 Giveaway پایان یافت | prize=${g.prize} | winner=${winner||'none'}`);
+
+      const guild=client.guilds.cache.get(g.guild_id);
+      const ch=guild?.channels.cache.get(g.channel_id);
+      const winnerText=winner?`🏆 برنده: <@${winner}>`:'🏆 برنده: هیچ‌کس (شرکت‌کننده‌ای نبود)';
+      if(ch) await ch.send({
+        content:`🎉 **Giveaway تمام شد!**\n🎁 جایزه: **${g.prize}**\n👥 Joined: **${users.length}**\n${winnerText}`,
+        allowedMentions:{users:winner?[winner]:[],parse:[]}
+      }).catch(err=>console.error('giveaway finish send error:',err.message));
+
+      if(guild){
+        const s=await getSettings(guild.id);
+        const logChannelId=s.giveaway_winner_log_channel || s.giveaway_create_log_channel || s.drop_winner_log_channel || s.drop_create_log_channel;
+        const logCh=logChannelId ? (guild.channels.cache.get(logChannelId) || await guild.channels.fetch(logChannelId).catch(()=>null)) : null;
+        if(logCh?.isTextBased()){
+          await logCh.send({
+            content:`🎉 **Giveaway Log**\n🎁 Prize: **${g.prize}**\n👥 Joined: **${users.length}**\n${winner?`🏆 Winner: <@${winner}>`:'🏆 Winner: no one'}\n🕐 Finished: <t:${Math.floor(Date.now()/1000)}:F>`,
+            allowedMentions:{users:winner?[winner]:[],parse:[]}
+          }).catch(err=>console.error('giveaway log send error:',err.message));
+        }
+        await logTo(guild,'giveaway_winner_log_channel',`🎉 Giveaway پایان یافت | prize=${g.prize} | joined=${users.length} | winner=${winner||'no one'}`);
+      }
+
       if(ch && g.message_id){
         const original=await ch.messages.fetch(g.message_id).catch(()=>null);
         if(original){
-          const disabled=original.components.map(row=>new ActionRowBuilder().addComponents(row.components.map(component=>ButtonBuilder.from(component).setDisabled(true))));
-          await original.edit({components:disabled}).catch(()=>{});
+          const disabled=original.components.map(row=>new ActionRowBuilder().addComponents(
+            row.components.map(component=>ButtonBuilder.from(component).setDisabled(true))
+          ));
+          await original.edit({content:`🎉 **Giveaway تمام شد!**\n🎁 جایزه: **${g.prize}**\n👥 Joined: **${users.length}**\n${winnerText}`,components:disabled,allowedMentions:{users:winner?[winner]:[],parse:[]}}).catch(()=>{});
         }
       }
     }catch(err){ console.error('giveaway expiry error:',err?.message||err); }
@@ -640,12 +691,14 @@ client.on('interactionCreate',async interaction=>{
     if(interaction.isButton()){
       const [type,id,extra]=interaction.customId.split(':');
       if(type==='gw'){
-        const {data:gw}=await supabase.from('giveaways').select('id,ended,end_at').eq('id',id).maybeSingle();
-        if(!gw || gw.ended || new Date(gw.end_at)<=new Date()) return interaction.reply({content:'این Giveaway تمام شده است.',ephemeral:true});
+        const {data:gw}=await supabase.from('giveaways').select('id,guild_id,channel_id,message_id,ended,end_at').eq('id',id).maybeSingle();
+        if(!gw || Number(gw.ended)===1 || new Date(gw.end_at)<=new Date()) return interaction.reply({content:'این Giveaway تمام شده است.',ephemeral:true});
         const {data:already}=await supabase.from('giveaway_entries').select('id').eq('giveaway_id',id).eq('user_id',interaction.user.id).maybeSingle();
         if(already) return interaction.reply({content:'قبلاً در این Giveaway شرکت کرده‌ای ✅',ephemeral:true});
         const {error}=await supabase.from('giveaway_entries').insert({giveaway_id:id,user_id:interaction.user.id});
-        return interaction.reply({content:error?'❌ خطا در ثبت ورود Giveaway.':'وارد Giveaway شدی ✅',ephemeral:true});
+        if(error) return interaction.reply({content:'❌ خطا در ثبت ورود Giveaway.',ephemeral:true});
+        await updateGiveawayMessage(gw);
+        return interaction.reply({content:'وارد Giveaway شدی ✅',ephemeral:true});
       }
       if(type==='drop'){
         const {data:d}=await supabase.from('drops').select('*').eq('id',id).eq('ended',false).maybeSingle();
@@ -653,6 +706,10 @@ client.on('interactionCreate',async interaction=>{
         const {data:u}=await supabase.from('drops').update({ended:true,winner_id:interaction.user.id}).eq('id',id).eq('ended',false).select().maybeSingle();
         if(!u) return interaction.reply({content:'همزمان یک نفر دیگر برنده شد.',ephemeral:true});
         await interaction.update({content:`🏆 <@${interaction.user.id}> اولین نفر بود و برنده شد!`,components:[]});
+        const ds=await getSettings(interaction.guild.id);
+        const logId=ds.drop_winner_log_channel||ds.drop_create_log_channel||ds.giveaway_winner_log_channel||ds.giveaway_create_log_channel;
+        const logCh=logId ? (interaction.guild.channels.cache.get(logId)||await interaction.guild.channels.fetch(logId).catch(()=>null)) : null;
+        if(logCh?.isTextBased()) await logCh.send(`⚡ **Drop Log**\n🎁 Prize: **${d.prize||'Unknown'}**\n🏆 Winner: <@${interaction.user.id}>\n🕐 Finished: <t:${Math.floor(Date.now()/1000)}:F>`,{allowedMentions:{users:[interaction.user.id],parse:[]}}).catch(()=>{});
         return logTo(interaction.guild,'drop_winner_log_channel',`🏆 Drop winner | ${interaction.user.tag}`);
       }
       if(type==='openpanel'){
@@ -899,11 +956,11 @@ client.on('interactionCreate',async interaction=>{
           const detail=gError?.message ? `\n${gError.message}` : '';
           return interaction.reply({content:`❌ ساخت Giveaway در دیتابیس انجام نشد.${detail}`,ephemeral:true});
         }
-        const row=new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`gw:${g.id}`).setLabel('شرکت در Giveaway').setStyle(ButtonStyle.Success));
+        const row=new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`gw:${g.id}`).setLabel('Joined: 0').setStyle(ButtonStyle.Success));
         if(link) row.addComponents(new ButtonBuilder().setLabel('باز کردن لینک').setStyle(ButtonStyle.Link).setURL(link));
         let msg;
         try{
-          msg=await interaction.channel.send({content:`🎉 **Giveaway**\n🎁 جایزه: **${prize}**\n⏱️ زمان: **${fmt(minutes*60000)}**`,components:[row]});
+          msg=await interaction.channel.send({content:`🎉 **Giveaway**\n🎁 جایزه: **${prize}**\n⏱️ زمان: **${fmt(minutes*60000)}**\n👥 Joined: **0**`,components:[row]});
         }catch(sendError){
           console.error('giveaway channel send error:',sendError);
           await supabase.from('giveaways').delete().eq('id',g.id).catch(()=>{});
@@ -1165,6 +1222,20 @@ client.on('interactionCreate',async interaction=>{
     if(commandName==='settextwel'){ if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); await setSettings(guild.id,{welcome_text:interaction.options.getString('text')}); return interaction.reply({content:'متن Welcome ذخیره شد.'}); }
     if(commandName==='settextinc'){ if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); await setSettings(guild.id,{invite_text:interaction.options.getString('text')}); return interaction.reply({content:'متن Invite ذخیره شد.'}); }
     if(commandName==='setex'){ if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true}); await setSettings(guild.id,{exchange_channel:interaction.options.getChannel('channel').id}); return interaction.reply({content:'چنل Exchange ذخیره شد.'}); }
+    if(commandName==='setgivelog'){
+      if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true});
+      const ch=interaction.options.getChannel('channel');
+      await setSettings(guild.id,{giveaway_create_log_channel:ch.id,giveaway_winner_log_channel:ch.id,drop_create_log_channel:ch.id,drop_winner_log_channel:ch.id});
+      await protectLogChannel(guild,ch.id);
+      return interaction.reply({content:`✅ Giveaway / Drop Log روی ${ch} تنظیم شد.`});
+    }
+    if(commandName==='setinvitelog'){
+      if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true});
+      const ch=interaction.options.getChannel('channel');
+      await setSettings(guild.id,{invite_log_channel:ch.id});
+      await protectLogChannel(guild,ch.id);
+      return interaction.reply({content:`✅ Invite Log روی ${ch} تنظیم شد.`});
+    }
     if(commandName==='setlogchannel'){
       if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'فقط افراد مجاز.',ephemeral:true});
       const ch=interaction.options.getChannel('channel');
@@ -1191,12 +1262,48 @@ client.on('interactionCreate',async interaction=>{
 client.on('guildMemberAdd',async member=>{
   const s=await getSettings(member.guild.id);
   const welcomeText=placeholders(s.welcome_text||'خوش آمدی [user] ❤️\nتعداد اعضا: [Number]',member,member.guild);
-  if(s.welcome_channel){ const ch=member.guild.channels.cache.get(s.welcome_channel); if(ch) await ch.send(welcomeText).catch(()=>{}); }
+  if(s.welcome_channel){
+    const ch=member.guild.channels.cache.get(s.welcome_channel) || await member.guild.channels.fetch(s.welcome_channel).catch(()=>null);
+    if(ch?.isTextBased()) await ch.send(welcomeText).catch(()=>{});
+  }
   await logTo(member.guild,'welcome_channel',`👋 Welcome | ${member.user.tag} (${member.id})`);
-  const before=inviteCache.get(member.guild.id)||new Map(), after=await member.guild.invites.fetch().catch(()=>new Map());
-  let used=null; for(const i of after.values()){ if((i.uses||0)>(before.get(i.code)||0)){used=i;break;} }
+
+  const before=inviteCache.get(member.guild.id)||new Map();
+  const after=await member.guild.invites.fetch().catch(()=>new Map());
+  const candidates=[];
+  for(const i of after.values()){
+    const previous=Number(before.get(i.code)||0);
+    const current=Number(i.uses||0);
+    if(current>previous) candidates.push({invite:i,delta:current-previous});
+  }
+  candidates.sort((a,b)=>b.delta-a.delta);
+  const used=candidates[0]?.invite||null;
   await cacheInvites(member.guild).catch(()=>{});
-  if(used){ await supabase.from('invite_stats').upsert({guild_id:member.guild.id,inviter_id:used.inviter?.id||'unknown',invited_id:member.id}); const {count}=await supabase.from('invite_stats').select('*',{count:'exact',head:true}).eq('guild_id',member.guild.id).eq('inviter_id',used.inviter?.id||'unknown'); const inviteText=placeholders(s.invite_text||'👋 [user] با دعوت <inv> وارد شد. تعداد دعوت: [invnum]',member,member.guild,used.inviter?.id||'',count||0).replace('[inv]',used.inviter?.id||''); if(s.invite_log_channel){ const ch=member.guild.channels.cache.get(s.invite_log_channel); if(ch) await ch.send(inviteText).catch(()=>{}); } await logTo(member.guild,'invite_log_channel',`📨 Invite | ${member.user.tag} | inviter=${used.inviter?.tag||used.inviter?.id||'unknown'} | total=${count||0}`); }
+
+  if(used?.inviter?.id){
+    const inviterId=used.inviter.id;
+    const {data:existingInvite,error:existingInviteError}=await supabase.from('invite_stats')
+      .select('id').eq('guild_id',member.guild.id).eq('invited_id',member.id).maybeSingle();
+    if(existingInviteError) console.error('invite stats lookup error:',existingInviteError.message);
+    if(!existingInvite){
+      const {error:insertInviteError}=await supabase.from('invite_stats').insert(
+        {guild_id:member.guild.id,inviter_id:inviterId,invited_id:member.id}
+      );
+      if(insertInviteError) console.error('invite stats save error:',insertInviteError.message);
+    }
+
+    const {count}=await supabase.from('invite_stats').select('*',{count:'exact',head:true})
+      .eq('guild_id',member.guild.id).eq('inviter_id',inviterId);
+    const total=Number(count||0);
+    const inviteText=`👋 <@${member.id}> joined!\n🤝 Invited by: <@${inviterId}>\n📨 Total invites: **${total}**`;
+    if(s.invite_log_channel){
+      const ch=member.guild.channels.cache.get(s.invite_log_channel) || await member.guild.channels.fetch(s.invite_log_channel).catch(()=>null);
+      if(ch?.isTextBased()) await ch.send({content:inviteText,allowedMentions:{users:[member.id,inviterId],parse:[]}}).catch(err=>console.error('invite log send error:',err.message));
+    }
+    await logTo(member.guild,'invite_log_channel',`📨 Invite | ${member.user.tag} | inviter=${used.inviter.tag||inviterId} | total=${total}`);
+  }else{
+    console.log(`Invite tracker: could not determine inviter for ${member.user.tag} in ${member.guild.name}`);
+  }
 });
 client.on('voiceStateUpdate',async(oldS,newS)=>{ if(!newS.guild) return; if(!oldS.channelId&&newS.channelId) await logTo(newS.guild,'voice_log_channel',`🔊 <@${newS.id}> وارد ${newS.channel?.name} شد.`); else if(oldS.channelId&&!newS.channelId) await logTo(newS.guild,'voice_log_channel',`🔇 <@${newS.id}> از ${oldS.channel?.name} خارج شد.`); });
 client.on('messageDelete',async m=>{ if(m.guild&&!m.author?.bot) await logTo(m.guild,'message_log_channel',`🗑️ پیام حذف شد | ${m.author?.tag||'نامشخص'} | ${m.content||'بدون متن'}`); });

@@ -11,6 +11,9 @@ add(new SlashCommandBuilder().setName('leaderboard').setDescription('نمایش 
 add(new SlashCommandBuilder().setName('setwelcome').setDescription('انتخاب کانال خوشامدگویی').addChannelOption(o=>o.setName('channel').setDescription('کانال ارسال پیام خوشامدگویی').addChannelTypes(ChannelType.GuildText).setRequired(true)));
 
 // Giveaway / drops (authorized IDs only)
+add(new SlashCommandBuilder().setName('setgivelog').setDescription('انتخاب کانال لاگ Giveaway و Drop').addChannelOption(o=>o.setName('channel').setDescription('کانال لاگ Giveaway و Drop').addChannelTypes(ChannelType.GuildText).setRequired(true)));
+add(new SlashCommandBuilder().setName('setinvitelog').setDescription('انتخاب کانال لاگ دعوت‌ها').addChannelOption(o=>o.setName('channel').setDescription('کانال ارسال پیام دعوت‌ها').addChannelTypes(ChannelType.GuildText).setRequired(true)));
+
 add(new SlashCommandBuilder().setName('giveaway').setDescription('ایجاد یک قرعه‌کشی').addStringOption(o=>o.setName('prize').setDescription('جایزه').setRequired(true)).addIntegerOption(o=>o.setName('minutes').setDescription('مدت زمان به دقیقه').setRequired(true).setMinValue(1)));
 add(new SlashCommandBuilder().setName('giveawaysv').setDescription('ایجاد یک قرعه‌کشی with a link').addStringOption(o=>o.setName('prize').setDescription('جایزه').setRequired(true)).addIntegerOption(o=>o.setName('minutes').setDescription('مدت زمان به دقیقه').setRequired(true).setMinValue(1)).addStringOption(o=>o.setName('link').setDescription('لینک').setRequired(true)));
 add(new SlashCommandBuilder().setName('dropmatn').setDescription('ایجاد دراپ متنی').addStringOption(o=>o.setName('text').setDescription('متن برنده').setRequired(true)).addStringOption(o=>o.setName('prize').setDescription('جایزه').setRequired(true)));
