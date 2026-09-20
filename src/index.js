@@ -569,6 +569,12 @@ async function claimTicket(interaction,t){
   if(error || !claimed) return interaction.reply({content:'❌ این Ticket همین الان توسط شخص دیگری Claim شد.',ephemeral:true});
   const {error:claimHistoryError}=await supabase.from('ticket_claim_history').insert({ticket_id:t.id,guild_id:interaction.guild.id,user_id:interaction.user.id,action:'claim'});
   if(claimHistoryError) console.error('ticket claim history error:',claimHistoryError?.message||claimHistoryError);
+  const claimText=`🎫 Ticket Claim شد | ${interaction.channel.name} | توسط ${interaction.user.tag} (<@${interaction.user.id}>)`;
+  await logTo(interaction.guild,'ticket_log_channel',claimText);
+  const settings=await getSettings(interaction.guild.id);
+  const logId=settings.ticket_log_channel;
+  const logChannel=logId ? (interaction.guild.channels.cache.get(logId)||await interaction.guild.channels.fetch(logId).catch(()=>null)) : null;
+  if(logChannel?.isTextBased()) await logChannel.send({content:claimText,allowedMentions:{users:[]}}).catch(err=>console.error('ticket claim discord log error:',err?.message||err));
   return interaction.reply({content:`🎫 Ticket توسط <@${interaction.user.id}> Claim شد.`,allowedMentions:{users:[interaction.user.id]}});
 }
 async function buildTranscript(interaction,t){
@@ -595,7 +601,14 @@ async function sendTranscript(interaction,t){
   if(!ch?.isTextBased()) return interaction.reply({content:'❌ Transcript Log تنظیم نشده. از /setticketlog استفاده کنید.',ephemeral:true});
   const safeName=String(interaction.channel.name||'ticket').replace(/[^a-z0-9-_]/gi,'-').slice(0,60);
   const file=new AttachmentBuilder(Buffer.from(text,'utf8'),{name:`${safeName}-${t.id}.txt`});
-  await ch.send({content:`📄 Transcript | ${interaction.channel} | <@${t.opener_id}>`,files:[file],allowedMentions:{users:[t.opener_id]}});
+
+  // Transcript header: transcript | ticket owner | claimed by
+  // Use usernames (not the channel name). If nobody claimed the ticket, show "no one".
+  const opener=await interaction.guild.members.fetch(t.opener_id).catch(()=>null);
+  const claimer=t.claimed_by ? await interaction.guild.members.fetch(t.claimed_by).catch(()=>null) : null;
+  const openerName=opener?.user?.username || opener?.user?.globalName || String(t.opener_id);
+  const claimerName=claimer?.user?.username || claimer?.user?.globalName || (t.claimed_by ? String(t.claimed_by) : 'no one');
+  await ch.send({content:`📄 Transcript | ${openerName} | ${claimerName}`,files:[file],allowedMentions:{parse:[]}});
   return interaction.reply({content:`✅ Transcript به ${ch} ارسال شد.`,ephemeral:true});
 }
 async function closeTicket(interaction,t,reason){
@@ -1043,7 +1056,14 @@ client.on('interactionCreate',async interaction=>{
       const t=await getTicket(interaction.channel); if(!t||!isTicketStaff(interaction.member)) return interaction.reply({content:'دسترسی یا Ticket ندارید.',ephemeral:true}); const u=interaction.options.getUser('user');
       const {error:claimChangeError}=await supabase.from('tickets').update({claimed_by:u.id}).eq('id',t.id);
       if(claimChangeError) return interaction.reply({content:`❌ تغییر Claim انجام نشد: ${claimChangeError.message}`,ephemeral:true});
-      await supabase.from('ticket_claim_history').insert({ticket_id:t.id,guild_id:guild.id,user_id:u.id,action:'claimchange',changed_by:interaction.user.id}).catch(err=>console.error('ticket claim history error:',err?.message||err));
+      const {error:claimHistoryError}=await supabase.from('ticket_claim_history').insert({ticket_id:t.id,guild_id:guild.id,user_id:u.id,action:'claimchange',changed_by:interaction.user.id});
+      if(claimHistoryError) console.error('ticket claim history error:',claimHistoryError?.message||claimHistoryError);
+      const claimText=`🔄 Claim تغییر کرد | ${interaction.channel.name} | مسئول جدید: ${u.tag||u.username} (<@${u.id}>) | توسط ${interaction.user.tag}`;
+      await logTo(guild,'ticket_log_channel',claimText);
+      const settings=await getSettings(guild.id);
+      const logId=settings.ticket_log_channel;
+      const logChannel=logId ? (guild.channels.cache.get(logId)||await guild.channels.fetch(logId).catch(()=>null)) : null;
+      if(logChannel?.isTextBased()) await logChannel.send({content:claimText,allowedMentions:{users:[]}}).catch(err=>console.error('ticket claim-change discord log error:',err?.message||err));
       return interaction.reply({content:`Claim به <@${u.id}> منتقل شد.`,allowedMentions:{users:[u.id]}});
     }
     if(commandName==='add'||commandName==='remove'){
