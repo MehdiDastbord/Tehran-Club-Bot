@@ -269,6 +269,43 @@ async function buildTicketPerformanceFields(guildId){
   return fields;
 }
 
+function embedCharacterCount(embed){
+  const data=embed?.data||{};
+  let total=0;
+  if(data.title) total+=String(data.title).length;
+  if(data.description) total+=String(data.description).length;
+  if(data.footer?.text) total+=String(data.footer.text).length;
+  if(data.author?.name) total+=String(data.author.name).length;
+  for(const field of data.fields||[]) total+=String(field.name||'').length+String(field.value||'').length;
+  return total;
+}
+
+function addLogFieldSafely(embeds,state,field){
+  const safe={
+    name:String(field?.name||'Field').slice(0,256),
+    value:String(field?.value||'—').slice(0,1024),
+    inline:Boolean(field?.inline)
+  };
+  const MAX_EMBED_CHARS=6000;
+  const MAX_FIELDS=25;
+  const projected=embedCharacterCount(state.embed)+safe.name.length+safe.value.length;
+  if(state.fields>=MAX_FIELDS || projected>MAX_EMBED_CHARS){
+    embeds.push(state.embed);
+    state.embed=new EmbedBuilder().setTitle('📋 Tehran Club Logs (ادامه)').setTimestamp();
+    state.fields=0;
+  }
+  state.embed.addFields(safe);
+  state.fields++;
+}
+
+async function sendEmbedBatches(channel,embeds){
+  // Discord allows at most 10 embeds per message. Send every batch instead of
+  // silently dropping everything after the first 10 embeds.
+  for(let i=0;i<embeds.length;i+=10){
+    await channel.send({embeds:embeds.slice(i,i+10)});
+  }
+}
+
 async function flushGuildLogs(guild,force=false){
   if(!guild || logFlushRunning) return {sent:false,reason:'busy'};
   const settings=await getSettings(guild.id);
@@ -286,26 +323,30 @@ async function flushGuildLogs(guild,force=false){
   logFlushRunning=true;
   try{
     const embeds=[];
-    let embed=new EmbedBuilder().setTitle('📋 Tehran Club Logs').setDescription(`گزارش تجمعی لاگ‌ها • ${new Date().toLocaleString('en-GB',{timeZone:'Asia/Dubai',hour12:false})} (Dubai)\n⚠️ لاگ‌ها دائمی هستند و با ارسال گزارش حذف یا Reset نمی‌شوند.`).setTimestamp();
-    let fields=0;
+    const state={
+      embed:new EmbedBuilder()
+        .setTitle('📋 Tehran Club Logs')
+        .setDescription(`گزارش تجمعی لاگ‌ها • ${new Date().toLocaleString('en-GB',{timeZone:'Asia/Dubai',hour12:false})} (Dubai)\n⚠️ لاگ‌ها دائمی هستند و با ارسال گزارش حذف یا Reset نمی‌شوند.`)
+        .setTimestamp(),
+      fields:0
+    };
+
     for(const item of sections||[]){
       if(!item.total) continue;
-      if(fields>=25){ embeds.push(embed); embed=new EmbedBuilder().setTitle('📋 Tehran Club Logs (ادامه)').setTimestamp(); fields=0; }
-      embed.addFields({name:item.section,value:formatLogSection(item.section,item.rows,item.total)}); fields++;
+      addLogFieldSafely(embeds,state,{name:item.section,value:formatLogSection(item.section,item.rows,item.total)});
     }
-    const performanceFields=await buildTicketPerformanceFields(guild.id);
-    for(const f of performanceFields){
-      if(fields>=25){ embeds.push(embed); embed=new EmbedBuilder().setTitle('📋 Tehran Club Logs (ادامه)').setTimestamp(); fields=0; }
-      embed.addFields(f); fields++;
-    }
-    if(fields===0) embed.addFields({name:'📭 Logs',value:'در این بازه لاگی ثبت نشده است.'});
-    embeds.push(embed);
 
-    await channel.send({embeds:embeds.slice(0,10)});
+    const performanceFields=await buildTicketPerformanceFields(guild.id);
+    for(const f of performanceFields) addLogFieldSafely(embeds,state,f);
+
+    if(state.fields===0) addLogFieldSafely(embeds,state,{name:'📭 Logs',value:'در این بازه لاگی ثبت نشده است.'});
+    embeds.push(state.embed);
+
+    await sendEmbedBatches(channel,embeds);
     // IMPORTANT: log_queue is an immutable history. Never delete rows after /sendlogs
     // or after the automatic 6-hour report. This keeps all historical logs and counts.
     await setSettings(guild.id,{next_log_flush_at:new Date(Date.now()+LOG_FLUSH_INTERVAL_MS).toISOString(),last_log_report_at:new Date().toISOString()});
-    return {sent:true,count:total};
+    return {sent:true,count:total,embeds:embeds.length};
   }catch(error){
     console.error('log flush error:',error?.message||error);
     return {sent:false,reason:'send-failed',error:error?.message||String(error)};
