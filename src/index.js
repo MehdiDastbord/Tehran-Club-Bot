@@ -103,11 +103,17 @@ async function updateGiveawayMessage(g){
   const {count}=await getGiveawayParticipantCount(g.id);
   const components=original.components.map(row=>new ActionRowBuilder().addComponents(
     row.components.map(component=>{
-      if(component.customId===`gw:${g.id}`) return ButtonBuilder.from(component).setLabel(`Joined: ${count}`);
+      if(component.customId===`gw:${g.id}`) return ButtonBuilder.from(component).setLabel(`Enter: ${count}`);
       return ButtonBuilder.from(component);
     })
   ));
-  await original.edit({components}).catch(err=>console.error('giveaway participant update error:',err.message));
+  const prize=g.prize || 'Unknown';
+  const durationMinutes=Number(g.duration_minutes||0);
+  const timeText=durationMinutes>0 ? `${durationMinutes} دقیقه` : '—';
+  await original.edit({
+    content:`🎉 **Giveaway**\n🎁 Prize: **${prize}**\n⏱️ Time: **${timeText}**\n👥 Joined: **${count}**`,
+    components
+  }).catch(err=>console.error('giveaway participant update error:',err.message));
 }
 function placeholders(text, member, guild, inv, invnum){
   return String(text||'').replaceAll('[user]', `<@${member.id}>`).replaceAll('[Number]', String(guild.memberCount))
@@ -167,20 +173,20 @@ function formatLogSection(section, rows, total){
   return value;
 }
 
-async function fetchAllLogRows(guildId){
-  const all=[];
-  const pageSize=1000;
-  for(let from=0;;from+=pageSize){
-    const {data,error}=await supabase.from('log_queue')
-      .select('id,section,content,created_at')
-      .eq('guild_id',guildId)
-      .order('created_at',{ascending:true})
-      .range(from,from+pageSize-1);
-    if(error) return {rows:null,error};
-    if(data?.length) all.push(...data);
-    if(!data || data.length<pageSize) break;
-  }
-  return {rows:all,error:null};
+async function fetchLogSummary(guildId){
+  const sections=[...AGG_LOG_ORDER];
+  const results=await Promise.all(sections.map(async section=>{
+    const [countResult,rowsResult]=await Promise.all([
+      supabase.from('log_queue').select('id',{count:'exact',head:true}).eq('guild_id',guildId).eq('section',section),
+      supabase.from('log_queue').select('id,section,content,created_at').eq('guild_id',guildId).eq('section',section).order('created_at',{ascending:false}).limit(8)
+    ]);
+    if(countResult.error) return {section,error:countResult.error};
+    if(rowsResult.error) return {section,error:rowsResult.error};
+    return {section,total:Number(countResult.count||0),rows:(rowsResult.data||[]).reverse()};
+  }));
+  const error=results.find(x=>x.error)?.error||null;
+  if(error) return {sections:null,total:0,error};
+  return {sections:results,total:results.reduce((sum,x)=>sum+x.total,0),error:null};
 }
 
 async function fetchTicketPerformance(guildId){
@@ -270,25 +276,22 @@ async function flushGuildLogs(guild,force=false){
   if(!channelId) return {sent:false,reason:'not-configured'};
   const channel=guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(()=>null);
   if(!channel?.isTextBased()) return {sent:false,reason:'invalid-channel'};
-  const {rows,error}=await fetchAllLogRows(guild.id);
+  const {sections,error,total}=await fetchLogSummary(guild.id);
   if(error){ console.error('log queue read error:',error.message); return {sent:false,reason:'database',error:error.message}; }
-  if(!rows?.length && !force){
+  if(!total && !force){
     await setSettings(guild.id,{next_log_flush_at:new Date(Date.now()+LOG_FLUSH_INTERVAL_MS).toISOString()});
     return {sent:false,reason:'empty'};
   }
 
   logFlushRunning=true;
   try{
-    const grouped=new Map();
-    for(const section of AGG_LOG_ORDER) grouped.set(section,[]);
-    for(const row of rows||[]){ if(!grouped.has(row.section)) grouped.set(row.section,[]); grouped.get(row.section).push(row); }
     const embeds=[];
     let embed=new EmbedBuilder().setTitle('📋 Tehran Club Logs').setDescription(`گزارش تجمعی لاگ‌ها • ${new Date().toLocaleString('en-GB',{timeZone:'Asia/Dubai',hour12:false})} (Dubai)\n⚠️ لاگ‌ها دائمی هستند و با ارسال گزارش حذف یا Reset نمی‌شوند.`).setTimestamp();
     let fields=0;
-    for(const [section,items] of grouped){
-      if(!items.length) continue;
+    for(const item of sections||[]){
+      if(!item.total) continue;
       if(fields>=25){ embeds.push(embed); embed=new EmbedBuilder().setTitle('📋 Tehran Club Logs (ادامه)').setTimestamp(); fields=0; }
-      embed.addFields({name:section,value:formatLogSection(section,items,items.length)}); fields++;
+      embed.addFields({name:item.section,value:formatLogSection(item.section,item.rows,item.total)}); fields++;
     }
     const performanceFields=await buildTicketPerformanceFields(guild.id);
     for(const f of performanceFields){
@@ -302,7 +305,7 @@ async function flushGuildLogs(guild,force=false){
     // IMPORTANT: log_queue is an immutable history. Never delete rows after /sendlogs
     // or after the automatic 6-hour report. This keeps all historical logs and counts.
     await setSettings(guild.id,{next_log_flush_at:new Date(Date.now()+LOG_FLUSH_INTERVAL_MS).toISOString(),last_log_report_at:new Date().toISOString()});
-    return {sent:true,count:rows.length};
+    return {sent:true,count:total};
   }catch(error){
     console.error('log flush error:',error?.message||error);
     return {sent:false,reason:'send-failed',error:error?.message||String(error)};
@@ -444,7 +447,7 @@ client.on('messageCreate',async message=>{
 });
 
 async function endGiveaways(){
-  const {data:rows,error}=await supabase.from('giveaways').select('*').eq('ended',0).lte('end_at',new Date().toISOString());
+  const {data:rows,error}=await supabase.from('giveaways').select('*').eq('ended',false).lte('end_at',new Date().toISOString());
   if(error){ console.error('giveaway expiry query error:',error.message); return; }
   for(const g of rows||[]){
     try{
@@ -452,7 +455,7 @@ async function endGiveaways(){
       if(entryError){ console.error('giveaway entries read error:',entryError.message); continue; }
       const users=[...new Set((entries||[]).map(x=>String(x.user_id)).filter(Boolean))];
       const winner=users.length?users[Math.floor(Math.random()*users.length)]:null;
-      const {data:endedRow,error:updateError}=await supabase.from('giveaways').update({ended:1,winner_id:winner}).eq('id',g.id).eq('ended',0).select('id').maybeSingle();
+      const {data:endedRow,error:updateError}=await supabase.from('giveaways').update({ended:true,winner_id:winner}).eq('id',g.id).eq('ended',false).select('id').maybeSingle();
       if(updateError || !endedRow) continue;
 
       const guild=client.guilds.cache.get(g.guild_id);
@@ -637,10 +640,11 @@ async function claimTicket(interaction,t){
   if(t.claimed_by) return interaction.reply({content:`این Ticket قبلاً توسط <@${t.claimed_by}> Claim شده است.`,ephemeral:true});
   const {data:claimed,error}=await supabase.from('tickets').update({claimed_by:interaction.user.id}).eq('id',t.id).eq('status','open').is('claimed_by',null).select('id,claimed_by').maybeSingle();
   if(error || !claimed) return interaction.reply({content:'❌ این Ticket همین الان توسط شخص دیگری Claim شد.',ephemeral:true});
-  const {error:claimHistoryError}=await supabase.from('ticket_claim_history').insert({ticket_id:t.id,guild_id:interaction.guild.id,user_id:interaction.user.id,action:'claim'});
+  const {error:claimHistoryError}=await supabase.from('ticket_claim_history').insert({ticket_id:String(t.id),guild_id:String(interaction.guild.id),user_id:String(interaction.user.id),action:'claim'});
   if(claimHistoryError) console.error('ticket claim history error:',claimHistoryError?.message||claimHistoryError);
   const claimText=`🎫 Ticket Claim شد | ${interaction.channel.name} | توسط ${interaction.user.tag} (<@${interaction.user.id}>)`;
   await logTo(interaction.guild,'ticket_log_channel',claimText);
+  await interaction.channel.permissionOverwrites.edit(interaction.user.id,{ViewChannel:true,SendMessages:true,ReadMessageHistory:true}).catch(err=>console.error('ticket claim permission error:',err?.message||err));
   const settings=await getSettings(interaction.guild.id);
   const logId=settings.ticket_log_channel;
   const logChannel=logId ? (interaction.guild.channels.cache.get(logId)||await interaction.guild.channels.fetch(logId).catch(()=>null)) : null;
@@ -711,10 +715,10 @@ client.on('interactionCreate',async interaction=>{
       const [type,id,extra]=interaction.customId.split(':');
       if(type==='gw'){
         const {data:gw}=await supabase.from('giveaways').select('id,guild_id,channel_id,message_id,ended,end_at').eq('id',id).maybeSingle();
-        if(!gw || Number(gw.ended)===1 || new Date(gw.end_at)<=new Date()) return interaction.reply({content:'این Giveaway تمام شده است.',ephemeral:true});
+        if(!gw || gw.ended===true || gw.ended===1 || String(gw.ended).toLowerCase()==='true' || new Date(gw.end_at)<=new Date()) return interaction.reply({content:'این Giveaway تمام شده است.',ephemeral:true});
         const {data:already}=await supabase.from('giveaway_entries').select('id').eq('giveaway_id',id).eq('user_id',interaction.user.id).maybeSingle();
         if(already) return interaction.reply({content:'قبلاً در این Giveaway شرکت کرده‌ای ✅',ephemeral:true});
-        const {error}=await supabase.from('giveaway_entries').insert({giveaway_id:id,user_id:interaction.user.id});
+        const {error}=await supabase.from('giveaway_entries').insert({giveaway_id:String(id),user_id:String(interaction.user.id)});
         if(error) return interaction.reply({content:'❌ خطا در ثبت ورود Giveaway.',ephemeral:true});
         await updateGiveawayMessage(gw);
         return interaction.reply({content:'وارد Giveaway شدی ✅',ephemeral:true});
@@ -1021,7 +1025,7 @@ client.on('interactionCreate',async interaction=>{
     if(commandName==='rerole'){
       if(!isBotOwner(interaction.user.id)) return interaction.reply({content:'⛔ فقط Owner می‌تواند Giveaway را دوباره قرعه‌کشی کند.',ephemeral:true});
       if(!interaction.channel?.isTextBased()) return interaction.reply({content:'❌ این دستور باید داخل کانال متنی اجرا شود.',ephemeral:true});
-      const {data:g,error:gError}=await supabase.from('giveaways').select('*').eq('guild_id',guild.id).eq('channel_id',interaction.channel.id).eq('ended',1).order('end_at',{ascending:false}).limit(1).maybeSingle();
+      const {data:g,error:gError}=await supabase.from('giveaways').select('*').eq('guild_id',guild.id).eq('channel_id',interaction.channel.id).eq('ended',true).order('end_at',{ascending:false}).limit(1).maybeSingle();
       if(gError || !g) return interaction.reply({content:'❌ در این چنل Giveaway تمام‌شده‌ای پیدا نشد.',ephemeral:true});
       const {data:entries,error:entryError}=await supabase.from('giveaway_entries').select('user_id').eq('giveaway_id',g.id);
       if(entryError) return interaction.reply({content:'❌ خواندن شرکت‌کننده‌ها از دیتابیس انجام نشد.',ephemeral:true});
@@ -1029,7 +1033,7 @@ client.on('interactionCreate',async interaction=>{
       if(users.length<2) return interaction.reply({content:'❌ برای انتخاب یک برنده جدید حداقل ۲ شرکت‌کننده لازم است.',ephemeral:true});
       const candidates=users.filter(u=>String(u)!==String(g.winner_id));
       const winner=(candidates.length?candidates:users)[Math.floor(Math.random()*(candidates.length?candidates:users).length)];
-      const {data:updated,error:updateError}=await supabase.from('giveaways').update({winner_id:winner}).eq('id',g.id).eq('ended',1).select('id').maybeSingle();
+      const {data:updated,error:updateError}=await supabase.from('giveaways').update({winner_id:winner}).eq('id',g.id).eq('ended',true).select('id').maybeSingle();
       if(updateError || !updated) return interaction.reply({content:'❌ ذخیره برنده جدید انجام نشد.',ephemeral:true});
       await interaction.channel.send({content:`🔄 **Giveaway Reroll**
 🎁 جایزه: **${g.prize}**
@@ -1069,11 +1073,11 @@ client.on('interactionCreate',async interaction=>{
           const detail=gError?.message ? `\n${gError.message}` : '';
           return interaction.reply({content:`❌ ساخت Giveaway در دیتابیس انجام نشد.${detail}`,ephemeral:true});
         }
-        const row=new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`gw:${g.id}`).setLabel('Joined: 0').setStyle(ButtonStyle.Success));
+        const row=new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`gw:${g.id}`).setLabel('Enter: 0').setStyle(ButtonStyle.Success));
         if(link) row.addComponents(new ButtonBuilder().setLabel('باز کردن لینک').setStyle(ButtonStyle.Link).setURL(link));
         let msg;
         try{
-          msg=await interaction.channel.send({content:`🎉 **Giveaway**\n🎁 جایزه: **${prize}**\n⏱️ زمان: **${fmt(minutes*60000)}**\n👥 Joined: **0**`,components:[row]});
+          msg=await interaction.channel.send({content:`🎉 **Giveaway**\n🎁 Prize: **${prize}**\n⏱️ Time: **${fmt(minutes*60000)}**\n👥 Joined: **0**`,components:[row]});
         }catch(sendError){
           console.error('giveaway channel send error:',sendError);
           await supabase.from('giveaways').delete().eq('id',g.id).catch(()=>{});
@@ -1236,9 +1240,12 @@ client.on('interactionCreate',async interaction=>{
     if(commandName==='claim'){ const t=await getTicket(interaction.channel); if(!t) return interaction.reply({content:'Ticket نیست.',ephemeral:true}); return claimTicket(interaction,t); }
     if(commandName==='claimchange'){
       const t=await getTicket(interaction.channel); if(!t||!isTicketStaff(interaction.member)) return interaction.reply({content:'دسترسی یا Ticket ندارید.',ephemeral:true}); const u=interaction.options.getUser('user');
+      const previousClaimer=t.claimed_by ? String(t.claimed_by) : null;
       const {error:claimChangeError}=await supabase.from('tickets').update({claimed_by:u.id}).eq('id',t.id);
       if(claimChangeError) return interaction.reply({content:`❌ تغییر Claim انجام نشد: ${claimChangeError.message}`,ephemeral:true});
-      const {error:claimHistoryError}=await supabase.from('ticket_claim_history').insert({ticket_id:t.id,guild_id:guild.id,user_id:u.id,action:'claimchange',changed_by:interaction.user.id});
+      if(previousClaimer && previousClaimer!==String(u.id)) await interaction.channel.permissionOverwrites.edit(previousClaimer,{ViewChannel:true,SendMessages:false,ReadMessageHistory:true}).catch(err=>console.error('old claimant permission error:',err?.message||err));
+      await interaction.channel.permissionOverwrites.edit(u.id,{ViewChannel:true,SendMessages:true,ReadMessageHistory:true}).catch(err=>console.error('new claimant permission error:',err?.message||err));
+      const {error:claimHistoryError}=await supabase.from('ticket_claim_history').insert({ticket_id:String(t.id),guild_id:String(guild.id),user_id:String(u.id),action:'claimchange',changed_by:String(interaction.user.id)});
       if(claimHistoryError) console.error('ticket claim history error:',claimHistoryError?.message||claimHistoryError);
       const claimText=`🔄 Claim تغییر کرد | ${interaction.channel.name} | مسئول جدید: ${u.tag||u.username} (<@${u.id}>) | توسط ${interaction.user.tag}`;
       await logTo(guild,'ticket_log_channel',claimText);

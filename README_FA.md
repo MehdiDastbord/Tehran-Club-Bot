@@ -3,7 +3,7 @@
 نسخه 6 با تمرکز روی پایداری، Supabase persistence و قابلیت‌های درخواستی Tehran Club.
 
 ## قبل از اجرا
-1. Node.js 20 یا بالاتر نصب باشد.
+1. Node.js 22.x نصب باشد (برای این نسخه توصیه/نیازمندی اصلی).
 2. `npm install`
 3. فایل `.env` را از روی `.env.example` بسازید و این موارد را وارد کنید:
    - `DISCORD_TOKEN`
@@ -12,7 +12,7 @@
    - `OWNER_ID`
    - `SUPABASE_URL`
    - `SUPABASE_SERVICE_ROLE_KEY`
-4. کل فایل `supabase/schema.sql` را در Supabase SQL Editor اجرا کنید. این فایل شامل migrationهای V6 برای دیتابیس‌های V5 هم هست.
+4. اگر دیتابیس نسخه قبلی را دارید، ابتدا همان SQL قبلی خودتان را نگه دارید و سپس `supabase_migration_v6_2.sql` را در Supabase SQL Editor اجرا کنید. این migration غیرمخرب است و نوع `giveaways.ended` را به Boolean اصلاح می‌کند و جدول‌های لازم برای Giveaway/Claim Log/Log Queue را در صورت نبودن می‌سازد.
 5. `npm run deploy`
 6. `npm start`
 
