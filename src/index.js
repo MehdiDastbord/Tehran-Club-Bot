@@ -299,11 +299,40 @@ function addLogFieldSafely(embeds,state,field){
 }
 
 async function sendEmbedBatches(channel,embeds){
-  // Discord allows at most 10 embeds per message. Send every batch instead of
-  // silently dropping everything after the first 10 embeds.
-  for(let i=0;i<embeds.length;i+=10){
-    await channel.send({embeds:embeds.slice(i,i+10)});
+  // Discord's 6,000-character limit applies to the TOTAL text of all embeds
+  // in a single message, not just to each embed individually. Sending up to
+  // 10 individually-valid 6,000-char embeds together can therefore still fail.
+  // Send one embed per message for a guaranteed-safe payload.
+  for(const embed of embeds){
+    const safeEmbed=embedCharacterCount(embed) > 5900
+      ? trimEmbedToLimit(embed,5900)
+      : embed;
+    await channel.send({embeds:[safeEmbed]});
   }
+}
+
+function trimEmbedToLimit(embed,maxChars=5900){
+  const src=embed?.data||{};
+  const out=new EmbedBuilder();
+  if(src.title) out.setTitle(String(src.title).slice(0,256));
+  if(src.description) out.setDescription(String(src.description).slice(0,4096));
+  if(src.url) out.setURL(src.url);
+  if(src.timestamp) out.setTimestamp(new Date(src.timestamp));
+  if(src.footer?.text) out.setFooter({text:String(src.footer.text).slice(0,2048),iconURL:src.footer.icon_url});
+  if(src.author?.name) out.setAuthor({name:String(src.author.name).slice(0,256),iconURL:src.author.icon_url,url:src.author.url});
+  let used=embedCharacterCount(out);
+  for(const field of src.fields||[]){
+    const name=String(field.name||'Field').slice(0,256);
+    let value=String(field.value||'—').slice(0,1024);
+    const room=maxChars-used-name.length;
+    if(room<=10) break;
+    value=value.slice(0,Math.min(1024,room-10));
+    if(!value) continue;
+    out.addFields({name,value,inline:Boolean(field.inline)});
+    used=embedCharacterCount(out);
+    if(used>=maxChars) break;
+  }
+  return out;
 }
 
 async function flushGuildLogs(guild,force=false){
@@ -408,7 +437,7 @@ async function handleSetCh(message, parts){
   await deleteInvocation(message); return true;
 }
 
-client.once('ready',async()=>{
+client.once('clientReady',async()=>{
   console.log(`Logged in as ${client.user.tag}`);
   for(const g of client.guilds.cache.values()) await ensureRoles(g);
   setInterval(endGiveaways,10000); setInterval(showStats,21600000);
@@ -1486,7 +1515,7 @@ client.on('roleUpdate',async(oldR,newR)=>{ if(oldR.name!==newR.name) await logTo
 client.on('channelUpdate',async(oldC,newC)=>{ if(oldC.name!==newC.name) await logTo(newC.guild,'server_update_log_channel',`✏️ Channel تغییر نام: ${oldC.name} → ${newC.name}`); });
 const inviteCache=new Map();
 async function cacheInvites(g){ const m=new Map(); for(const i of await g.invites.fetch().catch(()=>new Map())) m.set(i.code,i.uses||0); inviteCache.set(g.id,m); }
-client.on('ready',async()=>{ for(const g of client.guilds.cache.values()) await cacheInvites(g).catch(()=>{}); });
+client.on('clientReady',async()=>{ for(const g of client.guilds.cache.values()) await cacheInvites(g).catch(()=>{}); });
 client.on('inviteCreate',async i=>cacheInvites(i.guild));
 client.on('inviteDelete',async i=>cacheInvites(i.guild));
 process.on('unhandledRejection', e => console.error('UNHANDLED REJECTION:', e));
