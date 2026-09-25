@@ -18,6 +18,9 @@ add(new SlashCommandBuilder().setName('giveaway').setDescription('ایجاد ی�
 add(new SlashCommandBuilder().setName('giveawaysv').setDescription('ایجاد یک قرعه‌کشی with a link').addStringOption(o=>o.setName('prize').setDescription('جایزه').setRequired(true)).addIntegerOption(o=>o.setName('minutes').setDescription('مدت زمان به دقیقه').setRequired(true).setMinValue(1)).addStringOption(o=>o.setName('link').setDescription('لینک').setRequired(true)));
 add(new SlashCommandBuilder().setName('dropmatn').setDescription('ایجاد دراپ متنی').addStringOption(o=>o.setName('text').setDescription('متن برنده').setRequired(true)).addStringOption(o=>o.setName('prize').setDescription('جایزه').setRequired(true)));
 add(new SlashCommandBuilder().setName('dropclick').setDescription('ایجاد دراپ کلیکی').addStringOption(o=>o.setName('prize').setDescription('جایزه').setRequired(true)));
+add(new SlashCommandBuilder().setName('rerole').setDescription('انتخاب دوباره برنده آخرین Giveaway این چنل'));
+add(new SlashCommandBuilder().setName('embed').setDescription('ساخت Embed و افزودن دکمه').addStringOption(o=>o.setName('title').setDescription('عنوان Embed')).addStringOption(o=>o.setName('description').setDescription('متن Embed')));
+add(new SlashCommandBuilder().setName('banch').setDescription('دادن رول Ban CH به کاربر').addUserOption(o=>o.setName('user').setDescription('کاربر').setRequired(true)));
 
 // Ticket panel management
 const panel=new SlashCommandBuilder().setName('panel').setDescription('ایجاد یک پنل تیکت')
