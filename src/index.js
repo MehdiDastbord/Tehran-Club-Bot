@@ -201,7 +201,8 @@ async function updateGiveawayMessage(g){
       return ButtonBuilder.from(component);
     })
   ));
-  await original.edit({components}).catch(err=>console.error('giveaway participant update error:',err.message));
+  const updatedContent=giveawayContent(g, count);
+  await original.edit({content:updatedContent,components}).catch(err=>console.error('giveaway participant update error:',err.message));
 }
 
 function moderationHierarchyError(executor, target, guild, action){
