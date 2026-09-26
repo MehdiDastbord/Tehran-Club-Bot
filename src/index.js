@@ -11,9 +11,8 @@ const { supabase, getSettings, setSettings } = require('./db');
 // requires editReply instead of reply. This prevents 3-second timeout races
 // from turning normal database latency into Unknown interaction errors.
 async function respond(interaction, options){
-  if(interaction.deferred) return interaction.editReply(options);
-  if(interaction.replied) return interaction.editReply(options);
-  return respond(interaction, options);
+  if(interaction.deferred || interaction.replied) return interaction.editReply(options);
+  return interaction.reply(options);
 }
 
 const ADMIN = PermissionsBitField.Flags.Administrator;
