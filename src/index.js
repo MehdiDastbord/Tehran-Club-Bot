@@ -434,10 +434,12 @@ async function flushGuildLogs(guild,force=false){
     if(fields===0) pushField({name:'📭 Logs',value:'در این بازه لاگی ثبت نشده است.'});
     embeds.push(embed);
 
-    // Discord allows max 10 embeds per message. Send pages in batches instead
-    // of silently dropping old pages.
-    for(let i=0;i<embeds.length;i+=10){
-      await channel.send({embeds:embeds.slice(i,i+10)});
+    // IMPORTANT: Discord's 6000-character limit applies to the combined
+    // embed payload of a single message, not only to each individual embed.
+    // Sending several ~5900-character embeds together can therefore still
+    // trigger MAX_EMBED_SIZE_EXCEEDED. Send each page as its own message.
+    for(const page of embeds){
+      await channel.send({embeds:[page]});
     }
     // IMPORTANT: log_queue is an immutable history. Never delete rows after /sendlogs
     // or after the automatic 6-hour report. This keeps all historical logs and counts.
