@@ -77,6 +77,19 @@ add(new SlashCommandBuilder().setName('createcmd').setDescription('ایجاد ی
 add(new SlashCommandBuilder().setName('setlogchannel').setDescription('تنظیم کانال اصلی گزارش لاگ‌ها').addChannelOption(o=>o.setName('channel').setDescription('کانال ارسال گزارش‌های تجمیعی').addChannelTypes(ChannelType.GuildText).setRequired(true)));
 add(new SlashCommandBuilder().setName('sendlogs').setDescription('ارسال فوری گزارش لاگ‌های جمع‌شده'));
 
+// Staff hierarchy / access-role configuration
+add(new SlashCommandBuilder().setName('setlevelrole').setDescription('تنظیم رول Staff Level از 1 تا 10').addIntegerOption(o=>o.setName('level').setDescription('Level 1 تا 10').setRequired(true).setMinValue(1).setMaxValue(10)).addRoleOption(o=>o.setName('role').setDescription('رول این Level').setRequired(true)));
+add(new SlashCommandBuilder().setName('clearlevelrole').setDescription('حذف رول Staff Level').addIntegerOption(o=>o.setName('level').setDescription('Level 1 تا 10').setRequired(true).setMinValue(1).setMaxValue(10)));
+add(new SlashCommandBuilder().setName('setaccessrole').setDescription('تنظیم رول دسترسی یک قابلیت').addStringOption(o=>o.setName('access').setDescription('نوع دسترسی').setRequired(true).addChoices(
+  {name:'Ban / Kick',value:'ban_kick'},{name:'High Rank',value:'highrank'},{name:'Giveaway / Drop',value:'giveaway'},
+  {name:'Exchange',value:'exchange'},{name:'Logs',value:'logs'},{name:'Timeout',value:'timeout'},{name:'Ticket Support',value:'ticket_support'}
+)).addRoleOption(o=>o.setName('role').setDescription('رول دسترسی').setRequired(true)));
+add(new SlashCommandBuilder().setName('clearaccessrole').setDescription('حذف رول دسترسی یک قابلیت').addStringOption(o=>o.setName('access').setDescription('نوع دسترسی').setRequired(true).addChoices(
+  {name:'Ban / Kick',value:'ban_kick'},{name:'High Rank',value:'highrank'},{name:'Giveaway / Drop',value:'giveaway'},
+  {name:'Exchange',value:'exchange'},{name:'Logs',value:'logs'},{name:'Timeout',value:'timeout'},{name:'Ticket Support',value:'ticket_support'}
+)));
+add(new SlashCommandBuilder().setName('staffroles').setDescription('نمایش Staff Levels و Access Roles فعلی'));
+
 (async()=>{
   const rest=new REST({version:'10'}).setToken(process.env.DISCORD_TOKEN);
   await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID,process.env.GUILD_ID),{body:cmds.map(x=>x.toJSON())});
