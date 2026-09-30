@@ -53,10 +53,13 @@ logs.addSubcommand(s => s.setName('reset').setDescription('حذف تنظیم ی�
 logs.addSubcommand(s => s.setName('resetall').setDescription('حذف تمام Log Channelها'));
 logs.addSubcommand(s => s.setName('status').setDescription('نمایش وضعیت Logها'));
 logs.addSubcommand(s => s.setName('test').setDescription('تست ارسال Log'));
-const setup = logs.addSubcommand(s => s.setName('setup').setDescription('تنظیم چند Log Channel با یک دستور'));
-for (const type of logTypes) {
-  setup.addChannelOption(o => o.setName(type).setDescription(`${type} log`).addChannelTypes(ChannelType.GuildText));
-}
+logs.addSubcommand(s => {
+  s.setName('setup').setDescription('تنظیم چند Log Channel با یک دستور');
+  for (const type of logTypes) {
+    s.addChannelOption(o => o.setName(type).setDescription(`${type} log`).addChannelTypes(ChannelType.GuildText));
+  }
+  return s;
+});
 register(logs);
 
 // Legacy/shortcut command: configure all log channels in one command.
@@ -150,8 +153,8 @@ ticket.addSubcommand(s => s.setName('panel').setDescription('Create panel')
   .addStringOption(o => o.setName('title').setDescription('Title').setRequired(true))
   .addStringOption(o => o.setName('text').setDescription('Text').setRequired(true))
   .addStringOption(o => o.setName('types').setDescription('Comma separated type keys').setRequired(true))
-  .addChannelOption(o => o.setName('category').setDescription('Category'))
-  .addRoleOption(o => o.setName('supportrole').setDescription('Ticket Support Role').setRequired(true)));
+  .addRoleOption(o => o.setName('supportrole').setDescription('Ticket Support Role').setRequired(true))
+  .addChannelOption(o => o.setName('category').setDescription('Category')));
 ticket.addSubcommand(s => s.setName('addtype').setDescription('Add ticket type')
   .addStringOption(o => o.setName('key').setDescription('Key').setRequired(true))
   .addStringOption(o => o.setName('name').setDescription('Name').setRequired(true))
