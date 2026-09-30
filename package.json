@@ -1,20 +1,28 @@
 {
   "name": "tehran-club-bot",
-  "version": "6.1.0",
+  "version": "20.0.0",
   "private": true,
-  "description": "Tehran Club Discord bot with Supabase database",
+  "description": "Tehran Club Discord bot - hardened single-guild discord.js bot",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "deploy": "node src/deploy-commands.js"
+    "deploy": "node src/deploy-commands.js",
+    "check": "node scripts/check.js",
+    "audit": "node scripts/audit.js",
+    "restore": "node scripts/restore.js",
+    "test:sql": "python3 scripts/outbox-sql-test.py"
   },
   "engines": {
-    "node": "22.x"
+    "node": ">=22.12.0"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.57.0",
-    "discord.js": "^14.22.1",
-    "dotenv": "^16.6.1",
-    "ws": "^8.18.3"
+    "@discord-player/extractor": "7.2.0",
+    "@discordjs/voice": "0.19.2",
+    "better-sqlite3": "13.0.3",
+    "discord-player": "7.2.0",
+    "discord.js": "14.27.0",
+    "dotenv": "17.2.2",
+    "ffmpeg-static": "5.3.0",
+    "openai": "7.17.0"
   }
 }

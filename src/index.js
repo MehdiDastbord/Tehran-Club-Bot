@@ -1,1801 +1,741 @@
-require('dotenv').config();
 const {
-  Client, GatewayIntentBits, Partials, PermissionsBitField,
-  EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
-  StringSelectMenuBuilder, ModalBuilder, TextInputBuilder, TextInputStyle,
-  AttachmentBuilder, ChannelType, MessageFlags
+  Client, GatewayIntentBits, Partials, MessageFlags, EmbedBuilder, ActionRowBuilder,
+  ButtonBuilder, ButtonStyle, ChannelType, PermissionFlagsBits, AttachmentBuilder,
+  AuditLogEvent, ModalBuilder, TextInputBuilder, TextInputStyle
 } = require('discord.js');
-const { supabase, getSettings, setSettings } = require('./db');
+const crypto = require('crypto');
+const { token, owners, botName, guildId, aiRetentionDays, logRetentionDays, backupDir, backupRetention, banchRoleId, banchAccessRoleId } = require('./config');
+const { getSettings, setSettings, getXp, db, backupNow, integrityCheck } = require('./db');
+const { safeReply, ok, err, info, warn, isOwner, isAdmin, hasRole, placeholders, stripMentions, safeEmoji, clamp } = require('./utils');
+const { sendLog, cleanup: cleanupLogs, types: LOG_TYPES } = require('./services/logService');
+const xp = require('./services/xpService');
+const staff = require('./services/staffService');
+const invites = require('./services/inviteService');
+const tickets = require('./services/ticketService');
+const giveaways = require('./services/giveawayService');
+const drops = require('./services/dropService');
+const ai = require('./services/aiService');
+const music = require('./services/musicService');
+const music247 = require('./services/music247');
+const outbox = require('./services/discordOutboxService');
+const delivery = require('./services/discordDeliveryService');
+const guess = require('./services/guessService');
+const { hasAccess, hasStrictRole, canManageTarget, botHas } = require('./services/permissionService');
+const { sleep } = require('./utils');
 
-// Central interaction responder: after an interaction is deferred, Discord
-// requires editReply instead of reply. This prevents 3-second timeout races
-// from turning normal database latency into Unknown interaction errors.
-async function respond(interaction, options){
-  if(interaction.deferred || interaction.replied) return interaction.editReply(options);
-  return interaction.reply(options);
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildInvites,
+    GatewayIntentBits.DirectMessages
+  ],
+  partials: [Partials.Channel, Partials.Message]
+});
+
+const inviteQueues = new Map();
+const inviteSnapshots = new Map();
+const timers = new Set();
+let shuttingDown = false;
+let intervalsStarted = false;
+const owner = id => isOwner(id, owners);
+
+function access(interaction, key, options={}) {
+  return hasAccess(interaction.member, key, options);
 }
-
-const ADMIN = PermissionsBitField.Flags.Administrator;
-const ACCESS = {
-  giveaway: 'Giveway Acces', ticket: 'Tickets Support', mod: 'Ban/Kick Acces', logs: 'Logs', exchange: 'Exchange'
-};
-const TICKET_SUPPORT_ROLE = 'Tickets Support';
-
-// Staff hierarchy + per-action access control. These defaults are only used
-// when a guild has not customized the settings yet; all values are editable
-// through the staff-role configuration commands added below.
-const DEFAULT_LEVEL_ROLES = {
-  1: '1550061780447920169', // SUPPORTER
-  2: '1550570396611514418', // HELPER
-  3: '1550061830943150100', // MODERATOR
-  4: '1550570248208523356', // ADMIN
-  5: '1550061880863621120', // MANAGEMENT
-  6: '1550570182689165433', // DIRECTOR
-  7: null,
-  8: null,
-  9: null,
-  10: null
-};
-const DEFAULT_ACCESS_ROLES = {
-  ban_kick: '1550650256293625907',
-  highrank: '1552630481906827304',
-  giveaway: '1550650245757665280',
-  exchange: '1550650257841328148',
-  logs: '1550935507251237046',
-  timeout: '1551549678825373786',
-  ticket_support: '1549899402481770659'
-};
-const ACTION_ACCESS = {
-  kick: 'ban_kick', ban: 'ban_kick', banch: 'ban_kick', unban: 'ban_kick',
-  timeout: 'timeout', untimeout: 'timeout',
-  giveaway: 'giveaway', giveawaysv: 'giveaway', dropmatn: 'giveaway', dropclick: 'giveaway', rerole: 'giveaway',
-  exchange: 'exchange',
-  claim: 'ticket_support', claimchange: 'ticket_support', add: 'ticket_support', remove: 'ticket_support', close: 'ticket_support', reopen: 'ticket_support',
-  sendlogs: 'logs'
-};
-const TICKET_TYPES = {
-  support: {label:'Support', emoji:'🛠️', prefix:'support'},
-  exchange: {label:'Exchange', emoji:'💱', prefix:'exchange'},
-  staffhire: {label:'Staff Hire', emoji:'👔', prefix:'staffhire'},
-  eventjoin: {label:'Event Join', emoji:'🎉', prefix:'eventjoin'}
-};
-const PUBLIC_COMMANDS = new Set(['exchange','banner','level','leaderboard']);
-const BANCH_TARGET_ROLE_ID = '1550062330182762556';
-const hasRoleId = (m, roleId) => !!roleId && !!m?.roles?.cache?.has(String(roleId));
-
-async function getLevelRoleIds(guildId){
-  const settings=await getSettings(guildId).catch(()=>({}));
-  const configured=settings.staff_level_roles || {};
-  return Object.fromEntries(Object.keys(DEFAULT_LEVEL_ROLES).map(k=>[k, Object.prototype.hasOwnProperty.call(configured,k) ? configured[k] : DEFAULT_LEVEL_ROLES[k]]));
+async function need(interaction, key, options={}) {
+  if (access(interaction,key,options)) return true;
+  await safeReply(interaction,{embeds:[err('برای این بخش دسترسی لازم را نداری.')],flags:MessageFlags.Ephemeral});
+  return false;
 }
-
-async function getAccessRoleIds(guildId){
-  const settings=await getSettings(guildId).catch(()=>({}));
-  const configured=settings.access_roles || {};
-  // Migrate the old command-key format without deleting any existing settings.
-  const migrated={
-    ban_kick: Object.prototype.hasOwnProperty.call(configured,'ban_kick') ? configured.ban_kick : (configured.ban || configured.kick || DEFAULT_ACCESS_ROLES.ban_kick),
-    highrank: Object.prototype.hasOwnProperty.call(configured,'highrank') ? configured.highrank : DEFAULT_ACCESS_ROLES.highrank,
-    giveaway: Object.prototype.hasOwnProperty.call(configured,'giveaway') ? configured.giveaway : DEFAULT_ACCESS_ROLES.giveaway,
-    exchange: Object.prototype.hasOwnProperty.call(configured,'exchange') ? configured.exchange : DEFAULT_ACCESS_ROLES.exchange,
-    logs: Object.prototype.hasOwnProperty.call(configured,'logs') ? configured.logs : DEFAULT_ACCESS_ROLES.logs,
-    timeout: Object.prototype.hasOwnProperty.call(configured,'timeout') ? configured.timeout : DEFAULT_ACCESS_ROLES.timeout,
-    ticket_support: Object.prototype.hasOwnProperty.call(configured,'ticket_support') ? configured.ticket_support : (configured.ticket || DEFAULT_ACCESS_ROLES.ticket_support)
-  };
-  return migrated;
+async function needAdmin(interaction) {
+  if(owner(interaction.user.id)||isAdmin(interaction.member))return true;
+  await safeReply(interaction,{embeds:[err('فقط Owner یا Administrator اجازه این تنظیم را دارد.')],flags:MessageFlags.Ephemeral});
+  return false;
 }
+function hierarchyMessage(interaction,target){const r=canManageTarget(interaction,target);return r.ok?null:r.message;}
+async function getMember(guild,user){return guild.members.fetch(user.id).catch(()=>null)}
+function textChannel(channel){return !!channel?.isTextBased?.() && channel.type!==ChannelType.GuildVoice && channel.type!==ChannelType.GuildStageVoice;}
+function botPermissionMessage(guild,permission,label){return botHas(guild,permission)?null:`Bot دسترسی ${label} را ندارد.`;}
+function buttonWithEmoji(button,value){const e=safeEmoji(value);if(!e)return button;if(typeof e==='string')return button.setEmoji(e);return button.setEmoji({id:e.id,name:e.name,animated:e.animated});}
+async function deferEphemeral(interaction){if(!interaction.deferred&&!interaction.replied)await interaction.deferReply({flags:MessageFlags.Ephemeral});}
 
-async function saveDefaultAccessRoleIds(guildId){
-  const settings=await getSettings(guildId).catch(()=>({}));
-  const current=settings.access_roles || {};
-  const access_roles=await getAccessRoleIds(guildId);
-  const levelRoles=await getLevelRoleIds(guildId);
-  const patch={};
-  if(JSON.stringify(current)!==JSON.stringify(access_roles)) patch.access_roles=access_roles;
-  if(JSON.stringify(settings.staff_level_roles||{})!==JSON.stringify(levelRoles)) patch.staff_level_roles=levelRoles;
-  if(Object.keys(patch).length) await setSettings(guildId,patch).catch(err=>console.error('staff role settings save error:',err?.message||err));
-  return {access_roles,level_roles:levelRoles};
-}
-
-async function getStaffLevel(member, guildId){
-  if(!member) return 0;
-  const roles=await getLevelRoleIds(guildId);
-  let level=0;
-  for(const [raw,id] of Object.entries(roles)) if(id && hasRoleId(member,id)) level=Math.max(level,Number(raw));
-  return level;
-}
-
-async function staffPermission(member, guildId, action, target=null){
-  if(!member) return {ok:false,reason:'عضو پیدا نشد.'};
-  if(isBotOwner(member.id)) return {ok:true,level:10,owner:true};
-  const level=await getStaffLevel(member,guildId);
-  const accessRoles=await getAccessRoleIds(guildId);
-  const accessKey=ACTION_ACCESS[action];
-  // Ticket Support is intentionally available to every configured Staff Level.
-  // Other management actions keep the existing Level 3+ gate and access-role checks.
-  if(accessKey==='ticket_support'){
-    if(level<1) return {ok:false,reason:'⛔ برای Ticket Support حداقل یک Staff Level لازم است.'};
+function invitePageData(guildId, mode, inviterId, page=0){
+  const perPage=12; const safePage=Math.max(0,Math.floor(Number(page)||0)); const offset=safePage*perPage;
+  let rows=[];
+  if(mode==='invited'||mode==='active'||mode==='left_members'||mode==='fake_members'){
+    const memberMode=mode==='active'?'active':mode==='left_members'?'left':mode==='fake_members'?'fake':'all';
+    rows=invites.listMembers(guildId,{inviterId,mode:memberMode,limit:perPage+1,offset});
   }else{
-    if(level<3) return {ok:false,reason:'⛔ سطح Staff شما برای انجام این کار کافی نیست. Level 1 و 2 دسترسی مدیریتی ندارند.'};
-    if(accessKey && !hasRoleId(member,accessRoles[accessKey])) return {ok:false,reason:`⛔ برای **${action}** رول دسترسی مخصوص آن را ندارید.`};
+    const eventMode=mode==='alljoins'?'join':mode;
+    rows=invites.eventList(guildId,{inviterId,type:eventMode,limit:perPage+1,offset});
   }
-  if(target){
-    const targetLevel=await getStaffLevel(target,guildId);
-    if(targetLevel>0 && targetLevel>=level) return {ok:false,reason:`⛔ نمی‌توانید ${action} را روی Staff با Level ${targetLevel} انجام دهید. سطح هدف باید پایین‌تر از سطح شما باشد.`};
+  const hasNext=rows.length>perPage; rows=rows.slice(0,perPage);
+  let lines=[];
+  if(mode==='invited'||mode==='active'||mode==='left_members'||mode==='fake_members'){
+    lines=rows.map((r,n)=>`${offset+n+1}. <@${r.member_id}> — ${r.fake?'🟠 Fake':'🟢 Regular'} — ${r.active?'Joined':'Left'} — Rejoins: ${Math.max(0,(r.join_count||1)-1)} — <t:${Math.floor((r.last_joined_at||r.joined_at)/1000)}:R>`);
+  }else if(eventMode==='left'){
+    lines=rows.map((r,n)=>`${offset+n+1}. <@${r.member_id}> — ${r.inviter_id?`invited by <@${r.inviter_id}>`:'inviter Unknown'} — ${r.fake?'Fake leave':'Leave'} — <t:${Math.floor(r.created_at/1000)}:R>`);
+  }else{
+    lines=rows.map((r,n)=>`${offset+n+1}. <@${r.member_id}> ${r.fake?'🟠 Fake ':''}${r.rejoin?'🔁 Rejoin ':''}— ${r.invite_code||'unknown'} — ${r.inviter_id?`inviter: <@${r.inviter_id}>`:'inviter: Unknown'} — <t:${Math.floor(r.created_at/1000)}:R>`);
   }
-  return {ok:true,level,accessKey};
+  const row=new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`invpage:${mode}:${inviterId||'all'}:${Math.max(0,safePage-1)}`).setLabel('Prev').setEmoji('◀️').setStyle(ButtonStyle.Secondary).setDisabled(safePage<=0),
+    new ButtonBuilder().setCustomId(`invpage:${mode}:${inviterId||'all'}:${safePage+1}`).setLabel('Next').setEmoji('▶️').setStyle(ButtonStyle.Secondary).setDisabled(!hasNext)
+  );
+  return {embed:info(`${lines.length?lines.join('\n'):'هیچ موردی ثبت نشده.'}\n\nصفحه: **${safePage+1}**`),row};
 }
 
-async function requireStaffAccess(interaction, action, target=null){
-  const result=await staffPermission(interaction.member,interaction.guild.id,action,target);
-  if(!result.ok){ await respond(interaction, {content:result.reason,flags:MessageFlags.Ephemeral}).catch(()=>{}); return false; }
-  return true;
-}
+function xpDefaults(existing={}){return {enabled:true,min:10,max:20,cooldownMs:60000,curve:'linear',multiplier:1,maxLevel:0,channelId:null,levelUpChannelId:null,...existing};}
+function inviteDefaults(existing={}){return {fakeDays:3,countRejoins:false,...existing};}
 
-const MODERATION_ROLE_IDS = Object.fromEntries(Object.entries(DEFAULT_ACCESS_ROLES));
-const canUseModerationCommand = (m, commandName, roleIds=MODERATION_ROLE_IDS) => {
-  const key=ACTION_ACCESS[commandName] || commandName;
-  return hasRoleId(m, roleIds[key] || roleIds[commandName]);
-};
-const TICKET_STAFF_COMMANDS = new Set(['claim','claimchange','add','remove','close','reopen']);
-const client = new Client({ intents:[
-  GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages,
-  GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.DirectMessages,
-  GatewayIntentBits.GuildInvites
-], partials:[Partials.Channel] });
+async function handleXp(i,s){
+  const gid=i.guild.id;
+  const settings=getSettings(gid);
+  const cfg=xpDefaults(settings.xp||{});
+  if(!await need(i,'xp'))return;
+  await deferEphemeral(i);
 
-const OWNER_IDS = String(process.env.AUTHORIZED_IDS || process.env.OWNER_IDS || process.env.OWNER_ID || '').split(',').map(x=>x.trim()).filter(Boolean);
-const isBotOwner = id => OWNER_IDS.includes(String(id));
-const isAdmin = m => !!m?.permissions?.has(ADMIN);
-const hasAccess = (m, role) => !!m?.roles?.cache?.some(r=>r.name===role);
-const hasRoleOnly = (m, role) => !!m?.roles?.cache?.some(r=>r.name===role);
-const isTicketStaff = m => hasRoleOnly(m,TICKET_SUPPORT_ROLE) || isBotOwner(m?.id || m?.user?.id);
-function safeEmoji(builder, emoji){
-  const value=String(emoji||'').trim();
-  if(!value) return builder;
-  // Discord accepts Unicode emoji or a structured custom-emoji object. Avoid
-  // passing colon-shortcodes / malformed values into builders: those can fail
-  // later during JSON serialization, making the whole component row invalid.
-  const custom=value.match(/^<(a?):([A-Za-z0-9_~]+):(\d{17,20})>$/);
-  try{
-    if(custom) builder.setEmoji({id:custom[3],name:custom[2],animated:custom[1]==='a'});
-    else if(!value.includes(':') && !/[<>]/.test(value)) builder.setEmoji(value);
-  }catch{}
-  return builder;
-}
-const clean = s => String(s||'').replace(/`/g,'').trim();
-function stripMentions(text){
-  return String(text||'')
-    .replace(/<@!?(\d+)>/g,'@user')
-    .replace(/<@&(\d+)>/g,'@role')
-    .replace(/<#(\d+)>/g,'#channel')
-    .replace(/@everyone/gi,'[everyone]')
-    .replace(/@here/gi,'[here]');
-}
-function displayUser(memberOrUser){
-  return memberOrUser?.user?.tag || memberOrUser?.tag || memberOrUser?.username || memberOrUser?.id || 'Unknown';
-}
-const EXACT_EXCHANGE_MENTION_USERNAMES = ['amir_gholizadeh22', 'itskingpubgyt'];
-const EXCHANGE_LOG_CHANNEL_ID = String(process.env.EXCHANGE_LOG_CHANNEL_ID || '').trim();
+  if(s==='setchannel'||s==='setlevelup'){
+    if(!await needAdmin(i))return;
+    const ch=i.options.getChannel('channel');
+    if(!textChannel(ch))return safeReply(i,{embeds:[err('Channel معتبر نیست.')],flags:MessageFlags.Ephemeral});
+    if(!i.guild.members.me?.permissionsFor(ch)?.has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages]))return safeReply(i,{embeds:[err('Bot در این Channel دسترسی ارسال ندارد.')],flags:MessageFlags.Ephemeral});
+    await setSettings(gid,{xp:{[s==='setchannel'?'channelId':'levelUpChannelId']:ch.id}});
+    return safeReply(i,{embeds:[ok(s==='setchannel'?`XP فقط در <#${ch.id}> محاسبه می‌شود.`:`پیام Level Up در <#${ch.id}> ارسال می‌شود.`)],flags:MessageFlags.Ephemeral});
+  }
 
-async function resolveExchangeLogMentions(guild){
-  // These are the exact accounts requested for the Exchange Log. IDs may be
-  // supplied for extra reliability, but the username defaults remain fixed.
-  const configured=String(process.env.EXCHANGE_LOG_MENTION_USERS || EXACT_EXCHANGE_MENTION_USERNAMES.join(','))
-    .split(',').map(x=>x.trim()).filter(Boolean);
-  const ids=[];
-  for(const target of configured){
-    if(/^\d{15,25}$/.test(target)) { ids.push(target); continue; }
-    const username=target.toLowerCase();
-    let member=guild.members.cache.find(m=>m.user.username.toLowerCase()===username);
-    if(!member) {
-      const fetched=await guild.members.fetch({query:target,limit:10}).catch(()=>null);
-      member=fetched?.find(m=>m.user.username.toLowerCase()===username) || null;
+  if(s==='settings'){
+    const min=i.options.getInteger('min'),max=i.options.getInteger('max'),cd=i.options.getInteger('cooldown');
+    if(max<min)return safeReply(i,{embeds:[err('Max باید بزرگ‌تر یا مساوی Min باشد.')],flags:MessageFlags.Ephemeral});
+    const curve=i.options.getString('curve')||cfg.curve,mult=i.options.getNumber('multiplier')??cfg.multiplier,maxLevel=i.options.getInteger('maxlevel')??cfg.maxLevel;
+    await setSettings(gid,{xp:{...cfg,min,max,cooldownMs:cd*1000,curve,multiplier:mult,maxLevel,enabled:true}});
+    return safeReply(i,{embeds:[ok(`XP تنظیم شد. ${min}-${max} | Cooldown: ${cd}s | Curve: ${curve} | Multiplier: ${mult} | Max Level: ${maxLevel||'نامحدود'}`)],flags:MessageFlags.Ephemeral});
+  }
+
+  if(s==='setrole'||s==='removerole'){
+    const level=i.options.getInteger('level');
+    if(s==='setrole'){
+      const role=i.options.getRole('role'),me=i.guild.members.me;
+      if(!role||role.managed||!me||role.id===i.guild.id||role.position>=me.roles.highest.position)return safeReply(i,{embeds:[err('این Role قابل مدیریت توسط Bot نیست.')],flags:MessageFlags.Ephemeral});
+      const result=await xp.changeRoleMapping(i.guild,level,role.id,false,i.user.tag);
+      return safeReply(i,{embeds:[result.ok?ok(`Level ${level} → <@&${role.id}> تنظیم شد.`):err(result.message)],flags:MessageFlags.Ephemeral});
     }
-    if(member) ids.push(member.user.id);
+    const result=await xp.changeRoleMapping(i.guild,level,null,true,i.user.tag);
+    return safeReply(i,{embeds:[result.ok?ok(`Mapping Level ${level} حذف شد.`):err(result.message)],flags:MessageFlags.Ephemeral});
   }
-  return [...new Set(ids)];
+
+  if(s==='roles'){
+    const rows=xp.rolesFor(gid);return safeReply(i,{embeds:[info([`Curve: **${cfg.curve}**`,`Multiplier: **${cfg.multiplier}**`,`Max Level: **${cfg.maxLevel||'نامحدود'}**`,rows.length?rows.map(r=>`Level ${r.level} → <@&${r.role_id}>`).join('\n'):'هیچ Roleای تنظیم نشده.'].join('\n'))],flags:MessageFlags.Ephemeral});
+  }
+  if(s==='resetall'){
+    const result=await xp.resetAll(i.guild,i.user.tag);return safeReply(i,{embeds:[result.ok?ok(`XP کل سرور ریست شد (${result.users} کاربر).`):err(result.message)],flags:MessageFlags.Ephemeral});
+  }
+  const user=i.options.getUser('user'); const member=user?await getMember(i.guild,user):null;
+  if(!member)return safeReply(i,{embeds:[err('Member پیدا نشد.')],flags:MessageFlags.Ephemeral});
+  const hm=hierarchyMessage(i,member);if(hm&&!owner(i.user.id))return safeReply(i,{embeds:[err(hm)],flags:MessageFlags.Ephemeral});
+  if(s==='reset'){const result=await xp.resetUser(i.guild,member,i.user.tag);return safeReply(i,{embeds:[result.ok?ok('XP کاربر ریست شد.'):err(result.message)],flags:MessageFlags.Ephemeral});}
+  const amount=i.options.getInteger('amount');const result=await xp.manualChange(i.guild,member,s==='add'?amount:-amount,i.user.tag,s);
+  return safeReply(i,{embeds:[result.ok?ok(`<@${member.id}> → XP **${result.next.xp}** | Level **${result.next.level}**`):err(result.message)],flags:MessageFlags.Ephemeral});
 }
-function duration(minutes){ const n=Number(minutes); return Number.isFinite(n)&&n>0 ? n : null; }
-function fmt(ms){ const m=Math.max(1,Math.ceil(ms/60000)); return `${m} دقیقه`; }
-async function getGiveawayParticipantCount(giveawayId){
-  const {data,error}=await supabase.from('giveaway_entries').select('user_id').eq('giveaway_id',giveawayId);
-  if(error){ console.error('giveaway participant count error:',error.message); return {count:0,users:[]}; }
-  const users=[...new Set((data||[]).map(x=>String(x.user_id)).filter(Boolean))];
-  return {count:users.length,users};
+async function handleLogs(i,s){
+  if(['set','reset','resetall','setup'].includes(s)){if(!await needAdmin(i))return;}else if(!await need(i,'logs'))return;
+
+  await deferEphemeral(i);
+  const gid=i.guild.id;const cur={...(getSettings(gid).logs||{})};
+  if(s==='set'||s==='reset'){
+    const type=i.options.getString('type');
+    if(s==='set'){
+      const ch=i.options.getChannel('channel'),me=i.guild.members.me;
+      if(!textChannel(ch)||!me||!ch.permissionsFor(me).has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))return safeReply(i,{embeds:[err('Log Channel معتبر نیست یا Bot دسترسی ارسال Log ندارد.')],flags:MessageFlags.Ephemeral});
+      cur[type]=ch.id;
+    }else delete cur[type];
+    await setSettings(gid,{logs:cur});
+    return safeReply(i,{embeds:[ok(s==='set'?`Log ${type} → <#${cur[type]}>`:`Log ${type} حذف شد.`)],flags:MessageFlags.Ephemeral});
+  }
+  if(s==='resetall'){await setSettings(gid,{logs:{}});return safeReply(i,{embeds:[ok('تمام Log Channelها پاک شدند.')],flags:MessageFlags.Ephemeral});}
+  if(s==='setup'){
+    const invalid=[];const me=i.guild.members.me;
+    for(const type of LOG_TYPES){const ch=i.options.getChannel(type);if(!ch)continue;if(!textChannel(ch)||!me||!ch.permissionsFor(me).has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks])){invalid.push(type);continue;}cur[type]=ch.id;}
+    await setSettings(gid,{logs:cur});return safeReply(i,{embeds:[invalid.length?warn(`این Logها ذخیره نشدند: ${invalid.join(', ')}`):ok('تمام Log Channelهای انتخاب‌شده تنظیم شدند.')],flags:MessageFlags.Ephemeral});
+  }
+  if(s==='test'){
+    let success=0,failed=0;
+    for(const [type,id] of Object.entries(cur)){
+      const ch=await i.guild.channels.fetch(id).catch(()=>null);
+      if(!ch?.isTextBased()){failed++;continue;}
+      try{await ch.send({embeds:[new EmbedBuilder().setColor(0x57F287).setTitle('✅ Log Test').setDescription(`Log **${type}** به‌درستی ارسال شد.`).setTimestamp()]}).then(()=>success++).catch(()=>{failed++});}catch{failed++}
+    }
+    return safeReply(i,{embeds:[failed?warn(`Test تمام شد: ${success} موفق، ${failed} ناموفق.`):ok(`Test با موفقیت روی ${success} Log Channel انجام شد.`)],flags:MessageFlags.Ephemeral});
+  }
+  return safeReply(i,{embeds:[info(LOG_TYPES.map(t=>`**${t}** → ${cur[t]?`<#${cur[t]}>`:'تنظیم نشده'}`).join('\n'))],flags:MessageFlags.Ephemeral});
 }
-function giveawayContent(g, count){
-  const minutes = Number(g?.duration_minutes);
-  const timeText = Number.isFinite(minutes) && minutes > 0 ? fmt(minutes*60000) : (g?.end_at ? `<t:${Math.floor(new Date(g.end_at).getTime()/1000)}:R>` : 'نامشخص');
-  return `🎉 **Giveaway**\n🎁 جایزه: **${String(g?.prize ?? 'نامشخص')}**\n⏱️ زمان: **${timeText}**\n👥 Joined: **${count}**`;
+async function handleSetTicketLog(i){
+  if(!await needAdmin(i))return;
+  await deferEphemeral(i);
+  const gid=i.guild.id; const cur={...(getSettings(gid).logs||{})}; const invalid=[]; const me=i.guild.members.me;
+  for(const type of LOG_TYPES){
+    const ch=i.options.getChannel(type); if(!ch) continue;
+    if(!textChannel(ch)||!me||!ch.permissionsFor(me).has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks])){invalid.push(type);continue;}
+    cur[type]=ch.id;
+  }
+  await setSettings(gid,{logs:cur});
+  return safeReply(i,{embeds:[invalid.length?warn(`این Logها ذخیره نشدند: ${invalid.join(', ')}`):ok('همه Log Channelهای انتخاب‌شده تنظیم شدند.')],flags:MessageFlags.Ephemeral});
 }
 
-async function updateGiveawayMessage(g){
-  if(!g?.guild_id || !g?.channel_id || !g?.message_id) return;
-  const guild=client.guilds.cache.get(g.guild_id);
-  const ch=guild?.channels.cache.get(g.channel_id);
-  if(!ch?.isTextBased()) return;
-  const original=await ch.messages.fetch(g.message_id).catch(()=>null);
-  if(!original) return;
-  const {count}=await getGiveawayParticipantCount(g.id);
-  // Never rebuild the Giveaway text from database fields here. This preserves
-  // the original prize/time text and prevents old/migrated rows from showing
-  // `Unknown` after someone joins. Only the Joined counter is changed.
-  const components=original.components.map(row=>{
-    const rebuilt=row.components.map(component=>{
-      if(component.customId===`gw:${g.id}`) return ButtonBuilder.from(component).setLabel(`Joined: ${count}`);
-      return ButtonBuilder.from(component);
-    });
-    return new ActionRowBuilder().addComponents(rebuilt);
-  });
-  const updatedContent=giveawayContent(g, count);
-  await original.edit({content:updatedContent,components}).catch(err=>console.error('giveaway participant update error:',err.message));
+async function handleInvite(i,s){
+  const gid=i.guild.id;
+  const managed=['add','remove','addfake','removefake','reset'];
+  if(managed.includes(s)&&!await need(i,'invite'))return;
+  if(['setchannel','config'].includes(s)&&!await needAdmin(i))return;
+  await deferEphemeral(i);
+  if(s==='add'||s==='remove'||s==='addfake'||s==='removefake'){
+    const u=i.options.getUser('user'),amount=i.options.getInteger('amount');
+    const result=s==='add'?invites.add(gid,u.id,amount):s==='remove'?invites.remove(gid,u.id,amount):s==='addfake'?invites.addFake(gid,u.id,amount):invites.removeFake(gid,u.id,amount);
+    await sendLog(i.guild,'invite',{action:s,user:u.tag,amount,by:i.user.tag});
+    return safeReply(i,{embeds:[ok(`${s==='add'?'Bonus Invite اضافه شد':s==='remove'?'Bonus Invite حذف شد':s==='addfake'?'Fake Invite اضافه شد':'Fake Invite حذف شد'}: **${amount}**`)],flags:MessageFlags.Ephemeral});
+  }
+  if(s==='reset'){
+    const u=i.options.getUser('user');invites.reset(gid,u?.id||null);await sendLog(i.guild,'invite',{action:u?'reset_user':'reset_all',user:u?.tag||'all',by:i.user.tag});
+    return safeReply(i,{embeds:[ok(u?`Inviteهای <@${u.id}> ریست شد.`:'تمام Inviteها ریست شدند.')],flags:MessageFlags.Ephemeral});
+  }
+  if(s==='setchannel'){
+    const ch=i.options.getChannel('channel');const me=i.guild.members.me;
+    if(!textChannel(ch)||!me||!ch.permissionsFor(me).has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))return safeReply(i,{embeds:[err('Invite Log Channel معتبر نیست یا Bot دسترسی ندارد.')],flags:MessageFlags.Ephemeral});
+    await setSettings(gid,{logs:{invite:ch.id}});return safeReply(i,{embeds:[ok(`Invite Log → <#${ch.id}>`)],flags:MessageFlags.Ephemeral});
+  }
+  if(s==='config'){
+    const fakeDays=i.options.getInteger('fake_days'),count=i.options.getBoolean('count_rejoins');await setSettings(gid,{invite:{fakeDays,countRejoins:count}});
+    return safeReply(i,{embeds:[ok(`Fake Delay: ${fakeDays} روز | Count Rejoins: ${count?'فعال':'غیرفعال'}`)],flags:MessageFlags.Ephemeral});
+  }
+  if(s==='leaderboard'){
+    const rows=invites.leaderboard(gid);return safeReply(i,{embeds:[info(rows.length?rows.slice(0,20).map((r,n)=>`${n+1}. <@${r.user_id}> — **${r.valid}** | Regular ${r.uses} | Left ${r.leaves} | Fake ${r.fake} | Bonus ${r.added} | Active ${r.active_members}`).join('\n'):'داده‌ای ثبت نشده.')],flags:MessageFlags.Ephemeral});
+  }
+  if(s==='stats'){
+    const u=i.options.getUser('user')||i.user,r=invites.stats(gid,u.id);return safeReply(i,{embeds:[info(`<@${u.id}>\nRegular: **${r.uses}**\nLeft: **${r.leaves}**\nFake: **${r.fake}**\nBonus: **${r.added}**\nTotal Joins: **${r.total_joins}**\nActive: **${r.active_members}**\nValid: **${r.valid}**`)],flags:MessageFlags.Ephemeral});
+  }
+  if(s==='invited'){
+    const u=i.options.getUser('user');const data=invitePageData(gid,'invited',u.id,0);return safeReply(i,{embeds:[data.embed],components:[data.row],flags:MessageFlags.Ephemeral});
+  }
+  if(s==='joins'||s==='alljoins'){
+    const u=i.options.getUser('user');const data=invitePageData(gid,'alljoins',u?.id||null,0);return safeReply(i,{embeds:[data.embed],components:[data.row],flags:MessageFlags.Ephemeral});
+  }
+  if(s==='fake'){
+    const u=i.options.getUser('user');const data=invitePageData(gid,'fake',u?.id||null,0);return safeReply(i,{embeds:[data.embed],components:[data.row],flags:MessageFlags.Ephemeral});
+  }
+  if(s==='left'||s==='leave'){
+    const u=i.options.getUser('user');const data=invitePageData(gid,'left',u?.id||null,0);return safeReply(i,{embeds:[data.embed],components:[data.row],flags:MessageFlags.Ephemeral});
+  }
+  if(s==='events'){
+    const u=i.options.getUser('user'),type=i.options.getString('type')||'all',rows=invites.eventList(gid,{inviterId:u?.id||null,type,limit:50});return safeReply(i,{embeds:[info(rows.length?rows.map((r,n)=>`${n+1}. **${r.type}** <@${r.member_id}> ${r.fake?'Fake ':''}${r.rejoin?'Rejoin ':''}${r.invite_code?`[${r.invite_code}] `:''}<t:${Math.floor(r.created_at/1000)}:R>`).join('\n'):'Eventی ثبت نشده.')],flags:MessageFlags.Ephemeral});
+  }
+  return safeReply(i,{embeds:[err('Invite subcommand نامعتبر است.')],flags:MessageFlags.Ephemeral});
+}
+async function handleStaff(i,s){
+  const gid=i.guild.id;if(!await need(i,'staff'))return;
+  if(s==='setrole'||s==='removerole'){
+    const level=i.options.getInteger('level');
+    if(s==='setrole'){
+      const role=i.options.getRole('role'),me=i.guild.members.me;
+      if(!role||role.managed||!me||role.id===i.guild.id||role.position>=me.roles.highest.position)return safeReply(i,{embeds:[err('Staff Role باید قابل مدیریت و پایین‌تر از Role بات باشد.')],flags:MessageFlags.Ephemeral});
+      const result=await staff.changeRoleMapping(i.guild,level,role.id,false,i.user.tag);
+      return safeReply(i,{embeds:[result.ok?ok(`Staff Level ${level} → <@&${role.id}>`):err(result.message)],flags:MessageFlags.Ephemeral});
+    }
+    const result=await staff.changeRoleMapping(i.guild,level,null,true,i.user.tag);
+    return safeReply(i,{embeds:[result.ok?ok('Staff Role Mapping حذف شد.'):err(result.message)],flags:MessageFlags.Ephemeral});
+  }
+  if(s==='roles'){
+    const rows=staff.listRoles(gid);
+    return safeReply(i,{embeds:[info(rows.length?rows.sort((a,b)=>b.level-a.level).map(r=>`**Rank ${r.level}** → <@&${r.role_id}>`).join('\n'):'هیچ Staff Role تنظیم نشده.')],flags:MessageFlags.Ephemeral});
+  }
+  if(s==='list'){
+    const rows=staff.listMembers(gid,50);
+    if(!rows.groups.length&&!rows.unmapped.length)return safeReply(i,{embeds:[info('هیچ Staffی ثبت نشده.')],flags:MessageFlags.Ephemeral});
+    const lines=[];
+    for(const group of rows.groups){
+      lines.push(`**Rank ${group.level}${group.role_id?` — <@&${group.role_id}>`:''}**`);
+      for(const member of group.members) lines.push(`• <@${member.user_id}> — Points **${member.points}**`);
+      lines.push('');
+    }
+    let description=lines.join('\n').trim();
+    if(description.length>3900)description=description.slice(0,3880)+'\n…';
+    return safeReply(i,{embeds:[info(`**Staff List — مرتب‌شده بر اساس Rank**\n\n${description}`)],flags:MessageFlags.Ephemeral});
+  }
+  if(s==='add'){
+    const u=await getMember(i.guild,i.options.getUser('user'));if(!u)return safeReply(i,{embeds:[err('Member پیدا نشد.')],flags:MessageFlags.Ephemeral});
+    const level=i.options.getInteger('level');if(level<1)return safeReply(i,{embeds:[err('Rank باید حداقل 1 باشد.')],flags:MessageFlags.Ephemeral});
+    const hm=hierarchyMessage(i,u);if(hm&&!owner(i.user.id))return safeReply(i,{embeds:[err(hm)],flags:MessageFlags.Ephemeral});
+    const reason=stripMentions(i.options.getString('reason')||'staff add');
+    const result=await staff.changeLevel(i.guild,u,i.member,level,'STAFF_ADD',reason);
+    return safeReply(i,{embeds:[result.ok?ok(`<@${u.id}> به Staff در Rank **${result.next}** اضافه شد.`):err(result.message)],flags:MessageFlags.Ephemeral});
+  }
+  if(s==='remove'){
+    const u=await getMember(i.guild,i.options.getUser('user'));if(!u)return safeReply(i,{embeds:[err('Member پیدا نشد.')],flags:MessageFlags.Ephemeral});
+    const current=staff.getStaff(gid,u.id);if(!current||current.level<=0)return safeReply(i,{embeds:[err('این کاربر Staff نیست.')],flags:MessageFlags.Ephemeral});
+    const hm=hierarchyMessage(i,u);if(hm&&!owner(i.user.id))return safeReply(i,{embeds:[err(hm)],flags:MessageFlags.Ephemeral});
+    const reason=stripMentions(i.options.getString('reason')||'staff remove');
+    const result=await staff.removeStaff(i.guild,u,i.member,reason);
+    return safeReply(i,{embeds:[result.ok?ok(`<@${u.id}> از Staff خارج شد.`):err(result.message)],flags:MessageFlags.Ephemeral});
+  }
+  if(s==='history'){const user=i.options.getUser('user');const rows=user?db.prepare('SELECT * FROM staff_history WHERE guild_id=? AND target_id=? ORDER BY id DESC LIMIT 30').all(gid,user.id):db.prepare('SELECT * FROM staff_history WHERE guild_id=? ORDER BY id DESC LIMIT 30').all(gid);return safeReply(i,{embeds:[info(rows.length?rows.map(r=>`<t:${Math.floor(r.created_at/1000)}:f> — <@${r.target_id}> — ${r.action} ${r.old_level}→${r.new_level} — by <@${r.actor_id}>${r.reason?` — ${clamp(r.reason,200)}`:''}`).join('\n'):'Historyی ثبت نشده.')],flags:MessageFlags.Ephemeral});}
+  const u=await getMember(i.guild,i.options.getUser('user'));if(!u)return safeReply(i,{embeds:[err('Member پیدا نشد.')],flags:MessageFlags.Ephemeral});
+  if(s==='info'){const r=staff.getStaff(gid,u.id);return safeReply(i,{embeds:[info(r?`<@${u.id}> — Level **${r.level}** | Points **${r.points}**`:'Staff نیست.')],flags:MessageFlags.Ephemeral});}
+  const hm=hierarchyMessage(i,u);if(hm&&!owner(i.user.id))return safeReply(i,{embeds:[err(hm)],flags:MessageFlags.Ephemeral});
+  if(s==='setlevel'){const level=i.options.getInteger('level'),reason=stripMentions(i.options.getString('reason')||'manual set'),result=await staff.changeLevel(i.guild,u,i.member,level,'SET_LEVEL',reason);return safeReply(i,{embeds:[result.ok?ok(`Staff Level: ${result.old} → ${result.next}`):err(result.message)],flags:MessageFlags.Ephemeral});}
+  const result=await staff.changeRank(i.guild,u,i.member,s==='rankup'?1:-1,stripMentions(i.options.getString('reason')||'بدون دلیل'));return safeReply(i,{embeds:[result.ok?ok(`${result.action}: ${result.old} → ${result.next}`):err(result.message)],flags:MessageFlags.Ephemeral});
 }
 
-function moderationHierarchyError(executor, target, guild, action){
-  if(!target) return 'ممبر پیدا نشد.';
-  if(String(target.id)===String(executor.id)) return `❌ نمی‌توانی خودت را ${action} کنی.`;
-  if(String(target.id)===String(guild.ownerId)) return `❌ نمی‌توانی Owner سرور را ${action} کنی.`;
-  const executorHighest=executor.roles?.highest;
-  const targetHighest=target.roles?.highest;
-  if(executorHighest && targetHighest && targetHighest.position >= executorHighest.position){
-    return `❌ رول بالاتر یا مساوی داری؛ نمی‌توانی کاربری با رول **${targetHighest.name}** را ${action} کنی.`;
+async function handleTicket(i,s){
+  const gid=i.guild.id;
+  // Ticket actions may perform multiple Discord API calls; defer up front.
+  await deferEphemeral(i);
+  if(s==='panel'){
+    if(!await need(i,'staff'))return;
+    const title=i.options.getString('title'),text=i.options.getString('text'),keys=[...new Set(i.options.getString('types').split(',').map(x=>x.trim().toLowerCase()).filter(Boolean))].slice(0,25);const cat=i.options.getChannel('category'),role=i.options.getRole('supportrole');if(!role)return safeReply(i,{embeds:[err('Ticket Support Role الزامی است.')],flags:MessageFlags.Ephemeral});const me=i.guild.members.me;if(role.managed||!me||role.position>=me.roles.highest.position)return safeReply(i,{embeds:[err('Ticket Support Role باید پایین‌تر از Role بات باشد.')],flags:MessageFlags.Ephemeral});if(cat&&cat.type!==ChannelType.GuildCategory)return safeReply(i,{embeds:[err('Category نامعتبر است.')],flags:MessageFlags.Ephemeral});
+    const all=tickets.getTypes(gid);const rows=[];for(const k of keys){if(!all[k])continue;let b=new ButtonBuilder().setCustomId(`ticket_open:${k}`).setLabel(String(all[k].name).slice(0,80)).setStyle(ButtonStyle.Primary);b=buttonWithEmoji(b,all[k].emoji||'🎫');let row=rows[rows.length-1];if(!row||row.components.length>=5){row=new ActionRowBuilder();rows.push(row);}row.addComponents(b);}if(!rows.length)return safeReply(i,{embeds:[err('هیچ Ticket Type معتبری انتخاب نشده.')],flags:MessageFlags.Ephemeral});
+    const oldRole=tickets.supportRoleId(i.guild);
+    const panelMessage=await i.channel.send({embeds:[new EmbedBuilder().setColor(0x5865F2).setTitle(title).setDescription(text)],components:rows});
+    const syncFailures=await tickets.syncSupportRole(i.guild,oldRole,role.id);
+    if(syncFailures.length){await panelMessage.delete().catch(()=>{});return safeReply(i,{embeds:[err(`Support Role تنظیم نشد؛ ${syncFailures.length} Ticket قدیمی Sync نشد.`)],flags:MessageFlags.Ephemeral});}
+    try{await setSettings(gid,{ticket:{categoryId:cat?.id||null,supportRoleId:role.id}});}catch(error){await tickets.syncSupportRole(i.guild,role.id,oldRole).catch(()=>{});await panelMessage.delete().catch(()=>{});return safeReply(i,{embeds:[err(`تنظیمات Ticket ذخیره نشد: ${clamp(error.message,500)}`)],flags:MessageFlags.Ephemeral});}
+    await sendLog(i.guild,'ticket',{action:'panel_created',support_role:role.id,by:i.user.tag});return safeReply(i,{embeds:[ok('Ticket Panel ساخته شد و Ticket Support Role اعمال شد.')],flags:MessageFlags.Ephemeral});
   }
-  const botMember=guild.members.me;
-  if(botMember?.roles?.highest && targetHighest && targetHighest.position >= botMember.roles.highest.position){
-    return `❌ رول من از رول **${targetHighest.name}** پایین‌تر است و نمی‌توانم این کار را انجام دهم.`;
+  if(s==='setrole'){
+    if(!await need(i,'staff'))return;
+    const role=i.options.getRole('role'),me=i.guild.members.me;
+    if(!role||role.managed||!me||role.id===i.guild.id||role.position>=me.roles.highest.position)return safeReply(i,{embeds:[err('Ticket Support Role باید قابل مدیریت و پایین‌تر از Role بات باشد.')],flags:MessageFlags.Ephemeral});
+    const old=tickets.supportRoleId(i.guild),failures=await tickets.syncSupportRole(i.guild,old,role.id);
+    if(failures.length)return safeReply(i,{embeds:[err(`Support Role تغییر نکرد؛ ${failures.length} مورد Sync نشد.`)],flags:MessageFlags.Ephemeral});
+    try{await setSettings(gid,{ticket:{supportRoleId:role.id}});}catch(error){const rollback=await tickets.syncSupportRole(i.guild,role.id,old).catch(e=>[{ticket:'rollback',error:e.message}]);return safeReply(i,{embeds:[err(`تنظیمات ذخیره نشد و Roleها rollback شدند.${rollback.length?' وضعیت Ticketها را بررسی کن.':''}`)],flags:MessageFlags.Ephemeral});}
+    await sendLog(i.guild,'ticket',{action:'support_role_set',old_role:old||'none',role:role.id,by:i.user.tag});
+    return safeReply(i,{embeds:[ok(`Ticket Support Role → <@&${role.id}>`)],flags:MessageFlags.Ephemeral});
   }
-  return null;
+  if(s==='addtype'){if(!await need(i,'staff'))return;const t=tickets.getTypes(gid),key=i.options.getString('key').toLowerCase().replace(/[^a-z0-9_-]/g,'').slice(0,30);if(!key)return safeReply(i,{embeds:[err('Key نامعتبر است.')],flags:MessageFlags.Ephemeral});t[key]={name:clamp(i.options.getString('name'),80),emoji:safeEmoji(i.options.getString('emoji')||'🎫')||'🎫',prefix:(i.options.getString('prefix')||key).replace(/[^a-zA-Z0-9_-]/g,'').slice(0,30)};await tickets.saveTypes(gid,t);return safeReply(i,{embeds:[ok(`Ticket Type **${key}** اضافه شد.`)],flags:MessageFlags.Ephemeral});}
+  if(s==='leaderboard'){if(!await need(i,'staff'))return;const ch=i.options.getChannel('channel');if(!textChannel(ch))return safeReply(i,{embeds:[err('Channel معتبر نیست.')],flags:MessageFlags.Ephemeral});const me=i.guild.members.me;if(!me||!ch.permissionsFor(me).has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))return safeReply(i,{embeds:[err('Bot در این Channel دسترسی ارسال ندارد.')],flags:MessageFlags.Ephemeral});await setSettings(gid,{ticket:{claimLeaderboardChannelId:ch.id,claimLeaderboardMessageId:null}});return safeReply(i,{embeds:[ok(`Claim Leaderboard هر ۶ ساعت در <#${ch.id}> ارسال می‌شود.`)],flags:MessageFlags.Ephemeral});}
+  if(s==='settings'){const cfg=getSettings(gid).ticket||{};return safeReply(i,{embeds:[info(`Support Role: ${cfg.supportRoleId?`<@&${cfg.supportRoleId}>`:'تنظیم نشده'}\nCategory: ${cfg.categoryId?`<#${cfg.categoryId}>`:'تنظیم نشده'}\nTypes: ${Object.keys(tickets.getTypes(gid)).join(', ')}`)],flags:MessageFlags.Ephemeral});}
+  const ticket=tickets.getByChannel(gid,i.channel.id);if(!ticket)return safeReply(i,{embeds:[err('این Channel یک Ticket ثبت‌شده نیست.')],flags:MessageFlags.Ephemeral});
+  if(s==='claim')return safeReply(i,{embeds:[await tickets.claim(i.guild,ticket.id,i.user.id,i.member)?ok('Ticket Claim شد.'):err('Claim ناموفق بود؛ فقط Ticket Support Role دسترسی دارد یا Ticket قبلاً Claim شده.')],flags:MessageFlags.Ephemeral});
+  if(s==='close'){const reason=stripMentions(i.options.getString('reason')||'بدون دلیل');return safeReply(i,{embeds:[await tickets.close(i.guild,ticket.id,i.member,reason)?ok('Ticket بسته شد.'):err('بستن Ticket ناموفق بود.')],flags:MessageFlags.Ephemeral});}
+  if(s==='reopen')return safeReply(i,{embeds:[await tickets.reopen(i.guild,ticket.id,i.member)?ok('Ticket دوباره باز شد.'):err('Reopen ناموفق بود.')],flags:MessageFlags.Ephemeral});
+  if(s==='transcript'){const buf=await tickets.transcript(i.guild,ticket.id,i.member).catch(e=>{console.error('[TRANSCRIPT]',e.message);return null});if(!buf)return safeReply(i,{embeds:[err('ساخت Transcript ناموفق بود.')],flags:MessageFlags.Ephemeral});return safeReply(i,{embeds:[ok('Transcript آماده شد.')],files:[new AttachmentBuilder(buf,{name:`ticket-${ticket.id}.txt`})],flags:MessageFlags.Ephemeral});}
+  const u=i.options.getUser('user');const done=s==='add'?await tickets.addUser(i.guild,ticket.id,u.id,i.member):await tickets.removeUser(i.guild,ticket.id,u.id,i.member);return safeReply(i,{embeds:[done?ok(`${s==='add'?'کاربر اضافه':'کاربر حذف'} شد.`):err('عملیات ناموفق بود.')],flags:MessageFlags.Ephemeral});
 }
-function placeholders(text, member, guild, inv, invnum){
-  return String(text||'').replaceAll('[user]', `<@${member.id}>`).replaceAll('[Number]', String(guild.memberCount))
-    .replaceAll('[inv]', inv||'').replaceAll('[invnum]', String(invnum??0));
-}
-async function ensureRole(guild,name){
-  let r=guild.roles.cache.find(x=>x.name===name);
-  if(!r) r=await guild.roles.create({name,reason:'Tehran Club bot access role'});
-  return r;
-}
-async function ensureRoles(guild){
-  await ensureRole(guild,TICKET_SUPPORT_ROLE).catch(()=>{});
-  await ensureRole(guild,ACCESS.logs).catch(()=>{});
-  await ensureRole(guild,ACCESS.giveaway).catch(()=>{});
-}
-const AGG_LOGS = {
-  giveaway_create_log_channel: '🎉 Giveaway / Drop',
-  giveaway_winner_log_channel: '🎉 Giveaway / Drop',
-  drop_create_log_channel: '🎉 Giveaway / Drop',
-  drop_winner_log_channel: '🎉 Giveaway / Drop',
-  ticket_log_channel: '🎫 Ticket Logs',
-  ticket_feedback_channel: '⭐ Feedback',
-  message_log_channel: '💬 Message Logs',
-  ban_kick_log_channel: '🔨 Ban / Kick Logs',
-  timeout_log_channel: '⏱️ Timeout Logs',
-  voice_log_channel: '🔊 Voice / Stage Logs',
-  dm_log_channel: '📩 DM Logs',
-  server_update_log_channel: '🛠️ Server Logs',
-  member_warn_log_channel: '⚠️ Member Warn Logs',
-  welcome_channel: '👋 Welcome',
-  invite_log_channel: '📨 Invite Logs',
-  level_channel: '⬆️ Level Up'
-};
-const AGG_LOG_ORDER = [...new Set(Object.values(AGG_LOGS))];
-const LOG_FLUSH_FIRST_MS = 3 * 60 * 60 * 1000;
-const LOG_FLUSH_INTERVAL_MS = 6 * 60 * 60 * 1000;
-let logFlushRunning = false;
 
-async function sendConfiguredLog(guild,key,text){
+async function handleGiveaway(i,s){
+  const giveawayRole=getSettings(i.guild.id).accessRoles?.giveaway;
+  if(!giveawayRole || !hasStrictRole(i.member,giveawayRole)) { await safeReply(i,{embeds:[err('فقط GiveAway Access Role می‌تواند Giveaway را مدیریت کند.')],flags:MessageFlags.Ephemeral}); return; }
+  await deferEphemeral(i);
+  if(s==='start'){
+    const g=giveaways.create(i.guild,i.channel,stripMentions(i.options.getString('prize')),i.options.getInteger('minutes'),i.options.getString('link'));
+    let sentMessage=null;try{sentMessage=await i.channel.send({embeds:[giveaways.embed(g)],components:[giveaways.row(g,false,0,1)]});const r=db.prepare('UPDATE giveaways SET message_id=? WHERE id=? AND message_id IS NULL').run(sentMessage.id,g.id);if(!r.changes)throw new Error('GIVEAWAY_MESSAGE_DB_FAILED');}
+    catch(error){if(sentMessage)await sentMessage.delete().catch(()=>{});db.prepare('DELETE FROM giveaway_entries WHERE giveaway_id=?').run(g.id);db.prepare('DELETE FROM giveaways WHERE id=? AND ended=0').run(g.id);throw error;}
+    await sendLog(i.guild,'giveaway',{action:'created',id:g.id,prize:g.prize,ends_at:g.ends_at,by:i.user.tag});return safeReply(i,{embeds:[ok(`Giveaway #${g.id} ساخته شد.`)],flags:MessageFlags.Ephemeral});
+  }
+  const requestedId=i.options.getInteger('id');const g=requestedId?db.prepare('SELECT * FROM giveaways WHERE guild_id=? AND channel_id=? AND id=? AND ended=0').get(i.guild.id,i.channel.id,requestedId):db.prepare('SELECT * FROM giveaways WHERE guild_id=? AND channel_id=? AND ended=0 ORDER BY id DESC LIMIT 1').get(i.guild.id,i.channel.id);if(!g)return safeReply(i,{embeds:[err('Giveaway فعالی در این Channel نیست.')],flags:MessageFlags.Ephemeral});await giveaways.finish(i.guild,g,true);return safeReply(i,{embeds:[ok('Giveaway پایان یافت و Winner کاملاً تصادفی انتخاب شد.')],flags:MessageFlags.Ephemeral});
+}
+
+async function handleDrop(i,s){
+  const giveawayRole=getSettings(i.guild.id).accessRoles?.giveaway;
+  if(!giveawayRole || !hasStrictRole(i.member,giveawayRole)) { await safeReply(i,{embeds:[err('فقط GiveAway Access Role می‌تواند Drop را مدیریت کند.')],flags:MessageFlags.Ephemeral}); return; }
+  await deferEphemeral(i);
+  if(s==='text'||s==='button'){
+    const d=drops.create(i.guild,i.channel,s==='text'?'text':'button',s==='text'?i.options.getString('trigger'):null,stripMentions(i.options.getString('prize')),i.options.getInteger('minutes'));
+    let sentMessage=null;try{sentMessage=await i.channel.send({embeds:[drops.embed(d)],components:s==='button'?[drops.row(d)]:[]});const r=db.prepare('UPDATE drops SET message_id=? WHERE id=? AND message_id IS NULL').run(sentMessage.id,d.id);if(!r.changes)throw new Error('DROP_MESSAGE_DB_FAILED');}
+    catch(error){if(sentMessage)await sentMessage.delete().catch(()=>{});db.prepare('DELETE FROM drops WHERE id=? AND ended=0').run(d.id);throw error;}
+    await sendLog(i.guild,'drop',{action:'created',drop_id:d.id,channel:i.channel.id,by:i.user.tag,ends_at:d.ends_at});return safeReply(i,{embeds:[ok(`Drop #${d.id} ساخته شد.`)],flags:MessageFlags.Ephemeral});
+  }
+  const ds=drops.active(i.guild.id,'text',i.channel.id).concat(drops.active(i.guild.id,'button',i.channel.id));
+  if(s==='end'){const requestedId=i.options.getInteger('id');const targets=requestedId?ds.filter(d=>d.id===requestedId):ds;for(const d of targets)await drops.endWithMessage(i.guild,d,'ended_manual');return safeReply(i,{embeds:[ok('Dropهای همین Channel پایان داده شدند.')],flags:MessageFlags.Ephemeral});}
+  return safeReply(i,{embeds:[info(ds.length?ds.map(d=>`#${d.id} — ${d.prize} — ${d.kind} — <t:${Math.floor(d.ends_at/1000)}:R>`).join('\n'):'Drop فعالی نیست.')],flags:MessageFlags.Ephemeral});
+}
+
+async function exchangeManage(i,action,requestId){
+  const ex=getSettings(i.guild.id).exchange||{};
+  if(!ex.accessRoleId||!hasStrictRole(i.member,ex.accessRoleId))return safeReply(i,{embeds:[err('فقط Exchange Access Role می‌تواند Exchange را تأیید یا رد کند.')],flags:MessageFlags.Ephemeral});
+  const req=db.prepare('SELECT * FROM exchange_requests WHERE guild_id=? AND id=?').get(i.guild.id,requestId);if(!req||req.status!=='pending')return safeReply(i,{embeds:[err('درخواست Exchange پیدا نشد یا قبلاً بررسی شده.')],flags:MessageFlags.Ephemeral});
+  const r=db.prepare('UPDATE exchange_requests SET status=?,decided_by=?,decided_at=? WHERE guild_id=? AND id=? AND status="pending"').run(action,i.user.id,Date.now(),i.guild.id,req.id);if(!r.changes)return safeReply(i,{embeds:[err('این درخواست همزمان توسط فرد دیگری بررسی شد.')],flags:MessageFlags.Ephemeral});
+  const ch=await i.guild.channels.fetch(req.channel_id).catch(()=>null);const m=await ch?.messages.fetch(req.message_id).catch(()=>null);const color=action==='accept'?0x57F287:0xED4245;const title=action==='accept'?'✅ Exchange Accepted':'❌ Exchange Rejected';
+  if(m)await m.edit({embeds:[new EmbedBuilder().setColor(color).setTitle(title).setDescription(req.text).addFields({name:'درخواست‌دهنده',value:`<@${req.requester_id}>`,inline:true},{name:'بررسی‌کننده',value:`<@${i.user.id}>`,inline:true})],components:[]}).catch(e=>{console.error('[EXCHANGE MESSAGE]',e.message);ch?.send({content:`Exchange #${req.id} ${action==='accept'?'تأیید':'رد'} شد توسط <@${i.user.id}>.`,allowedMentions:{users:[i.user.id]}}).catch(()=>{})});
+  if(action==='accept'){const outId=getSettings(i.guild.id).exchange?.approvedChannelId;const out=outId?await i.guild.channels.fetch(outId).catch(()=>null):null;if(out?.isTextBased()){await out.send({embeds:[new EmbedBuilder().setColor(0x57F287).setTitle('💱 Exchange Approved').setDescription(req.text).addFields({name:'درخواست‌دهنده',value:`<@${req.requester_id}>`,inline:true},{name:'تأییدکننده',value:`<@${i.user.id}>`,inline:true},{name:'Request ID',value:String(req.id),inline:true})],allowedMentions:{users:[req.requester_id,i.user.id]}}).catch(e=>console.error('[EXCHANGE OUTPUT]',e.message));}}
+  await sendLog(i.guild,'exchange',{action,request:req.id,requester:req.requester_id,by:i.user.tag});return safeReply(i,{embeds:[ok('Exchange به‌روزرسانی شد.')],flags:MessageFlags.Ephemeral});
+}
+
+async function handleMusic(i,s){
+  if(!await need(i,'music'))return;
+  await deferEphemeral(i);
+  const voice=i.member?.voice?.channel;
+  if(s==='play'||['skip','pause','resume','stop','leave','volume','loop','shuffle'].includes(s)){if(!voice)return safeReply(i,{embeds:[err('اول وارد Voice شو.')],flags:MessageFlags.Ephemeral});const me=i.guild.members.me;if(!me||!voice.permissionsFor(me).has([PermissionFlagsBits.Connect,PermissionFlagsBits.Speak]))return safeReply(i,{embeds:[err('Bot به Connect/Speak در Voice دسترسی ندارد.')],flags:MessageFlags.Ephemeral});const q=music.queue(i.guild.id);if(q&&q.channel?.id&&q.channel.id!==voice.id)return safeReply(i,{embeds:[err(`بات الان در <#${q.channel.id}> است.`)],flags:MessageFlags.Ephemeral});if(q&&['skip','pause','resume','stop','leave','volume','loop','shuffle'].includes(s)){const inSame=q.channel?.id===voice.id;if(!inSame)return safeReply(i,{embeds:[err('باید داخل همان Voice بات باشی.')],flags:MessageFlags.Ephemeral});}
+  }
   try{
-    const settings=await getSettings(guild.id);
-    const channelId=settings[key];
-    if(!channelId) return false;
-    const channel=guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(()=>null);
-    if(!channel?.isTextBased()) return false;
-    await channel.send({content:String(text).slice(0,1900),allowedMentions:{parse:[]}});
-    return true;
-  }catch(error){
-    console.error(`direct ${key} log error:`,error?.message||error);
-    return false;
-  }
+    if(s==='play'){const stay=!!music247.get(i.guild.id);const track=await music.play(i.guild,voice,i.options.getString('query'),i.user,stay,i.channel);await sendLog(i.guild,'music',{action:'play',track:track.title,by:i.user.tag,channel:voice.id});return safeReply(i,{embeds:[ok(`🎵 **${clamp(track.title,250)}** به Queue اضافه شد.`)],flags:MessageFlags.Ephemeral});}
+    if(s==='queue'){const q=music.queue(i.guild.id);if(!q)return safeReply(i,{embeds:[info('Queue فعالی نیست.')],flags:MessageFlags.Ephemeral});const rows=q.tracks.toArray();return safeReply(i,{embeds:[info(`${q.currentTrack?`Now: **${clamp(q.currentTrack.title,250)}**\n`:''}${rows.length?rows.slice(0,20).map((t,n)=>`${n+1}. ${clamp(t.title,150)}`).join('\n'):'Queue خالی است.'}`)],flags:MessageFlags.Ephemeral});}
+    if(s==='nowplaying'){const st=music.status(i.guild.id);return safeReply(i,{embeds:[st?.track?info(`🎵 **${clamp(st.track.title,250)}**\nVoice: <#${st.channelId}>\nPaused: ${st.paused?'Yes':'No'}\nVolume: ${st.volume??'?'}\nLoop: ${st.repeatMode}`):info('هیچ آهنگی در حال پخش نیست.')],flags:MessageFlags.Ephemeral});}
+    if(s==='shuffle'){const q=music.queue(i.guild.id);if(!q)return safeReply(i,{embeds:[err('Queue فعال نیست.')],flags:MessageFlags.Ephemeral});q.tracks.shuffle();return safeReply(i,{embeds:[ok('Queue Shuffle شد.')],flags:MessageFlags.Ephemeral});}
+    if(s==='247'){
+      const enabled=i.options.getBoolean('enabled');if(enabled){if(!voice)return safeReply(i,{embeds:[err('برای 24/7 باید داخل Voice باشی.')],flags:MessageFlags.Ephemeral});music247.set(i.guild.id,voice.id,i.channel.id);await music.ensure247(i.guild,voice,i.channel);await sendLog(i.guild,'music',{action:'247_enable',voice:voice.id,by:i.user.tag});return safeReply(i,{embeds:[ok(`24/7 فعال شد در <#${voice.id}>.`)],flags:MessageFlags.Ephemeral});}
+      music247.disable(i.guild.id);const q=music.queue(i.guild.id);if(q){q.options.leaveOnEnd=true;q.options.leaveOnStop=true;q.options.leaveOnEmpty=true;if(!q.currentTrack&&q.tracks?.size===0)await q.delete().catch(()=>{});}await sendLog(i.guild,'music',{action:'247_disable',by:i.user.tag});return safeReply(i,{embeds:[ok('24/7 خاموش شد و اتصال آزاد شد.')],flags:MessageFlags.Ephemeral});
+    }
+    await music.control(i.guild.id,s,i.options.getInteger('value')??i.options.getInteger('mode'));await sendLog(i.guild,'music',{action:s,by:i.user.tag});return safeReply(i,{embeds:[ok(`Music: ${s}`)],flags:MessageFlags.Ephemeral});
+  }catch(e){const msg=e.message==='MUSIC_ALREADY_IN_ANOTHER_VOICE'?'بات در Voice دیگری است.':e.message;await sendLog(i.guild,'music',{action:'error',by:i.user.tag,error:msg}).catch(()=>{});return safeReply(i,{embeds:[err(msg||'خطای Music رخ داد.')],flags:MessageFlags.Ephemeral});}
 }
 
-async function logTo(guild,key,text){
-  const section=AGG_LOGS[key];
-  if(!guild || !section || !String(text||'').trim()) return;
-  const content=String(text).slice(0,1900);
-  const {error}=await supabase.from('log_queue').insert({guild_id:guild.id,section,content});
-  if(error) console.error('log queue error:',error.message);
-}
-
-function formatLogSection(section, rows, total){
-  const shown=rows.slice(-8);
-  const lines=shown.map(r=>{
-    const stamp=r.created_at ? new Date(r.created_at).toLocaleString('en-GB',{timeZone:'Asia/Dubai',hour12:false}) : '';
-    return `• ${stamp} — ${String(r.content||'').replace(/\n/g,'\n  ')}`;
-  });
-  let value=`**تعداد کل: ${total}**`;
-  if(shown.length) value+=`\n${lines.join('\n')}`;
-  else value+='\n—';
-  if(value.length>1000) value=value.slice(0,997)+'...';
-  return value;
-}
-
-async function fetchAllLogRows(guildId){
-  const all=[];
-  const pageSize=1000;
-  for(let from=0;;from+=pageSize){
-    const {data,error}=await supabase.from('log_queue')
-      .select('id,section,content,created_at')
-      .eq('guild_id',guildId)
-      .order('created_at',{ascending:true})
-      .range(from,from+pageSize-1);
-    if(error) return {rows:null,error};
-    if(data?.length) all.push(...data);
-    if(!data || data.length<pageSize) break;
+async function handleEmbedCommand(i){
+  if(!owner(i.user.id)) return safeReply(i,{embeds:[err('فقط Owner اجازه استفاده از /embed را دارد.')],flags:MessageFlags.Ephemeral});
+  await deferEphemeral(i);
+  const title=stripMentions(i.options.getString('title')||'').slice(0,256);
+  const text=stripMentions(i.options.getString('text')||'').slice(0,4000);
+  const raw=i.options.getString('buttons')||'';
+  const pairs=raw.split('||').map(x=>x.trim()).filter(Boolean);
+  if(pairs.length<1||pairs.length>25)return safeReply(i,{embeds:[err('تعداد دکمه‌ها باید بین 1 تا 25 باشد. برای 10+ دکمه هم پشتیبانی می‌شود.')],flags:MessageFlags.Ephemeral});
+  const buttons=[];
+  for(const pair of pairs){
+    const idx=pair.indexOf('=');
+    if(idx<1)return safeReply(i,{embeds:[err('فرمت دکمه‌ها اشتباه است. نمونه: دکمه اول=متن مخفی || دکمه دوم=متن مخفی')],flags:MessageFlags.Ephemeral});
+    const label=pair.slice(0,idx).trim().slice(0,80); const response=stripMentions(pair.slice(idx+1).trim()).slice(0,2000);
+    if(!label||!response)return safeReply(i,{embeds:[err('نام و متن مخفی هر دکمه نباید خالی باشد.')],flags:MessageFlags.Ephemeral});
+    buttons.push({label,response});
   }
-  return {rows:all,error:null};
-}
-
-async function fetchTicketPerformance(guildId){
-  const {data:tickets,error:ticketError}=await supabase.from('tickets')
-    .select('id,claimed_by,opener_id,status').eq('guild_id',guildId);
-  if(ticketError) return {error:ticketError};
-  const staff=new Map();
-  const makeRow=()=>({claims:0,ratings:0,stars:0,counts:{1:0,2:0,3:0,4:0,5:0}});
-  let totalTickets=0, claimedTickets=0, unclaimedTickets=0;
-
-  const claimHistoryResult=await supabase.from('ticket_claim_history')
-    .select('ticket_id,user_id,action').eq('guild_id',guildId);
-  const claimHistory=claimHistoryResult.error ? [] : (claimHistoryResult.data||[]);
-  const historyTicketIds=new Set();
-  for(const h of claimHistory){
-    if(!h.user_id) continue;
-    const id=String(h.user_id);
-    const row=staff.get(id)||makeRow();
-    // Both a normal claim and an explicit claim-change represent a claim
-    // assignment, so both are counted once in the staff activity total.
-    row.claims++;
-    staff.set(id,row);
-    if(h.ticket_id) historyTicketIds.add(String(h.ticket_id));
-  }
-
-  for(const t of tickets||[]){
-    totalTickets++;
-    if(t.claimed_by) {
-      claimedTickets++;
-      // Legacy tickets created/claimed before claim history existed.
-      if(!historyTicketIds.has(String(t.id))){
-        const id=String(t.claimed_by);
-        const row=staff.get(id)||makeRow();
-        row.claims++;
-        staff.set(id,row);
-      }
-    } else unclaimedTickets++;
-  }
-
-  const ticketIds=(tickets||[]).map(t=>t.id).filter(Boolean);
-  const feedback=[];
-  for(let i=0;i<ticketIds.length;i+=100){
-    const ids=ticketIds.slice(i,i+100);
-    if(!ids.length) continue;
-    const {data,error}=await supabase.from('ticket_feedback')
-      .select('ticket_id,user_id,claimed_by,stars,text').in('ticket_id',ids);
-    if(error) return {error};
-    if(data?.length) feedback.push(...data);
-  }
-  const ticketMap=new Map((tickets||[]).map(t=>[String(t.id),t]));
-  for(const f of feedback){
-    const t=ticketMap.get(String(f.ticket_id));
-    const claimer=f.claimed_by || t?.claimed_by;
-    if(!claimer) continue;
-    const id=String(claimer);
-    const row=staff.get(id)||makeRow();
-    const stars=Number(f.stars);
-    if(!Number.isInteger(stars) || stars<1 || stars>5) continue;
-    row.ratings++; row.stars+=stars; row.counts[stars]=(row.counts[stars]||0)+1;
-    staff.set(id,row);
-  }
-  return {tickets:totalTickets,claimedTickets,unclaimedTickets,staff,feedbackCount:feedback.length,error:null};
-}
-
-async function buildTicketPerformanceFields(guildId){
-  const perf=await fetchTicketPerformance(guildId);
-  if(perf.error){
-    console.error('ticket performance error:',perf.error.message||perf.error);
-    return [{name:'👤 Ticket Staff Performance',value:'❌ آمار Claim/Rating خوانده نشد.\n'+String(perf.error.message||perf.error).slice(0,900)}];
-  }
-  const fields=[];
-  fields.push({name:'🎫 Ticket Summary',value:`**کل Ticket:** ${perf.tickets}\n**Claim شده:** ${perf.claimedTickets}\n**بدون Claim:** ${perf.unclaimedTickets}\n**Rating ثبت‌شده:** ${perf.feedbackCount}`});
-  const entries=[...perf.staff.entries()].sort((a,b)=>{
-    if(b[1].claims!==a[1].claims) return b[1].claims-a[1].claims;
-    return (b[1].ratings?b[1].stars/b[1].ratings:0)-(a[1].ratings?a[1].stars/a[1].ratings:0);
-  });
-  if(!entries.length){ fields.push({name:'👤 Ticket Staff Performance',value:'هنوز هیچ Ticket توسط Staff Claim نشده است.'}); return fields; }
-  for(const [id,row] of entries){
-    const avg=row.ratings ? (row.stars/row.ratings).toFixed(2) : '—';
-    const dist=`1⭐:${row.counts[1]||0} 2⭐:${row.counts[2]||0} 3⭐:${row.counts[3]||0} 4⭐:${row.counts[4]||0} 5⭐:${row.counts[5]||0}`;
-    fields.push({name:`👤 <@${id}>`,value:`**Claims:** ${row.claims}\n**Ratings:** ${row.ratings}\n**Average:** ${avg}/5 ⭐\n${dist}`.slice(0,1000)});
-    if(fields.length>=24) break;
-  }
-  return fields;
-}
-
-async function flushGuildLogs(guild,force=false){
-  if(!guild || logFlushRunning) return {sent:false,reason:'busy'};
-  const settings=await getSettings(guild.id);
-  const channelId=settings.aggregated_log_channel;
-  if(!channelId) return {sent:false,reason:'not-configured'};
-  const channel=guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(()=>null);
-  if(!channel?.isTextBased()) return {sent:false,reason:'invalid-channel'};
-  const {rows,error}=await fetchAllLogRows(guild.id);
-  if(error){ console.error('log queue read error:',error.message); return {sent:false,reason:'database',error:error.message}; }
-  if(!rows?.length && !force){
-    await setSettings(guild.id,{next_log_flush_at:new Date(Date.now()+LOG_FLUSH_INTERVAL_MS).toISOString()});
-    return {sent:false,reason:'empty'};
-  }
-
-  logFlushRunning=true;
+  const message=await i.channel.send({embeds:[new EmbedBuilder().setTitle(title).setDescription(text)]});
+  const rows=[];
+  for(let n=0;n<buttons.length;n++){let row=rows[rows.length-1];if(!row||row.components.length>=5){row=new ActionRowBuilder();rows.push(row);}row.addComponents(new ButtonBuilder().setCustomId(`emb:${message.id}:${n}`).setLabel(buttons[n].label).setStyle(ButtonStyle.Secondary));}
   try{
-    const grouped=new Map();
-    for(const section of AGG_LOG_ORDER) grouped.set(section,[]);
-    for(const row of rows||[]){ if(!grouped.has(row.section)) grouped.set(row.section,[]); grouped.get(row.section).push(row); }
-    // Discord limits each embed to 6000 total characters and 25 fields.
-    // Build pages by both limits so large historical logs never fail with
-    // MAX_EMBED_SIZE_EXCEEDED.
-    const embeds=[];
-    const makeEmbed=(continued=false)=>new EmbedBuilder()
-      .setTitle(continued?'📋 Tehran Club Logs (ادامه)':'📋 Tehran Club Logs')
-      .setDescription(continued?'گزارش ادامه دارد.':`گزارش تجمعی لاگ‌ها • ${new Date().toLocaleString('en-GB',{timeZone:'Asia/Dubai',hour12:false})} (Dubai)\n⚠️ لاگ‌ها دائمی هستند و با ارسال گزارش حذف یا Reset نمی‌شوند.`)
-      .setTimestamp();
-    let embed=makeEmbed(false);
-    let fields=0;
-    let chars=embed.data.title.length + (embed.data.description?.length||0);
-    const pushField=(field)=>{
-      const name=String(field.name||'').slice(0,256);
-      const value=String(field.value||'').slice(0,1024);
-      const fieldChars=name.length+value.length;
-      if(fields>=25 || chars+fieldChars+1>5900){
-        embeds.push(embed);
-        embed=makeEmbed(true); fields=0;
-        chars=(embed.data.title?.length||0)+(embed.data.description?.length||0);
+    await message.edit({components:rows});
+    const insert=db.prepare('INSERT INTO embed_buttons(message_id,button_index,label,response) VALUES(?,?,?,?)');
+    const tx=db.transaction(()=>{db.prepare('DELETE FROM embed_buttons WHERE message_id=?').run(message.id);for(let n=0;n<buttons.length;n++)insert.run(message.id,n,buttons[n].label,buttons[n].response);}); tx();
+  }catch(error){await message.delete().catch(()=>{});throw error;}
+  return safeReply(i,{embeds:[ok(`Embed ساخته شد با **${buttons.length}** دکمه.
+متن مخفی هر دکمه با کلیک به‌صورت خصوصی نمایش داده می‌شود.`)],flags:MessageFlags.Ephemeral});
+}
+
+async function handleSlash(i){
+  const n=i.commandName,s=i.options.getSubcommand(false);
+  if(n==='setticketlog')return handleSetTicketLog(i);
+  if(n==='embed')return handleEmbedCommand(i);
+  if(n==='rerole'){
+    if(!owner(i.user.id))return safeReply(i,{embeds:[err('فقط Owner اجازه استفاده از /rerole را دارد.')],flags:MessageFlags.Ephemeral});
+    await deferEphemeral(i);
+    const g=db.prepare('SELECT * FROM giveaways WHERE guild_id=? AND channel_id=? AND ended=1 ORDER BY id DESC LIMIT 1').get(i.guild.id,i.channel.id);
+    if(!g)return safeReply(i,{embeds:[err('Giveaway تمام‌شده‌ای در این Channel پیدا نشد.')],flags:MessageFlags.Ephemeral});
+    const r=await giveaways.reroll(i.guild,g);
+    if(r.error==='GIVEAWAY_NOT_ENOUGH_PARTICIPANTS')return safeReply(i,{embeds:[err('برای Reroll حداقل دو شرکت‌کننده لازم است.')],flags:MessageFlags.Ephemeral});
+    if(r.error)return safeReply(i,{embeds:[err('Reroll ناموفق بود.')],flags:MessageFlags.Ephemeral});
+    return safeReply(i,{embeds:[ok(`Giveaway #${g.id} دوباره قرعه‌کشی شد. برنده جدید: <@${r.winner}>`)],flags:MessageFlags.Ephemeral});
+  }
+  if(n==='banch'){
+    if(!hasStrictRole(i.member,banchAccessRoleId))return safeReply(i,{embeds:[err('برای /banch دسترسی لازم را نداری.')],flags:MessageFlags.Ephemeral});
+    await deferEphemeral(i);
+    const target=await getMember(i.guild,i.options.getUser('user')); if(!target)return safeReply(i,{embeds:[err('Member پیدا نشد.')],flags:MessageFlags.Ephemeral});
+    const role=await i.guild.roles.fetch(banchRoleId).catch(()=>null); const me=i.guild.members.me;
+    if(!role||role.managed||!me||role.position>=me.roles.highest.position)return safeReply(i,{embeds:[err('Role مخصوص Banch پیدا نشد یا توسط Bot قابل مدیریت نیست.')],flags:MessageFlags.Ephemeral});
+    if(target.roles.highest.position>=me.roles.highest.position)return safeReply(i,{embeds:[err('Role کاربر بالاتر یا هم‌سطح Role بات است.')],flags:MessageFlags.Ephemeral});
+    if(target.roles.cache.has(role.id))return safeReply(i,{embeds:[info(`<@${target.id}> این Role را از قبل دارد.`)],flags:MessageFlags.Ephemeral});
+    await target.roles.add(role,`Banch by ${i.user.tag}`); await sendLog(i.guild,'moderation',{action:'banch',target:target.user.tag,role:role.id,by:i.user.tag});
+    return safeReply(i,{embeds:[ok(`Role <@&${role.id}> به <@${target.id}> داده شد.`)],flags:MessageFlags.Ephemeral});
+  }
+  if(n==='xp')return handleXp(i,s);if(n==='logs')return handleLogs(i,s);if(n==='invite')return handleInvite(i,s);if(n==='staff')return handleStaff(i,s);if(n==='ticket')return handleTicket(i,s);if(n==='giveaway')return handleGiveaway(i,s);if(n==='drop')return handleDrop(i,s);if(n==='music')return handleMusic(i,s);
+  if(n==='exchange'){
+    await deferEphemeral(i);
+    const ex=getSettings(i.guild.id).exchange||{};if(!ex.channelId||!ex.accessRoleId)return safeReply(i,{embeds:[err('Exchange Channel و Exchange Access Role را ابتدا تنظیم کن.')],flags:MessageFlags.Ephemeral});const ch=await i.guild.channels.fetch(ex.channelId).catch(()=>null);if(!textChannel(ch))return safeReply(i,{embeds:[err('Exchange Channel معتبر نیست.')],flags:MessageFlags.Ephemeral});const text=stripMentions(i.options.getString('text')).slice(0,4000);const reqId=db.prepare('INSERT INTO exchange_requests(guild_id,channel_id,requester_id,text,status) VALUES(?,?,?,?,"pending")').run(i.guild.id,ch.id,i.user.id,text).lastInsertRowid;let msg;try{msg=await ch.send({embeds:[new EmbedBuilder().setColor(0x1ABC9C).setTitle('💱 Exchange Request').setDescription(text).addFields({name:'درخواست‌دهنده',value:`<@${i.user.id}>`,inline:true},{name:'Request ID',value:String(reqId),inline:true})],components:[new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`exchange:accept:${reqId}`).setLabel('Accept').setEmoji('✅').setStyle(ButtonStyle.Success),new ButtonBuilder().setCustomId(`exchange:reject:${reqId}`).setLabel('Reject').setEmoji('❌').setStyle(ButtonStyle.Danger))],allowedMentions:{users:[i.user.id]}});const updated=db.prepare('UPDATE exchange_requests SET message_id=? WHERE id=? AND status="pending"').run(msg.id,reqId);if(!updated.changes){await msg.delete().catch(()=>{});throw new Error('EXCHANGE_REQUEST_DB_FAILED');}}catch(e){db.prepare('DELETE FROM exchange_requests WHERE id=?').run(reqId);throw e;}await sendLog(i.guild,'exchange',{action:'created',request:reqId,requester:i.user.tag});return safeReply(i,{embeds:[ok(`درخواست Exchange ساخته شد. ID: ${reqId}`)],flags:MessageFlags.Ephemeral});
+  }
+  if(n==='setex'){if(!await needAdmin(i))return;await deferEphemeral(i);const channel=i.options.getChannel('channel'),me=i.guild.members.me;if(!textChannel(channel)||!me||!channel.permissionsFor(me).has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))return safeReply(i,{embeds:[err('Exchange Output Channel معتبر نیست یا Bot دسترسی ارسال ندارد.')],flags:MessageFlags.Ephemeral});await setSettings(i.guild.id,{exchange:{approvedChannelId:channel.id}});return safeReply(i,{embeds:[ok(`Exchangeهای تأییدشده → <#${channel.id}>`)],flags:MessageFlags.Ephemeral});}
+  if(n==='exchange-config'){if(!await needAdmin(i))return;await deferEphemeral(i);const role=i.options.getRole('role'),channel=i.options.getChannel('channel'),me=i.guild.members.me;if(!textChannel(channel)||role.managed||!me||!channel.permissionsFor(me).has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))return safeReply(i,{embeds:[err('Channel یا Exchange Role نامعتبر است یا Bot دسترسی ارسال ندارد.')],flags:MessageFlags.Ephemeral});await setSettings(i.guild.id,{exchange:{channelId:channel.id,accessRoleId:role.id}});await sendLog(i.guild,'exchange',{action:'config',channel:channel.id,role:role.id,by:i.user.tag});return safeReply(i,{embeds:[ok(`Exchange Channel: <#${channel.id}>\nExchange Access Role: <@&${role.id}>`)],flags:MessageFlags.Ephemeral});}
+  if(n==='exchange-manage')return exchangeManage(i,i.options.getString('action'),i.options.getInteger('request'));
+  if(n==='addemote'){
+    if(!await need(i,'emote'))return;await deferEphemeral(i);const perm=botPermissionMessage(i.guild,PermissionFlagsBits.ManageGuildExpressions,'Manage Expressions');if(perm)return safeReply(i,{embeds:[err(perm)],flags:MessageFlags.Ephemeral});const raw=i.options.getString('emoji').trim();const match=raw.match(/^<a?:([\w~]+):(\d{17,20})>$/);const animated=!!match&&raw.startsWith('<a:');const limit=animated?(i.guild.maximumEmojis?.animated||0):(i.guild.maximumEmojis?.static||0);const count=i.guild.emojis.cache.filter(e=>!!e.animated===animated).size;if(limit&&count>=limit)return safeReply(i,{embeds:[err(`ظرفیت ${animated?'Animated':'Static'} Emojiهای سرور پر است.`)],flags:MessageFlags.Ephemeral});const name=(i.options.getString('name')||match?.[1]||'emoji').replace(/[^a-zA-Z0-9_]/g,'').slice(0,32);if(!name)return safeReply(i,{embeds:[err('نام Emoji نامعتبر است.')],flags:MessageFlags.Ephemeral});const url=match?`https://cdn.discordapp.com/emojis/${match[2]}.${animated?'gif':'png'}?size=4096`:raw;if(!/^https?:\/\//i.test(url))return safeReply(i,{embeds:[err('Emoji باید URL یا Custom Emoji معتبر باشد.')],flags:MessageFlags.Ephemeral});try{const created=await i.guild.emojis.create({attachment:url,name});await sendLog(i.guild,'emote',{action:'created',name:created.name,id:created.id,by:i.user.tag});return safeReply(i,{embeds:[ok(`Emoji اضافه شد: ${created}`)],flags:MessageFlags.Ephemeral});}catch(e){return safeReply(i,{embeds:[err(`افزودن Emoji ناموفق بود: ${clamp(e.message,1000)}`)],flags:MessageFlags.Ephemeral});}
+  }
+  if(n==='guess'){
+    if(!await need(i,'guess'))return;await deferEphemeral(i);const gid=i.guild.id;
+    if(s==='start'){const r=await guess.start(gid,i.channel.id,i.user.id,i.options.getInteger('min'),i.options.getInteger('max'));if(r.error)return safeReply(i,{embeds:[err(r.error)],flags:MessageFlags.Ephemeral});let dmSent=true;try{const u=await client.users.fetch(r.starter_id);await u.send({embeds:[new EmbedBuilder().setColor(0xF39C12).setTitle('🔐 Guess Number Secret').setDescription(`عدد مخفی بازی Channel <#${r.channel_id}> انتخاب شد.
+بازه: **${r.min} تا ${r.max}**`) .addFields({name:'عدد مخفی',value:`**${r.number}**`})]});}catch{dmSent=false;}await sendLog(i.guild,'guess',{action:'start',by:i.user.tag,channel:i.channel.id,min:r.min,max:r.max,secret_dm:dmSent});return safeReply(i,{embeds:[ok(`بازی شروع شد: **${r.min} تا ${r.max}**${dmSent?'':'\n⚠️ ارسال DM عدد مخفی ممکن نشد.'}`)],flags:MessageFlags.Ephemeral});}
+    if(s==='stop'){if(!guess.stop(gid,i.channel.id))return safeReply(i,{embeds:[err('بازی فعالی در این Channel نیست.')],flags:MessageFlags.Ephemeral});await sendLog(i.guild,'guess',{action:'stop',by:i.user.tag,channel:i.channel.id});return safeReply(i,{embeds:[ok('بازی متوقف شد.')],flags:MessageFlags.Ephemeral});}
+    const r=guess.get(gid,i.channel.id);return safeReply(i,{embeds:[info(r?`بازی فعال: **${r.min} تا ${r.max}**`: 'بازی فعالی نیست.')],flags:MessageFlags.Ephemeral});
+  }
+  if(n==='mod'){
+    if(['warn','unwarn','untimeout','unban'].includes(s)&&!owner(i.user.id))return safeReply(i,{embeds:[err('این دستور فقط برای Owner است.')],flags:MessageFlags.Ephemeral});
+    if(!await need(i,'moderation'))return;await deferEphemeral(i);const reason=stripMentions(i.options.getString('reason')||'بدون دلیل');
+    try{
+      if(s==='unban'){const id=i.options.getString('user');if(!/^\d{17,20}$/.test(id))return safeReply(i,{embeds:[err('User ID نامعتبر است.')],flags:MessageFlags.Ephemeral});const perm=botPermissionMessage(i.guild,PermissionFlagsBits.BanMembers,'Ban Members');if(perm)return safeReply(i,{embeds:[err(perm)],flags:MessageFlags.Ephemeral});await i.guild.members.unban(id,reason);await sendLog(i.guild,'moderation',{action:'unban',user:id,by:i.user.tag,reason});return safeReply(i,{embeds:[ok('Unban انجام شد.')],flags:MessageFlags.Ephemeral});}
+      const u=await getMember(i.guild,i.options.getUser('user'));if(!u)return safeReply(i,{embeds:[err('Member پیدا نشد.')],flags:MessageFlags.Ephemeral});const hm=hierarchyMessage(i,u);if(hm&&!owner(i.user.id))return safeReply(i,{embeds:[err(hm)],flags:MessageFlags.Ephemeral});
+      if(s==='ban'){const p=botPermissionMessage(i.guild,PermissionFlagsBits.BanMembers,'Ban Members');if(p)return safeReply(i,{embeds:[err(p)],flags:MessageFlags.Ephemeral});await u.ban({reason});}
+      if(s==='kick'){const p=botPermissionMessage(i.guild,PermissionFlagsBits.KickMembers,'Kick Members');if(p)return safeReply(i,{embeds:[err(p)],flags:MessageFlags.Ephemeral});await u.kick(reason);}
+      if(s==='timeout'){const p=botPermissionMessage(i.guild,PermissionFlagsBits.ModerateMembers,'Moderate Members');if(p)return safeReply(i,{embeds:[err(p)],flags:MessageFlags.Ephemeral});await u.timeout(i.options.getInteger('minutes')*60000,reason);}
+      if(s==='untimeout'){const p=botPermissionMessage(i.guild,PermissionFlagsBits.ModerateMembers,'Moderate Members');if(p)return safeReply(i,{embeds:[err(p)],flags:MessageFlags.Ephemeral});await u.timeout(null,reason);}
+      if(s==='warn'){
+        db.prepare('INSERT INTO warnings(guild_id,user_id,moderator_id,reason,created_at) VALUES(?,?,?,?,?)').run(i.guild.id,u.id,i.user.id,reason,Date.now());
+        const count=db.prepare('SELECT COUNT(*) AS c FROM warnings WHERE guild_id=? AND user_id=?').get(i.guild.id,u.id).c;
+        if(count>=3){
+          const p=botPermissionMessage(i.guild,PermissionFlagsBits.ModerateMembers,'Moderate Members');
+          if(p)return safeReply(i,{embeds:[err(`Warning سوم ثبت شد، اما Timeout نشد: ${p}`)],flags:MessageFlags.Ephemeral});
+          await u.timeout(120*60000,'۳ Warning — Timeout خودکار ۲ ساعته');
+          let resetOk=true;
+          try { db.prepare('DELETE FROM warnings WHERE guild_id=? AND user_id=?').run(i.guild.id,u.id); } catch(error) { resetOk=false; await sendLog(i.guild,'warning',{action:'auto_timeout_warning_reset_failed',target:u.user.tag,by:i.user.tag,error:error.message}).catch(()=>{}); }
+          await sendLog(i.guild,'warning',{action:'auto_timeout_3_warnings',target:u.user.tag,by:i.user.tag,reason,timeout_minutes:120,warning_reset:resetOk});
+          return safeReply(i,{embeds:[resetOk?ok('Warning سوم ثبت شد؛ کاربر به‌صورت خودکار ۲ ساعت Timeout شد و Warningها به صفر برگشت.'):warn('کاربر ۲ ساعت Timeout شد، اما Reset Warningها در دیتابیس ناموفق بود و در Log ثبت شد.')],flags:MessageFlags.Ephemeral});
+        }
+        await sendLog(i.guild,'warning',{action:'warn',target:u.user.tag,by:i.user.tag,reason,count});return safeReply(i,{embeds:[ok(`Warning ثبت شد. تعداد فعلی: **${count}/3**`)],flags:MessageFlags.Ephemeral});
       }
-      embed.addFields({name,value}); fields++; chars+=fieldChars+1;
+      if(s==='unwarn'){const r=db.prepare('DELETE FROM warnings WHERE id=(SELECT id FROM warnings WHERE guild_id=? AND user_id=? ORDER BY id DESC LIMIT 1)').run(i.guild.id,u.id);if(!r.changes)return safeReply(i,{embeds:[err('Warningی برای این کاربر وجود ندارد.')],flags:MessageFlags.Ephemeral});await sendLog(i.guild,'warning',{action:'unwarn',target:u.user.tag,by:i.user.tag});return safeReply(i,{embeds:[ok('آخرین Warning حذف شد.')],flags:MessageFlags.Ephemeral});}
+      if(s==='warnings'){const rows=db.prepare('SELECT * FROM warnings WHERE guild_id=? AND user_id=? ORDER BY id DESC LIMIT 20').all(i.guild.id,u.id);return safeReply(i,{embeds:[info(rows.length?rows.map((r,n)=>`${n+1}. <@${r.moderator_id}> — <t:${Math.floor(r.created_at/1000)}:R> — ${clamp(r.reason,200)}`).join('\n'):'هشداری ثبت نشده.')],flags:MessageFlags.Ephemeral});}
+      await sendLog(i.guild,'moderation',{action:s,target:u.user.tag,by:i.user.tag,reason});return safeReply(i,{embeds:[ok('عملیات انجام شد.')],flags:MessageFlags.Ephemeral});
+    }catch(e){await sendLog(i.guild,'moderation',{action:'error',error:e.message,by:i.user.tag}).catch(()=>{});return safeReply(i,{embeds:[err(`عملیات ناموفق بود: ${clamp(e.message,1000)}`)],flags:MessageFlags.Ephemeral});}
+  }
+  if(n==='welcome'){
+    if(!await need(i,'staff'))return;const cfg={...(getSettings(i.guild.id).welcome||{})};if(s==='set'){const ch=i.options.getChannel('channel');const me=i.guild.members.me;if(!textChannel(ch))return safeReply(i,{embeds:[err('Channel معتبر نیست.')],flags:MessageFlags.Ephemeral});if(!me||!ch.permissionsFor(me).has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))return safeReply(i,{embeds:[err('Bot در این Channel دسترسی ارسال/Embed ندارد.')],flags:MessageFlags.Ephemeral});cfg.channelId=ch.id;cfg.text=stripMentions(i.options.getString('text')).slice(0,4000);await setSettings(i.guild.id,{welcome:cfg});return safeReply(i,{embeds:[ok(`Welcome → <#${ch.id}>`)],flags:MessageFlags.Ephemeral});}await setSettings(i.guild.id,{welcome:{}});return safeReply(i,{embeds:[ok('Welcome خاموش شد.')],flags:MessageFlags.Ephemeral});
+  }
+  if(n==='customcmd'){
+    if(!await need(i,'staff'))return;const name=i.options.getString('name').toLowerCase().trim().slice(0,32);if(!/^[a-z0-9_-]+$/.test(name))return safeReply(i,{embeds:[err('نام Custom Command باید فقط شامل a-z، 0-9، _ یا - باشد.')],flags:MessageFlags.Ephemeral});if(s==='set')db.prepare('INSERT INTO custom_commands(guild_id,name,response) VALUES(?,?,?) ON CONFLICT(guild_id,name) DO UPDATE SET response=excluded.response').run(i.guild.id,name,stripMentions(i.options.getString('response')));else db.prepare('DELETE FROM custom_commands WHERE guild_id=? AND name=?').run(i.guild.id,name);return safeReply(i,{embeds:[ok('Custom Command به‌روزرسانی شد.')],flags:MessageFlags.Ephemeral});
+  }
+  if(n==='setaccessrole'){
+    if(!await needAdmin(i))return;const role=i.options.getRole('role'),key=i.options.getString('type'),me=i.guild.members.me;if(!role||role.managed||role.id===i.guild.id)return safeReply(i,{embeds:[err('Role نامعتبر است.')],flags:MessageFlags.Ephemeral});const a={...(getSettings(i.guild.id).accessRoles||{})};a[key]=role.id;await setSettings(i.guild.id,{accessRoles:a});return safeReply(i,{embeds:[ok(`Access Role برای **${key}** → <@&${role.id}>`)],flags:MessageFlags.Ephemeral});
+  }
+  if(n==='ai'){
+    if(!await need(i,'staff'))return;if(s==='setchannel'){const ch=i.options.getChannel('channel');const me=i.guild.members.me;if(!textChannel(ch))return safeReply(i,{embeds:[err('Channel معتبر نیست.')],flags:MessageFlags.Ephemeral});if(!me||!ch.permissionsFor(me).has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages]))return safeReply(i,{embeds:[err('Bot در این Channel دسترسی ارسال ندارد.')],flags:MessageFlags.Ephemeral});await setSettings(i.guild.id,{ai:{channelId:ch.id}});return safeReply(i,{embeds:[ok(`AI Channel → <#${ch.id}>`)],flags:MessageFlags.Ephemeral});}if(s==='disable'){await setSettings(i.guild.id,{ai:{}});return safeReply(i,{embeds:[ok('AI خاموش شد.')],flags:MessageFlags.Ephemeral});}ai.clear(i.guild.id);return safeReply(i,{embeds:[ok('حافظه AI پاک شد.')],flags:MessageFlags.Ephemeral});
+  }
+  if(n==='level'){const r=getXp(i.guild.id,i.user.id);return safeReply(i,{embeds:[info(`<@${i.user.id}>\nXP: **${r.xp}**\nLevel: **${r.level}**\nMessages: **${r.messages}**`)],flags:MessageFlags.Ephemeral});}
+  if(n==='leaderboard'){const rows=db.prepare('SELECT * FROM xp_users WHERE guild_id=? ORDER BY xp DESC,level DESC LIMIT 20').all(i.guild.id);return safeReply(i,{embeds:[info(rows.length?rows.map((r,n)=>`${n+1}. <@${r.user_id}> — XP **${r.xp}** | L${r.level}`).join('\n'):'داده‌ای نیست.')],flags:MessageFlags.Ephemeral});}
+  if(n==='banner'){const url=i.guild.bannerURL({size:2048});return safeReply(i,{embeds:[url?new EmbedBuilder().setColor(0x5865F2).setTitle(i.guild.name).setImage(url):info('این سرور Banner ندارد.') ]});}
+  if(n==='health'){
+    const s=getSettings(i.guild.id),me=i.guild.members.me, checks=[];
+    const inviteReady=!!me?.permissions.has(PermissionFlagsBits.ManageGuild);const dbIntegrity=integrityCheck();
+    const auditReady=!!me?.permissions.has(PermissionFlagsBits.ViewAuditLog);
+    const voiceReady=!!me?.permissions.has(PermissionFlagsBits.Connect)&&!!me?.permissions.has(PermissionFlagsBits.Speak);
+    checks.push(`DB: ${dbIntegrity==='ok'?'✅':'❌ '+dbIntegrity}`);checks.push(`Bot Manage Roles: ${me?.permissions.has(PermissionFlagsBits.ManageRoles)?'✅':'❌'}`);checks.push(`Bot Manage Channels: ${me?.permissions.has(PermissionFlagsBits.ManageChannels)?'✅':'❌'}`);checks.push(`Audit Log: ${auditReady?'✅':'❌'}`);checks.push(`Invite Tracking: ${inviteReady?'✅':'❌ Manage Guild'}`);checks.push(`Voice: ${voiceReady?'✅':'❌ Connect/Speak'}`);checks.push(`OpenAI Key: ${process.env.OPENAI_API_KEY?'✅':'❌'}`);checks.push(`AI Channel: ${s.ai?.channelId?`<#${s.ai.channelId}>`:'—'}`);checks.push(`Ticket Support: ${s.ticket?.supportRoleId?`<@&${s.ticket.supportRoleId}>`:'—'}`);checks.push(`Exchange: ${s.exchange?.accessRoleId?`<@&${s.exchange.accessRoleId}>`:'—'}`);return safeReply(i,{embeds:[info(checks.join('\n'))],flags:MessageFlags.Ephemeral});
+  }
+}
+
+async function onInteraction(i){
+  try{
+    if(i.isChatInputCommand())return await handleSlash(i);
+    if(i.isModalSubmit()) {
+      const [kind,a]=i.customId.split(':');
+      if(kind==='ticket_close_modal'){
+        await deferEphemeral(i);
+        const ticket=tickets.getById(Number(a));
+        if(!ticket||ticket.guild_id!==i.guild?.id||ticket.channel_id!==i.channel?.id)return safeReply(i,{embeds:[err('Ticket معتبر نیست.')],flags:MessageFlags.Ephemeral});
+        const reason=stripMentions(i.fields.getTextInputValue('reason')||'بدون دلیل');
+        return safeReply(i,{embeds:[await tickets.close(i.guild,ticket.id,i.member,reason)?ok('Ticket بسته شد.'):err('بستن Ticket ناموفق بود.')],flags:MessageFlags.Ephemeral});
+      }
+    }
+    if(!i.isButton())return;
+    const [kind,a,b,c]=i.customId.split(':');
+    if(kind==='ticket_open'){
+      await deferEphemeral(i);const r=await tickets.create(i.guild,i,a);if(!r)return safeReply(i,{embeds:[err('Ticket Type یا تنظیمات Ticket معتبر نیست.')],flags:MessageFlags.Ephemeral});if(r.error)return safeReply(i,{embeds:[err(r.error)],flags:MessageFlags.Ephemeral});return safeReply(i,{embeds:[ok(`Ticket آماده شد: <#${r.channel.id}>`)],flags:MessageFlags.Ephemeral});
+    }
+    if(kind==='ticket_feedback'){const ticketId=Number(a),rating=Number(b);const ticket=tickets.getById(ticketId);if(!ticket||ticket.opener_id!==i.user.id)return i.update({content:'این Feedback برای شما معتبر نیست.',components:[]});const feedbackGuild=client.guilds.cache.get(ticket.guild_id)||await client.guilds.fetch(ticket.guild_id).catch(()=>null);const r=await tickets.recordFeedback(feedbackGuild,ticketId,i.user.id,rating);return i.update({content:r.ok?`⭐ امتیاز ${rating}/5 ثبت شد، ممنون ❤️`:`❌ ${r.message||'ثبت امتیاز ناموفق بود.'}`,components:[]});}
+    if(kind==='ticket_claim'||kind==='ticket_close'||kind==='ticket_reopen'){
+      const ticket=tickets.getById(Number(a));
+      if(!ticket||ticket.guild_id!==i.guild.id||ticket.channel_id!==i.channel.id)return safeReply(i,{embeds:[err('Ticket معتبر نیست.')],flags:MessageFlags.Ephemeral});
+      if(kind==='ticket_close'){
+        const modal=new ModalBuilder().setCustomId(`ticket_close_modal:${ticket.id}`).setTitle('بستن Ticket');
+        const input=new TextInputBuilder().setCustomId('reason').setLabel('دلیل بسته شدن').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1000).setPlaceholder('دلیل را وارد کنید...');
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        return i.showModal(modal);
+      }
+      await deferEphemeral(i);
+      if(kind==='ticket_claim')return safeReply(i,{embeds:[await tickets.claim(i.guild,ticket.id,i.user.id,i.member)?ok('Ticket Claim شد.'):err('فقط Ticket Support Role می‌تواند Claim کند یا Ticket قبلاً Claim شده.')],flags:MessageFlags.Ephemeral});
+      return safeReply(i,{embeds:[await tickets.reopen(i.guild,ticket.id,i.member)?ok('Ticket دوباره باز شد.'):err('Reopen ناموفق بود.')],flags:MessageFlags.Ephemeral});
+    }
+    if(kind==='invpage'){
+      const mode=a, inviterId=b==='all'?null:b, page=Number(c||0);
+      if(!['invited','alljoins','join','fake','left','active','left_members','fake_members'].includes(mode))return safeReply(i,{embeds:[err('Invite page نامعتبر است.')],flags:MessageFlags.Ephemeral});
+      const data=invitePageData(i.guild.id,mode,inviterId,page);
+      return i.update({embeds:[data.embed],components:[data.row]});
+    }
+    if(kind==='gw_join'||kind==='gw_list'||kind==='gw_prev'||kind==='gw_next'){
+      await deferEphemeral(i);const id=Number(a);const g=db.prepare('SELECT * FROM giveaways WHERE id=?').get(id);if(!g||g.guild_id!==i.guild.id||g.channel_id!==i.channel.id)return safeReply(i,{embeds:[err('Giveaway معتبر نیست.')],flags:MessageFlags.Ephemeral});
+      if(kind==='gw_join')return safeReply(i,{embeds:[giveaways.join(id,i.user.id)?ok('در Giveaway با موفقیت Join شدی.'):err('این Giveaway تمام شده، Join تکراری است یا دیگر فعال نیست.')],flags:MessageFlags.Ephemeral});
+      const requestedPage=kind==='gw_prev'?Math.max(0,Number(b||0)-1):kind==='gw_next'?Number(b||0)+1:0;const data=giveaways.page(id,requestedPage,15);const lines=data.items.map((p,n)=>`${data.page*15+n+1}. <@${p.user_id}> — <t:${Math.floor(p.joined_at/1000)}:R>`);const row=new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`gw_prev:${id}:${data.page}`).setLabel('Prev').setEmoji('◀️').setStyle(ButtonStyle.Secondary).setDisabled(data.page<=0),new ButtonBuilder().setCustomId(`gw_next:${id}:${data.page}`).setLabel('Next').setEmoji('▶️').setStyle(ButtonStyle.Secondary).setDisabled(data.page>=data.pages-1));return safeReply(i,{embeds:[info(`**Participants — صفحه ${data.page+1}/${data.pages}**\n\n${lines.length?lines.join('\n'):'هیچ‌کس Join نشده.'}\n\nTotal: **${data.total}**`)],components:[row],flags:MessageFlags.Ephemeral});
+    }
+    if(kind==='drop'){
+      await deferEphemeral(i);const d=drops.getById(Number(a));if(!d||d.guild_id!==i.guild.id||d.channel_id!==i.channel.id)return safeReply(i,{embeds:[err('Drop معتبر نیست.')],flags:MessageFlags.Ephemeral});return safeReply(i,{embeds:[await drops.win(i.guild,d,i.user.id)?ok('تو برنده Drop شدی!'):err('این Drop تمام شده یا زمانش گذشته.')],flags:MessageFlags.Ephemeral});
+    }
+    if(kind==='emb'){
+      const row=db.prepare('SELECT * FROM embed_buttons WHERE message_id=? AND button_index=?').get(a,Number(b));
+      if(!row)return safeReply(i,{embeds:[err('این دکمه دیگر معتبر نیست.')],flags:MessageFlags.Ephemeral});
+      return safeReply(i,{content:row.response,flags:MessageFlags.Ephemeral});
+    }
+    if(kind==='exchange'){await deferEphemeral(i);return exchangeManage(i,a,Number(b));}
+  }catch(e){
+    console.error('[INTERACTION]',e);
+    const messages={
+      TICKET_SUPPORT_REQUIRED:'برای این عملیات باید Ticket Support Role را داشته باشی.',
+      TICKET_CHANNEL_NOT_FOUND:'Channel این Ticket پیدا نشد.',
+      TICKET_STATUS_CHANGED:'وضعیت Ticket همزمان تغییر کرده است؛ دوباره تلاش کن.',
+      TICKET_PARTICIPANT_CHANGED:'لیست اعضای Ticket همزمان تغییر کرده است؛ دوباره تلاش کن.',
+      MUSIC_ALREADY_IN_ANOTHER_VOICE:'بات در Voice دیگری است.',
+      MUSIC_MOVE_FAILED:'جابجایی اتصال Voice ناموفق بود.',
+      OPENAI_API_KEY:'کلید OpenAI تنظیم نشده است.'
     };
-    for(const [section,items] of grouped){
-      if(!items.length) continue;
-      pushField({name:section,value:formatLogSection(section,items,items.length)});
-    }
-    const performanceFields=await buildTicketPerformanceFields(guild.id);
-    for(const f of performanceFields) pushField(f);
-    if(fields===0) pushField({name:'📭 Logs',value:'در این بازه لاگی ثبت نشده است.'});
-    embeds.push(embed);
-
-    // IMPORTANT: Discord's 6000-character limit applies to the combined
-    // embed payload of a single message, not only to each individual embed.
-    // Sending several ~5900-character embeds together can therefore still
-    // trigger MAX_EMBED_SIZE_EXCEEDED. Send each page as its own message.
-    for(const page of embeds){
-      await channel.send({embeds:[page]});
-    }
-    // IMPORTANT: log_queue is an immutable history. Never delete rows after /sendlogs
-    // or after the automatic 6-hour report. This keeps all historical logs and counts.
-    await setSettings(guild.id,{next_log_flush_at:new Date(Date.now()+LOG_FLUSH_INTERVAL_MS).toISOString(),last_log_report_at:new Date().toISOString()});
-    return {sent:true,count:rows.length};
-  }catch(error){
-    console.error('log flush error:',error?.message||error);
-    return {sent:false,reason:'send-failed',error:error?.message||String(error)};
-  }finally{ logFlushRunning=false; }
+    return safeReply(i,{embeds:[err(messages[e?.message]||`خطای داخلی: ${clamp(e?.message||'Unknown error',1000)}`)],flags:MessageFlags.Ephemeral});
+  }
 }
+client.on('interactionCreate',onInteraction);
 
-async function checkScheduledLogFlush(){
-  for(const guild of client.guilds.cache.values()){
+async function queueInviteTask(guild,task){const key=guild.id;const prev=inviteQueues.get(key)||Promise.resolve();const next=prev.catch(()=>{}).then(task);inviteQueues.set(key,next);try{return await next}finally{if(inviteQueues.get(key)===next)inviteQueues.delete(key)}}
+async function refreshInvites(guild){
+  if(!guild.members.me?.permissions?.has(PermissionFlagsBits.ManageGuild))return false;
+  const col=await guild.invites.fetch().catch(e=>{console.error('[INVITES FETCH]',e.message);return null});if(!col)return false;const map=new Map();for(const x of col.values())map.set(x.code,x.uses||0);inviteSnapshots.set(guild.id,map);const tx=db.transaction(()=>{db.prepare('DELETE FROM invite_codes WHERE guild_id=?').run(guild.id);for(const x of col.values())db.prepare('INSERT INTO invite_codes(guild_id,code,uses,updated_at) VALUES(?,?,?,?)').run(guild.id,x.code,x.uses||0,Date.now())});tx();return true;
+}
+async function processMemberAdd(member){
+  await queueInviteTask(member.guild,async()=>{
+    const settings=inviteDefaults(getSettings(member.guild.id).invite||{});
+    const oldMembership=invites.membership(member.guild.id,member.id);
+    const oldSnapshot=inviteSnapshots.get(member.guild.id)||new Map();
+    let inviter=null,code=null,ambiguous=false;
+    const nowCol=await member.guild.invites.fetch().catch(e=>{console.error('[INVITES FETCH JOIN]',e.message);return null});
+    if(nowCol){
+      const increased=[...nowCol.values()].map(inv=>({inv,delta:(inv.uses||0)-(oldSnapshot.get(inv.code)||0)})).filter(x=>oldSnapshot.has(x.inv.code)&&x.delta>0);
+      if(increased.length===1&&increased[0].delta===1){inviter=increased[0].inv.inviter;code=increased[0].inv.code;}
+      else if(increased.length>0){ambiguous=true;}
+      const map=new Map();for(const inv of nowCol.values())map.set(inv.code,inv.uses||0);inviteSnapshots.set(member.guild.id,map);
+      const tx=db.transaction(()=>{db.prepare('DELETE FROM invite_codes WHERE guild_id=?').run(member.guild.id);for(const inv of nowCol.values())db.prepare('INSERT INTO invite_codes(guild_id,code,uses,updated_at) VALUES(?,?,?,?)').run(member.guild.id,inv.code,inv.uses||0,Date.now())});tx();
+    }
+    const accountAgeDays=(Date.now()-member.user.createdTimestamp)/86400000;
+    const rejoin=!!oldMembership&&!oldMembership.active;
+    const fakeByAge=accountAgeDays<settings.fakeDays;
+    const fakeByRejoin=rejoin&&!settings.countRejoins;
+    const fake=fakeByAge||fakeByRejoin;
+    if(rejoin&&!settings.countRejoins){
+      if(!inviter&&oldMembership?.inviter_id){const u=await client.users.fetch(oldMembership.inviter_id).catch(()=>null);if(u)inviter=u;}
+      code=code||oldMembership?.last_invite_code||null;
+    }
+    if(ambiguous&&!rejoin){inviter=null;}
     try{
-      const s=await getSettings(guild.id);
-      const configured=s.aggregated_log_channel;
-      if(!configured) continue;
-      let next=s.next_log_flush_at ? new Date(s.next_log_flush_at).getTime() : Date.now()+LOG_FLUSH_FIRST_MS;
-      if(!Number.isFinite(next)){ next=Date.now()+LOG_FLUSH_FIRST_MS; }
-      if(!s.next_log_flush_at){ await setSettings(guild.id,{next_log_flush_at:new Date(next).toISOString()}); continue; }
-      if(Date.now()>=next) await flushGuildLogs(guild,false);
-    }catch(error){ console.error('scheduled log check error:',error?.message||error); }
-  }
+      invites.recordJoin(member.guild.id,{memberId:member.id,inviterId:inviter?.id||null,code,fake,rejoin,countRejoin:settings.countRejoins,accountAgeDays});
+    }catch(error){console.error('[INVITE RECORD JOIN]',error);throw error;}
+    await sendLog(member.guild,'invite',{action:'join',member:member.user.tag,inviter:inviter?.tag||'unknown',invite_code:code||'unknown',fake,rejoin,account_age_days:Number(accountAgeDays.toFixed(2)),ambiguous,total_joins:inviter?invites.totalJoins(member.guild.id,inviter.id):0});
+    if(fake)await sendLog(member.guild,'invite',{action:'fake_join',member:member.user.tag,inviter:inviter?.tag||'unknown',reason:fakeByAge?'account_age':'rejoin'});
+    if(rejoin)await sendLog(member.guild,'invite',{action:'rejoin',member:member.user.tag,inviter:inviter?.tag||'unknown',counted:settings.countRejoins});
+
+    const w=getSettings(member.guild.id).welcome;
+    if(w?.channelId){const ch=await member.guild.channels.fetch(w.channelId).catch(()=>null);if(textChannel(ch))await ch.send({embeds:[new EmbedBuilder().setColor(0x57F287).setTitle('👋 خوش آمدید').setDescription(placeholders(w.text||'خوش آمدی [user] به [server]!',member,member.guild))],allowedMentions:{users:[member.id]}}).catch(e=>console.error('[WELCOME]',e.message));}
+    await sendLog(member.guild,'member',{action:'join',user:member.user.tag,user_id:member.id});
+  });
 }
-async function deleteInvocation(message){ await message.delete().catch(()=>{}); }
-async function setTextSetting(message,key,value){ if(!isAdmin(message.member)) return; await setSettings(message.guild.id,{[key]:value}); await deleteInvocation(message); }
-
-const SETCH = {
-  setcht:'ticket_log_channel', setchfead:'ticket_feedback_channel',
-  setchm:'message_log_channel', setchb:'ban_kick_log_channel', setchto:'timeout_log_channel',
-  setchv:'voice_log_channel', setchdm:'dm_log_channel', setchdv:'server_update_log_channel', setchwa:'member_warn_log_channel',
-  setchwel:'welcome_channel', setchinv:'invite_log_channel', setchlevel:'level_channel'
-};
-
-async function protectLogChannel(guild, channelId){
-  const ch=guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(()=>null);
-  if(!ch?.permissionOverwrites) return;
-  const role=await ensureRole(guild,ACCESS.logs);
-  await ch.permissionOverwrites.edit(guild.roles.everyone.id,{
-    ViewChannel:false, SendMessages:false, EmbedLinks:false, ReadMessageHistory:false
-  }).catch(()=>{});
-  await ch.permissionOverwrites.edit(role.id,{
-    ViewChannel:true, ReadMessageHistory:true, SendMessages:false
-  }).catch(()=>{});
-  const botMember=guild.members.me || await guild.members.fetch(client.user.id).catch(()=>null);
-  if(botMember){
-    await ch.permissionOverwrites.edit(botMember.id,{
-      ViewChannel:true, ReadMessageHistory:true, SendMessages:true, EmbedLinks:true, AttachFiles:true
-    }).catch(err=>console.error('log channel bot permission error:',err?.message||err));
-  }
-}
-async function handleSetCh(message, parts){
-  if(!message.guild || !isBotOwner(message.author.id)) return false;
-  const cmd=parts[0].toLowerCase();
-  if(cmd==='setchg'){
-    const ch=message.mentions.channels.map(c=>c.id).concat(parts.slice(1).filter(x=>/^\d+$/.test(x))).slice(0,4);
-    if(ch.length<4) return true;
-    await setSettings(message.guild.id,{giveaway_create_log_channel:ch[0],giveaway_winner_log_channel:ch[1],drop_create_log_channel:ch[2],drop_winner_log_channel:ch[3]});
-    for(const x of ch) await protectLogChannel(message.guild,x);
-    await deleteInvocation(message); return true;
-  }
-  const key=SETCH[cmd]; if(!key) return false;
-  const ch=message.mentions.channels.first()?.id || parts[1]; if(ch) { await setSettings(message.guild.id,{[key]:ch}); if(key.includes('log_channel')) await protectLogChannel(message.guild,ch); }
-  await deleteInvocation(message); return true;
-}
-
-client.once('clientReady',async()=>{
-  console.log(`Logged in as ${client.user.tag}`);
-  for(const g of client.guilds.cache.values()) await ensureRoles(g);
-  setInterval(endGiveaways,10000); setInterval(showStats,21600000);
-  // First automatic log report is 3 hours after setup, then every 6 hours.
-  setInterval(checkScheduledLogFlush,60000);
-  await checkScheduledLogFlush();
-});
-client.on('guildCreate',g=>ensureRoles(g));
-
-client.on('messageCreate',async message=>{
-  if(message.author.bot) return;
-  if(!message.guild){
-    for(const g of client.guilds.cache.values()) await logTo(g,'dm_log_channel',`📩 DM از ${message.author.tag} (${message.author.id})\n${message.content}`).catch(()=>{});
-    return;
-  }
-  const parts=message.content.trim().split(/\s+/), cmd=(parts[0]||'').toLowerCase();
-  if(await handleSetCh(message,parts)) return;
-
-  // Admin text commands that were explicitly requested without slash.
-  if(['setfosh','deletefosh','whiteuser'].includes(cmd)){
-    if(!isBotOwner(message.author.id)) return;
-    if(cmd==='setfosh') for(const word of parts.slice(1).join(' ').split(',').map(x=>x.trim().toLowerCase()).filter(Boolean)) await supabase.from('profanity_words').upsert({guild_id:message.guild.id,word});
-    if(cmd==='deletefosh') for(const word of parts.slice(1).join(' ').split(',').map(x=>x.trim().toLowerCase()).filter(Boolean)) await supabase.from('profanity_words').delete().eq('guild_id',message.guild.id).eq('word',word);
-    if(cmd==='whiteuser'){ const u=message.mentions.users.first(); if(u) await supabase.from('profanity_whitelist').upsert({guild_id:message.guild.id,user_id:u.id}); }
-    await deleteInvocation(message); return;
-  }
-
-  const s=await getSettings(message.guild.id);
-  const wl=await supabase.from('profanity_whitelist').select('user_id').eq('guild_id',message.guild.id).eq('user_id',message.author.id).maybeSingle();
-  if(!wl.data){
-    const {data:words}=await supabase.from('profanity_words').select('word').eq('guild_id',message.guild.id);
-    const normalized=message.content.toLowerCase().replace(/[^\p{L}\p{N}]+/gu,' ').trim();
-    const hit=(words||[]).find(x=>x.word && normalized.split(/\s+/).includes(String(x.word).toLowerCase().trim()));
-    if(hit){
-      await message.delete().catch(()=>{}); const {count}=await supabase.from('member_warns').select('*',{count:'exact',head:true}).eq('guild_id',message.guild.id).eq('user_id',message.author.id);
-      await supabase.from('member_warns').insert({guild_id:message.guild.id,user_id:message.author.id,reason:'Profanity filter'});
-      await logTo(message.guild,'member_warn_log_channel',`⚠️ وارن فحش | <@${message.author.id}> | ${hit.word}`);
-      if((count||0)+1>=3) await message.member.timeout(2*60*60*1000,'3 warnings').catch(()=>{});
-      return;
-    }
-  }
-
-  // Simple persistent XP: 1 XP per non-bot message, with automatic level roles/messages.
-  const xpRow=(await supabase.from('xp_users').select('*').eq('guild_id',message.guild.id).eq('user_id',message.author.id).maybeSingle()).data||{xp:0,level:0};
-  const newXp=xpRow.xp+1, newLevel=Math.floor(newXp/10);
-  if(newXp!==xpRow.xp) await supabase.from('xp_users').upsert({guild_id:message.guild.id,user_id:message.author.id,xp:newXp,level:newLevel});
-  if(newLevel>xpRow.level){
-    const {data:roleRows}=await supabase.from('xp_roles').select('*').eq('guild_id',message.guild.id).order('level',{ascending:true});
-    for(const er of roleRows||[]) await message.member.roles.remove(er.role_id).catch(()=>{});
-    const er=(roleRows||[]).find(x=>x.level===newLevel);
-    if(er) await message.member.roles.add(er.role_id).catch(()=>{});
-    const es=await getSettings(message.guild.id), levelText=placeholders((es.xp_level_text||'🎉 [user] رسید به Level '+newLevel).replace('[level]',String(newLevel)), message.member,message.guild);
-    const ech=es.level_channel&&message.guild.channels.cache.get(es.level_channel);
-    if(ech) await ech.send(levelText).catch(()=>{});
-    await logTo(message.guild,'level_channel',`⬆️ Level Up | ${message.author.tag} | Level ${newLevel}`);
-  }
-
-  if(isBotOwner(message.author.id) && s.owner_relay_channel===message.channel.id){
-    await deleteInvocation(message); await message.channel.send(message.content);
-  }
-  // Custom commands are intentionally public: anyone can invoke a configured keyword.
-  if(s.custom_commands?.[cmd]) await message.channel.send(String(s.custom_commands[cmd]), {allowedMentions:{parse:[]}}).catch(()=>{});
-
-  const {data:drops}=await supabase.from('drops').select('*').eq('guild_id',message.guild.id).eq('ended',false).eq('kind','text');
-  for(const d of drops||[]) if(d.target_text && message.content.trim()===d.target_text){
-    const {data:updated}=await supabase.from('drops').update({ended:true,winner_id:message.author.id}).eq('id',d.id).eq('ended',false).select().maybeSingle();
-    if(updated){
-      await message.channel.send({content:`🏆 <@${message.author.id}> برنده Drop شد! متن برنده: **${d.target_text}**`,allowedMentions:{users:[message.author.id],parse:[]}});
-      const ds=await getSettings(message.guild.id);
-      const logId=ds.drop_winner_log_channel||ds.drop_create_log_channel||ds.giveaway_winner_log_channel||ds.giveaway_create_log_channel;
-      const logCh=logId ? (message.guild.channels.cache.get(logId)||await message.guild.channels.fetch(logId).catch(()=>null)) : null;
-      if(logCh?.isTextBased()) await logCh.send(`⚡ **Drop Log**\n🎁 Prize: **${d.prize||'Unknown'}**\n🏆 Winner: <@${message.author.id}>\n🕐 Finished: <t:${Math.floor(Date.now()/1000)}:F>`,{allowedMentions:{users:[message.author.id],parse:[]}}).catch(()=>{});
-      await logTo(message.guild,'drop_winner_log_channel',`🏆 Drop winner: ${message.author.tag}`);
-    }
-    break;
-  }
-});
-
-async function endGiveaways(){
-  const {data:rows,error}=await supabase.from('giveaways').select('*').eq('ended',false).lte('end_at',new Date().toISOString());
-  if(error){ console.error('giveaway expiry query error:',error.message); return; }
-  for(const g of rows||[]){
-    try{
-      const {data:entries, error:entryError}=await supabase.from('giveaway_entries').select('user_id').eq('giveaway_id',g.id);
-      if(entryError){ console.error('giveaway entries read error:',entryError.message); continue; }
-      const users=[...new Set((entries||[]).map(x=>String(x.user_id)).filter(Boolean))];
-      const winner=users.length?users[Math.floor(Math.random()*users.length)]:null;
-      const {data:endedRow,error:updateError}=await supabase.from('giveaways').update({ended:true,winner_id:winner}).eq('id',g.id).eq('ended',false).select('id').maybeSingle();
-      if(updateError || !endedRow) continue;
-
-      const guild=client.guilds.cache.get(g.guild_id);
-      const ch=guild?.channels.cache.get(g.channel_id);
-      const winnerText=winner?`🏆 برنده: <@${winner}>`:'🏆 برنده: هیچ‌کس (شرکت‌کننده‌ای نبود)';
-      if(ch) await ch.send({
-        content:`🎉 **Giveaway تمام شد!**\n🎁 جایزه: **${g.prize}**\n👥 Joined: **${users.length}**\n${winnerText}`,
-        allowedMentions:{users:winner?[winner]:[],parse:[]}
-      }).catch(err=>console.error('giveaway finish send error:',err.message));
-
-      if(guild){
-        const s=await getSettings(guild.id);
-        const logChannelId=s.giveaway_winner_log_channel || s.giveaway_create_log_channel || s.drop_winner_log_channel || s.drop_create_log_channel;
-        const logCh=logChannelId ? (guild.channels.cache.get(logChannelId) || await guild.channels.fetch(logChannelId).catch(()=>null)) : null;
-        if(logCh?.isTextBased()){
-          await logCh.send({
-            content:`🎉 **Giveaway Log**\n🎁 Prize: **${g.prize}**\n👥 Joined: **${users.length}**\n${winner?`🏆 Winner: <@${winner}>`:'🏆 Winner: no one'}\n🕐 Finished: <t:${Math.floor(Date.now()/1000)}:F>`,
-            allowedMentions:{users:winner?[winner]:[],parse:[]}
-          }).catch(err=>console.error('giveaway log send error:',err.message));
-        }
-        await logTo(guild,'giveaway_winner_log_channel',`🎉 Giveaway پایان یافت | prize=${g.prize} | joined=${users.length} | winner=${winner||'no one'}`);
-      }
-
-      if(ch && g.message_id){
-        const original=await ch.messages.fetch(g.message_id).catch(()=>null);
-        if(original){
-          const disabled=original.components.map(row=>new ActionRowBuilder().addComponents(
-            row.components.map(component=>ButtonBuilder.from(component).setDisabled(true))
-          ));
-          await original.edit({content:`🎉 **Giveaway تمام شد!**\n🎁 جایزه: **${g.prize}**\n👥 Joined: **${users.length}**\n${winnerText}`,components:disabled,allowedMentions:{users:winner?[winner]:[],parse:[]}}).catch(()=>{});
-        }
-      }
-    }catch(err){ console.error('giveaway expiry error:',err?.message||err); }
-  }
-}
-async function showStats(){
-  const {data:rows,error}=await supabase.from('ticket_claim_history').select('guild_id,user_id,action');
-  if(error){ console.error('claim stats history error:',error.message||error); return; }
-  const all={};
-  for(const r of rows||[]){ if(!r.guild_id||!r.user_id) continue; all[r.guild_id]??={}; all[r.guild_id][r.user_id]=(all[r.guild_id][r.user_id]||0)+1; }
-  for(const [gid,c] of Object.entries(all)){
-    const s=await getSettings(gid), ch=client.channels.cache.get(s.stats_channel); if(!ch) continue;
-    const body=Object.entries(c).sort((a,b)=>b[1]-a[1]).map((x,i)=>`${i+1}. <@${x[0]}> — **${x[1]} claim**`).join('\n')||'آماری نیست.';
-    await ch.send(`📊 **آمار Claim Staff**\nهر بار Claim یا انتقال مسئولیت ثبت شود، یک فعالیت برای Staff محاسبه می‌شود.\n${body}`).catch(()=>{});
-  }
-}
-function ticketRows(ticketId, panel){
-  const row=new ActionRowBuilder();
-  const claim=new ButtonBuilder().setCustomId(`claim:${ticketId}`).setLabel('Claim').setStyle(ButtonStyle.Primary);
-  safeEmoji(claim,panel.claim_emoji||'🎫');
-  const close=new ButtonBuilder().setCustomId(`close:${ticketId}`).setLabel('Close').setStyle(ButtonStyle.Danger);
-  safeEmoji(close,panel.close_emoji||'🔒');
-  row.addComponents(claim,close);
-  return [row];
-}
-function closedTicketRows(ticketId){
-  return [new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`ticketdelete:${ticketId}`).setLabel('Delete').setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId(`transcript:${ticketId}`).setLabel('Transcript').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`ticketreopen:${ticketId}`).setLabel('Reopen').setStyle(ButtonStyle.Success)
-  )];
-}
-function defaultPanelTypes(panel){
-  const meta=TICKET_TYPES[panel.panel_type];
-  return [{
-    name: meta?.label || String(panel.name || 'Ticket').slice(0,80),
-    emoji: meta?.emoji || panel.button_emoji || '🎫',
-    prefix: meta?.prefix || slugifyTicketType(panel.name || 'ticket')
-  }];
-}
-function slugifyTicketType(value){
-  const slug=String(value||'ticket').toLowerCase().trim()
-    .replace(/[^a-z0-9\s_-]/g,'')
-    .replace(/[\s_]+/g,'-')
-    .replace(/-+/g,'-')
-    .replace(/^-|-$/g,'')
-    .slice(0,50);
-  return slug || 'ticket';
-}
-function getPanelTypes(panel){
-  let raw=panel?.ticket_types;
-  // Supabase normally returns JSONB as an array, but older rows/migrations may
-  // contain it as a JSON string. Normalize both forms so list/edit/delete work.
-  if(typeof raw==='string'){
-    try{ raw=JSON.parse(raw); }catch{ raw=null; }
-  }
-  if(Array.isArray(raw) && raw.length){
-    return raw.map((t,i)=>({
-      name:clean(t?.name || `Ticket ${i+1}`).slice(0,80),
-      emoji:typeof t?.emoji==='string'?t.emoji:'🎫',
-      prefix:slugifyTicketType(t?.prefix || t?.name || `ticket-${i+1}`)
-    }));
-  }
-  return defaultPanelTypes(panel);
-}
-async function loadPanelByNumber(guildId,num){
-  const n=Number(num);
-  if(!Number.isInteger(n) || n<1) return {data:null,error:new Error('Invalid panel number')};
-  return await supabase.from('ticket_panels').select('*').eq('guild_id',guildId).eq('panel_number',n).maybeSingle();
-}
-async function savePanelTypes(panel,types){
-  const normalized=types.map((t,i)=>({
-    name:clean(t?.name || `Ticket ${i+1}`).slice(0,80),
-    emoji:typeof t?.emoji==='string'?t.emoji:'🎫',
-    prefix:slugifyTicketType(t?.prefix || t?.name || `ticket-${i+1}`)
-  }));
-  return await supabase.from('ticket_panels').update({ticket_types:normalized}).eq('id',panel.id).eq('guild_id',panel.guild_id).select('*').single();
-}
-function selectedPanelType(panel,index){
-  const types=getPanelTypes(panel);
-  return types[Number(index)] || types[0] || {name:'Ticket',emoji:'🎫',prefix:'ticket'};
-}
-function panelLabel(p){
-  const types=getPanelTypes(p);
-  const first=types[0];
-  return first ? `${first.emoji || '🎫'} ${first.name}` : String(p.name||'Ticket Panel').slice(0,100);
-}
-function panelTicketName(panel,user,index=0){
-  const type=selectedPanelType(panel,index);
-  const safeUser=String(user.username||'user').toLowerCase().replace(/[^a-z0-9-_]/g,'-').replace(/-+/g,'-').slice(0,70)||'user';
-  return `${slugifyTicketType(type.prefix || type.name)}-${safeUser}`.slice(0,100);
-}
-function buildPanelComponents(panel){
-  const types=getPanelTypes(panel).slice(0,25);
-  if(types.length<=5){
-    const row=new ActionRowBuilder();
-    types.forEach((t,i)=>{
-      const b=new ButtonBuilder().setCustomId(`openpanel:${panel.id}:${i}`).setLabel(String(t.name||`Ticket ${i+1}`).slice(0,80)).setStyle(ButtonStyle.Primary);
-      safeEmoji(b,t.emoji);
-      row.addComponents(b);
-    });
-    return [row];
-  }
-  const menu=new StringSelectMenuBuilder().setCustomId(`ticketmenu:${panel.id}`).setPlaceholder('نوع تیکت را انتخاب کنید').addOptions(types.map((t,i)=>({
-    label:String(t.name||`Ticket ${i+1}`).slice(0,100),
-    value:`${panel.id}:${i}`,
-    description:`باز کردن تیکت ${String(t.name||'').slice(0,90)}`,
-    ...(t.emoji ? {emoji:t.emoji} : {})
-  })));
-  return [new ActionRowBuilder().addComponents(menu)];
-}
-async function refreshTicketPanelMessage(guild,panel){
-  if(!panel?.channel_id || !panel?.message_id) return false;
-  const ch=guild.channels.cache.get(panel.channel_id) || await guild.channels.fetch(panel.channel_id).catch(()=>null);
-  const msg=ch ? await ch.messages.fetch(panel.message_id).catch(()=>null) : null;
-  if(!msg) return false;
-  const types=getPanelTypes(panel);
-  const first=types[0] || {emoji:'🎫',name:panel.name||'Ticket'};
-  const embed=new EmbedBuilder().setTitle(`${first.emoji || '🎫'} ${panel.name || first.name}`.slice(0,256)).setDescription(String(panel.description||'برای باز کردن تیکت، نوع موردنظر را انتخاب کنید.').slice(0,4096)).setFooter({text:`Panel #${panel.panel_number} • ${types.length} نوع تیکت`});
-  await msg.edit({embeds:[embed],components:buildPanelComponents(panel)});
-  return true;
-}
-async function createTicket(interaction,panel,answers={}){
-  // Multiple users (and multiple tickets) may open tickets at the same time.
-  // There is intentionally NO global/per-user "one open ticket" lock here.
-  // Discord channel creation + the Supabase ticket row are independent per ticket.
-  const cat=panel.category_id && interaction.guild.channels.cache.get(panel.category_id)?.type===ChannelType.GuildCategory ? panel.category_id : undefined;
-  const ticketAccessId=(await getAccessRoleIds(interaction.guild.id)).ticket_support;
-  const ticketRole=(ticketAccessId && interaction.guild.roles.cache.get(ticketAccessId)) || interaction.guild.roles.cache.find(r=>r.name===TICKET_SUPPORT_ROLE) || await ensureRole(interaction.guild,TICKET_SUPPORT_ROLE).catch(()=>null);
-  if(!ticketRole) return respond(interaction, {content:'❌ Role `Tickets Support` پیدا نشد و بات اجازه ساخت آن را ندارد. Role/Manage Roles permission را بررسی کنید.',flags:MessageFlags.Ephemeral});
-  const levelRoles=await getLevelRoleIds(interaction.guild.id);
-  const staffRoleIds=[ticketRole.id,...Object.values(levelRoles).filter(Boolean).map(String)];
-  const overwrites=[
-    {id:interaction.guild.roles.everyone.id,deny:[PermissionsBitField.Flags.ViewChannel]},
-    ...[...new Set(staffRoleIds)].map(id=>({id,allow:[PermissionsBitField.Flags.ViewChannel,PermissionsBitField.Flags.SendMessages,PermissionsBitField.Flags.ReadMessageHistory]})),
-    {id:interaction.user.id,allow:[PermissionsBitField.Flags.ViewChannel,PermissionsBitField.Flags.SendMessages,PermissionsBitField.Flags.ReadMessageHistory]}
-  ];
-  let channel;
-  try{
-    channel=await interaction.guild.channels.create({name:panelTicketName(panel,interaction.user,panel._typeIndex||0),type:ChannelType.GuildText,parent:cat,permissionOverwrites:overwrites,reason:`Ticket ${selectedPanelType(panel,panel._typeIndex||0).name||panel.panel_type||'custom'} opened by ${interaction.user.tag}`});
-  }catch(error){
-    console.error('ticket channel create error:',error);
-    return respond(interaction, {content:`❌ ساخت کانال Ticket انجام نشد: ${error?.message||error}`,flags:MessageFlags.Ephemeral});
-  }
-  const {data:t,error}=await supabase.from('tickets').insert({guild_id:interaction.guild.id,panel_id:panel.id,channel_id:channel.id,opener_id:interaction.user.id,category_id:cat||null,status:'open',claimed_by:null}).select().single();
-  if(error){ console.error('ticket insert error:',error); await channel.delete().catch(()=>{}); return respond(interaction, {content:`❌ ذخیره Ticket در Supabase انجام نشد: ${error.message}`,flags:MessageFlags.Ephemeral}); }
-  if(Object.keys(answers).length) { const {error:aerr}=await supabase.from('ticket_answers').insert({ticket_id:t.id,answers}); if(aerr) console.error('ticket answers insert error:',aerr); }
-  const welcome=placeholders(panel.welcome_text||'سلام [user]، تیکت شما ایجاد شد.',interaction.member,interaction.guild);
-  await channel.send({content:`<@&${ticketRole.id}> <@${interaction.user.id}>\n${welcome}`,components:ticketRows(t.id,panel),allowedMentions:{users:[interaction.user.id],roles:[ticketRole.id]}});
-  await logTo(interaction.guild,'ticket_log_channel',`🎫 Ticket ایجاد شد | ${panelTicketName(panel,interaction.user,panel._typeIndex||0)} | ${interaction.user.tag}`);
-  return respond(interaction, {content:`تیکت ساخته شد: ${channel}`,flags:MessageFlags.Ephemeral});
-}
-async function getTicket(ch){ return (await supabase.from('tickets').select('*').eq('channel_id',ch.id).maybeSingle()).data; }
-async function claimTicket(interaction,t){
-  if(!t) return respond(interaction, {content:'Ticket پیدا نشد.',flags:MessageFlags.Ephemeral});
-  const ticketPermission=await staffPermission(interaction.member,interaction.guild.id,'claim'); if(!ticketPermission.ok) return respond(interaction, {content:ticketPermission.reason,flags:MessageFlags.Ephemeral});
-  if(t.status!=='open') return respond(interaction, {content:'این Ticket بسته است.',flags:MessageFlags.Ephemeral});
-  if(t.claimed_by) return respond(interaction, {content:`این Ticket قبلاً توسط <@${t.claimed_by}> Claim شده است.`,flags:MessageFlags.Ephemeral});
-  const {data:claimed,error}=await supabase.from('tickets').update({claimed_by:interaction.user.id}).eq('id',t.id).eq('status','open').is('claimed_by',null).select('id,claimed_by').maybeSingle();
-  if(error || !claimed) return respond(interaction, {content:'❌ این Ticket همین الان توسط شخص دیگری Claim شد.',flags:MessageFlags.Ephemeral});
-  const {error:claimHistoryError}=await supabase.from('ticket_claim_history').insert({ticket_id:t.id,guild_id:interaction.guild.id,user_id:interaction.user.id,action:'claim'});
-  if(claimHistoryError) console.error('ticket claim history error:',claimHistoryError?.message||claimHistoryError);
-  const {count:claimCount,error:claimCountError}=await supabase.from('ticket_claim_history')
-    .select('*',{count:'exact',head:true}).eq('guild_id',interaction.guild.id).eq('user_id',interaction.user.id);
-  if(claimCountError) console.error('ticket claim count error:',claimCountError?.message||claimCountError);
-  const totalClaims=Number(claimCount||0);
-  const claimText=`🎫 **Ticket Claim** | ${interaction.channel.name}\n👤 Staff: ${interaction.user.tag} (<@${interaction.user.id}>)\n📊 تعداد Claim این شخص: **${totalClaims}**`;
-  await logTo(interaction.guild,'ticket_log_channel',claimText);
-  const settings=await getSettings(interaction.guild.id);
-  const logId=settings.ticket_log_channel;
-  const logChannel=logId ? (interaction.guild.channels.cache.get(logId)||await interaction.guild.channels.fetch(logId).catch(()=>null)) : null;
-  if(logChannel?.isTextBased()) await logChannel.send({content:claimText,allowedMentions:{users:[]}}).catch(err=>console.error('ticket claim discord log error:',err?.message||err));
-  return respond(interaction, {content:`🎫 Ticket توسط <@${interaction.user.id}> Claim شد.`,allowedMentions:{users:[interaction.user.id]}});
-}
-async function buildTranscript(interaction,t){
-  const msgs=[];
-  let before;
-  for(let page=0;page<10;page++){
-    const opts={limit:100}; if(before) opts.before=before;
-    const fetched=await interaction.channel.messages.fetch(opts).catch(()=>null); if(!fetched?.size) break;
-    for(const m of fetched.values()){
-      const attachments=[...m.attachments.values()].map(a=>a.url).join(' ');
-      msgs.push(`[${m.createdAt.toISOString()}] ${displayUser(m.author)}: ${m.content||''}${attachments?` [Attachments: ${attachments}]`:''}`.trim());
-    }
-    before=fetched.last()?.id; if(fetched.size<100) break;
-  }
-  msgs.reverse();
-  return `Tehran Club Ticket Transcript\nTicket ID: ${t.id}\nChannel: ${interaction.channel.name}\nOpened By: ${t.opener_id}\nClaimed By: ${t.claimed_by||'none'}\nStatus: ${t.status}\n\n--- Messages ---\n${msgs.join('\n')||'(no messages)'}`;
-}
-async function sendTranscript(interaction,t){
-  const text=await buildTranscript(interaction,t);
-  const {error:transcriptSaveError}=await supabase.from('tickets').update({transcript:text}).eq('id',t.id);
-  if(transcriptSaveError) console.error('ticket transcript save error:',transcriptSaveError?.message||transcriptSaveError);
-  const s=await getSettings(interaction.guild.id), logId=s.ticket_transcript_log_channel || s.ticket_log_channel;
-  const ch=logId ? (interaction.guild.channels.cache.get(logId)||await interaction.guild.channels.fetch(logId).catch(()=>null)) : null;
-  if(!ch?.isTextBased()) return respond(interaction, {content:'❌ Transcript Log تنظیم نشده. از /setticketlog استفاده کنید.',flags:MessageFlags.Ephemeral});
-  const safeName=String(interaction.channel.name||'ticket').replace(/[^a-z0-9-_]/gi,'-').slice(0,60);
-  const file=new AttachmentBuilder(Buffer.from(text,'utf8'),{name:`${safeName}-${t.id}.txt`});
-
-  // Transcript header: transcript | ticket owner | claimed by
-  // Use usernames (not the channel name). If nobody claimed the ticket, show "no one".
-  const opener=await interaction.guild.members.fetch(t.opener_id).catch(()=>null);
-  const claimer=t.claimed_by ? await interaction.guild.members.fetch(t.claimed_by).catch(()=>null) : null;
-  const openerName=opener?.user?.username || opener?.user?.globalName || String(t.opener_id);
-  const claimerName=claimer?.user?.username || claimer?.user?.globalName || (t.claimed_by ? String(t.claimed_by) : 'no one');
-  await ch.send({content:`📄 Transcript | ${openerName} | ${claimerName}`,files:[file],allowedMentions:{parse:[]}});
-  return respond(interaction, {content:`✅ Transcript به ${ch} ارسال شد.`,flags:MessageFlags.Ephemeral});
-}
-async function closeTicket(interaction,t,reason){
-  const ticketPermission=await staffPermission(interaction.member,interaction.guild.id,'close'); if(!ticketPermission.ok) return respond(interaction, {content:ticketPermission.reason,flags:MessageFlags.Ephemeral});
-  if(!t || t.status!=='open') return respond(interaction, {content:'این Ticket قبلاً بسته شده یا پیدا نشد.',flags:MessageFlags.Ephemeral});
-  await interaction.deferReply({flags:MessageFlags.Ephemeral});
-  const closedAt=new Date().toISOString();
-  const {data:closed,error:closeError}=await supabase.from('tickets').update({status:'closed',closed_at:closedAt}).eq('id',t.id).eq('status','open').select('id,status,opener_id,claimed_by').maybeSingle();
-  if(closeError || !closed) return interaction.editReply({content:`❌ بستن Ticket انجام نشد: ${closeError?.message||'already closed'}`});
-  // User loses access; Tickets Support keeps full access.
-  await interaction.channel.permissionOverwrites.edit(t.opener_id,{ViewChannel:false,SendMessages:false,ReadMessageHistory:false}).catch(()=>{});
-  const ticketRole=interaction.guild.roles.cache.find(r=>r.name===TICKET_SUPPORT_ROLE);
-  if(ticketRole) await interaction.channel.permissionOverwrites.edit(ticketRole.id,{ViewChannel:true,SendMessages:true,ReadMessageHistory:true}).catch(()=>{});
-  const feedbackRow=new ActionRowBuilder().addComponents([1,2,3,4,5].map(n=>new ButtonBuilder().setCustomId(`feedback:${t.id}:${n}`).setLabel(`${n} ⭐`).setStyle(ButtonStyle.Secondary)));
-  let dmSent=false;
-  try{
-    const user=await interaction.client.users.fetch(t.opener_id);
-    await user.send({content:`🎫 Your ticket **${interaction.channel.name}** was closed.\nReason: ${reason||'No reason provided'}\n\n⭐ Please rate your support experience:`,components:[feedbackRow],allowedMentions:{parse:[]}});
-    dmSent=true;
-  }catch(err){ console.warn('ticket rating DM failed:',err?.message||err); }
-  // Staff control panel stays in the ticket and only Tickets Support can see it.
-  await interaction.channel.send({content:`🔒 **Ticket Closed**\nReason: ${reason||'No reason provided'}\nTickets Support can use the buttons below.`,components:closedTicketRows(t.id),allowedMentions:{parse:[]}});
-  await logTo(interaction.guild,'ticket_log_channel',`🔒 Ticket بسته شد | ${interaction.channel.name} | توسط ${interaction.user.tag}`);
-  return interaction.editReply({content:dmSent?'Ticket بسته شد و Rating برای کاربر ارسال شد.':'Ticket بسته شد؛ DM کاربر ارسال نشد چون DM او بسته است.'});
-}
-
-client.on('interactionCreate',async interaction=>{
-  try{
-    if(interaction.isButton()){
-      const [type,id,extra]=interaction.customId.split(':');
-      if(type==='gw'){
-        const {data:gw}=await supabase.from('giveaways').select('id,guild_id,channel_id,message_id,prize,duration_minutes,ended,end_at').eq('id',id).maybeSingle();
-        if(!gw || (gw.ended===true || Number(gw.ended)===1) || new Date(gw.end_at)<=new Date()) return respond(interaction, {content:'این Giveaway تمام شده است.',flags:MessageFlags.Ephemeral});
-        const {data:already}=await supabase.from('giveaway_entries').select('id').eq('giveaway_id',id).eq('user_id',interaction.user.id).maybeSingle();
-        if(already) return respond(interaction, {content:'قبلاً در این Giveaway شرکت کرده‌ای ✅',flags:MessageFlags.Ephemeral});
-        const {error}=await supabase.from('giveaway_entries').insert({giveaway_id:id,user_id:interaction.user.id});
-        if(error) return respond(interaction, {content:'❌ خطا در ثبت ورود Giveaway.',flags:MessageFlags.Ephemeral});
-        await updateGiveawayMessage(gw);
-        return respond(interaction, {content:'وارد Giveaway شدی ✅',flags:MessageFlags.Ephemeral});
-      }
-      if(type==='drop'){
-        const {data:d}=await supabase.from('drops').select('*').eq('id',id).eq('ended',false).maybeSingle();
-        if(!d) return respond(interaction, {content:'این Drop قبلاً برنده شده.',flags:MessageFlags.Ephemeral});
-        const {data:u}=await supabase.from('drops').update({ended:true,winner_id:interaction.user.id}).eq('id',id).eq('ended',false).select().maybeSingle();
-        if(!u) return respond(interaction, {content:'همزمان یک نفر دیگر برنده شد.',flags:MessageFlags.Ephemeral});
-        await interaction.update({content:`🏆 <@${interaction.user.id}> اولین نفر بود و برنده شد!`,components:[]});
-        const ds=await getSettings(interaction.guild.id);
-        const logId=ds.drop_winner_log_channel||ds.drop_create_log_channel||ds.giveaway_winner_log_channel||ds.giveaway_create_log_channel;
-        const logCh=logId ? (interaction.guild.channels.cache.get(logId)||await interaction.guild.channels.fetch(logId).catch(()=>null)) : null;
-        if(logCh?.isTextBased()) await logCh.send(`⚡ **Drop Log**\n🎁 Prize: **${d.prize||'Unknown'}**\n🏆 Winner: <@${interaction.user.id}>\n🕐 Finished: <t:${Math.floor(Date.now()/1000)}:F>`,{allowedMentions:{users:[interaction.user.id],parse:[]}}).catch(()=>{});
-        return logTo(interaction.guild,'drop_winner_log_channel',`🏆 Drop winner | ${interaction.user.tag}`);
-      }
-      if(type==='embedadd'){
-        if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'⛔ فقط Owner می‌تواند دکمه Embed اضافه کند.',flags:MessageFlags.Ephemeral});
-        const modalId=`embedadd:${interaction.channelId}:${id}`;
-        try{
-          const modal=new ModalBuilder().setCustomId(modalId).setTitle('افزودن دکمه به Embed').addComponents(
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('label').setLabel('نام دکمه').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(80)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('message').setLabel('پیام مخفی دکمه').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1900)),
-            new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('emoji').setLabel('ایموجی (اختیاری)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(50))
-          );
-          return await interaction.showModal(modal);
-        }catch(err){
-          console.error('embed add modal error:',err);
-          return respond(interaction, {content:`❌ باز کردن فرم افزودن دکمه انجام نشد.\n${String(err?.message||err).slice(0,500)}`,flags:MessageFlags.Ephemeral}).catch(()=>{});
-        }
-      }
-      if(type==='embmsg'){
-        const settings=await getSettings(interaction.guild.id);
-        const buttons=settings.embed_buttons || {};
-        const item=buttons[String(id)];
-        if(!item) return respond(interaction, {content:'❌ این دکمه دیگر معتبر نیست.',flags:MessageFlags.Ephemeral});
-        return respond(interaction, {content:String(item.message).slice(0,1900),flags:MessageFlags.Ephemeral,allowedMentions:{parse:[]}});
-      }
-      if(type==='openpanel'){
-        const panel=(await supabase.from('ticket_panels').select('*').eq('id',id).maybeSingle()).data;
-        if(!panel) return respond(interaction, {content:'Panel پیدا نشد.',flags:MessageFlags.Ephemeral});
-        const typeIndex=Number.isInteger(Number(extra)) ? Number(extra) : 0;
-        panel._typeIndex=typeIndex;
-        if(panel.form_enabled && panel.form_questions?.length){
-          const modal=new ModalBuilder().setCustomId(`ticketform:${panel.id}:${typeIndex}`).setTitle(`فرم ${String(selectedPanelType(panel,typeIndex).name||panel.name).slice(0,40)}`);
-          for(let i=0;i<Math.min(5,panel.form_questions.length);i++) modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId(`q${i}`).setLabel(String(panel.form_questions[i]).slice(0,45)).setStyle(TextInputStyle.Paragraph).setRequired(false)));
-          return await interaction.showModal(modal);
-        }
-        return createTicket(interaction,panel);
-      }
-      if(type==='exapprove'||type==='exreject'){
-        const accessRoles=await getAccessRoleIds(interaction.guild.id);
-        const exchangeRoleId=String(accessRoles.exchange || '1550650257841328148');
-        if(!hasRoleId(interaction.member,exchangeRoleId) && !isBotOwner(interaction.user.id))
-          return respond(interaction, {content:'⛔ فقط اعضای دارای Exchange Role می‌توانند این درخواست را بررسی کنند.',flags:MessageFlags.Ephemeral});
-        await interaction.deferReply({flags:MessageFlags.Ephemeral});
-        let e;
-        const {data:exchangeRow,error:fetchError}=await supabase.from('exchange_requests').select('*').eq('id',id).maybeSingle();
-        e=exchangeRow;
-        if(fetchError){ console.error('exchange fetch error:',fetchError); return interaction.editReply({content:'❌ خطا در خواندن درخواست Exchange از Supabase.'}); }
-        if(!e) return interaction.editReply({content:'این درخواست دیگر وجود ندارد.'});
-        if(e.status && e.status!=='pending') return interaction.editReply({content:'این درخواست قبلاً بررسی شده است.'});
-
-        // Claim the request atomically so two Exchange staff members cannot
-        // approve/reject the same request at the same time.
-        const nextStatus=type==='exreject'?'rejected':'accepted';
-        const {data:claimed,error:claimError}=await supabase.from('exchange_requests').update({status:nextStatus}).eq('id',id).eq('status','pending').select('*').maybeSingle();
-        if(claimError) return interaction.editReply({content:'❌ تغییر وضعیت درخواست Exchange انجام نشد.'});
-        if(!claimed) return interaction.editReply({content:'این درخواست قبلاً توسط شخص دیگری بررسی شده است.'});
-        e=claimed;
-
-        if(type==='exreject'){
-          const {error:deleteError}=await supabase.from('exchange_requests').delete().eq('id',id).eq('status','rejected');
-          if(deleteError){ console.error('exchange decline delete error:',deleteError); return interaction.editReply({content:'❌ درخواست رد شد اما حذف آن از Supabase انجام نشد.'}); }
-          try{
-            const user=await interaction.client.users.fetch(e.user_id);
-            await user.send({content:'Banner declined',allowedMentions:{parse:[]}});
-          }catch(err){ console.error('exchange decline DM error:',err); }
-          await interaction.message.delete().catch(()=>interaction.message.edit({content:'❌ Banner declined',components:[],allowedMentions:{parse:[]}}));
-          return interaction.editReply({content:'Banner declined. پیام به کاربر ارسال شد و درخواست از Supabase حذف شد.'});
-        }
-
-        const guild=interaction.guild;
-        const settings=await getSettings(guild.id);
-        const chId=settings.exchange_channel;
-        const ch=chId ? (guild.channels.cache.get(chId) || await guild.channels.fetch(chId).catch(()=>null)) : null;
-        if(!ch?.isTextBased()){
-          return interaction.editReply({content:'❌ /setex تنظیم نشده یا کانال Exchange مقصد معتبر نیست.'});
-        }
-        const safeBanner=stripMentions(e.banner);
-        try{
-          await ch.send({content:`<@&${exchangeRoleId}>\n${safeBanner}`,allowedMentions:{parse:[],users:[],roles:[exchangeRoleId],repliedUser:false}});
-        }catch(err){
-          console.error('exchange final send error:',err);
-          await supabase.from('exchange_requests').update({status:'pending'}).eq('id',id).eq('status','accepted').catch(()=>{});
-          return interaction.editReply({content:`❌ ارسال به Exchange انجام نشد: ${err?.message || err}`});
-        }
-        const {error:deleteError}=await supabase.from('exchange_requests').delete().eq('id',id);
-        if(deleteError){
-          console.error('exchange accept delete error:',deleteError);
-          return interaction.editReply({content:'⚠️ Banner به Exchange ارسال شد، اما حذف درخواست از Supabase انجام نشد. بررسی کنید.'});
-        }
-        await interaction.message.delete().catch(()=>interaction.message.edit({content:'✅ Exchange accepted.',components:[],allowedMentions:{parse:[]}}));
-        return interaction.editReply({content:'Exchange accepted, sent, and removed from Supabase.'});
-      }
-      if(type==='ticketdelete'){
-        if(!(await staffPermission(interaction.member,interaction.guild.id,'close')).ok) return respond(interaction, {content:'⛔ رول Ticket Support برای این کار لازم است.',flags:MessageFlags.Ephemeral});
-        const t=await getTicket(interaction.channel); if(!t || t.id!==id) return respond(interaction, {content:'Ticket پیدا نشد.',flags:MessageFlags.Ephemeral});
-
-        // Prevent two staff members from triggering the same deletion at once.
-        if(interaction.channel.__ticketDeleteScheduled) {
-          return respond(interaction, {content:'🗑️ حذف این Ticket قبلاً زمان‌بندی شده است.',flags:MessageFlags.Ephemeral});
-        }
-        interaction.channel.__ticketDeleteScheduled=true;
-
-        await respond(interaction, {content:'🗑️ Ticket در 3 ثانیه حذف می‌شود...',flags:MessageFlags.Ephemeral});
-
-        // Keep the channel alive for exactly 3 seconds after the delete action.
-        await new Promise(resolve=>setTimeout(resolve,3000));
-
-        // IMPORTANT: keep the ticket row and feedback forever. The Discord channel
-        // can be deleted, but claim/rating history must remain available for the
-        // cumulative log report. Only transient ticket members/answers are removed.
-        const cleanupResults=await Promise.all([
-          supabase.from('ticket_answers').delete().eq('ticket_id',t.id),
-          supabase.from('ticket_members').delete().eq('ticket_id',t.id)
-        ]);
-        for(const result of cleanupResults){
-          if(result?.error) console.error('ticket delete cleanup error:',result);
-        }
-
-        try{
-          await interaction.channel.delete(`Ticket deleted by ${interaction.user.tag}`);
-        }catch(err){
-          console.error('ticket channel delete error:',err);
-          // If Discord temporarily failed, allow another click/retry instead of leaving the handler locked.
-          interaction.channel.__ticketDeleteScheduled=false;
-        }
+client.once('ready',async()=>{
+  console.log(`${botName} ready as ${client.user.tag}`);outbox.recoverFailed();delivery.recover();if(!guildId)throw new Error('GUILD_ID missing');
+  for(const g of [...client.guilds.cache.values()]){if(g.id!==guildId){await g.leave().catch(()=>{});continue;}await refreshInvites(g);await tickets.reconcile(g).catch(e=>console.error('[TICKET RECONCILE]',e.message));await xp.reconcileGuild(g).then(r=>{if(r.length)console.error('[XP RECONCILE]',JSON.stringify(r.slice(0,3)))}).catch(e=>console.error('[XP RECONCILE]',e.message));await staff.reconcileGuild(g).then(r=>{if(r.length)console.error('[STAFF RECONCILE]',JSON.stringify(r.slice(0,3)))}).catch(e=>console.error('[STAFF RECONCILE]',e.message));const q=music247.get(g.id);if(q){const vc=await g.channels.fetch(q.voice_channel_id).catch(()=>null);if(vc?.isVoiceBased())await music.ensure247(g,vc,null).catch(e=>console.error('[247 STARTUP]',e.message));}}
+  if(intervalsStarted)return;intervalsStarted=true;
+  const addTimer=(fn,ms)=>{const t=setInterval(fn,ms);timers.add(t);return t;};
+  addTimer(()=>outbox.drain(client).catch(e=>console.error('[OUTBOX]',e.message)),5000);
+  addTimer(()=>delivery.drain(client).catch(e=>console.error('[DELIVERY OUTBOX]',e.message)),5000);
+  addTimer(()=>giveaways.finishDue(client).catch(e=>console.error('[GIVEAWAY TIMER]',e.message)),5000);
+  addTimer(()=>{const g=client.guilds.cache.get(guildId);if(g)drops.expire(g).catch(e=>console.error('[DROP TIMER]',e.message));},30000);
+  const updateTicketClaimLeaderboard=async()=>{
+    const g=client.guilds.cache.get(guildId);if(!g)return;
+    const settings=getSettings(g.id);const ticketSettings=settings.ticket||{};const chId=ticketSettings.claimLeaderboardChannelId;if(!chId)return;
+    const now=Date.now();const interval=6*60*60*1000;
+    const last=Number(ticketSettings.claimLeaderboardLastUpdatedAt||0);
+    if(last>0 && now-last<interval)return;
+    const ch=await g.channels.fetch(chId).catch(()=>null);if(!textChannel(ch))return;
+    const rows=tickets.claimLeaderboard(g.id);
+    const body=rows.length?rows.map((r,n)=>`${n+1}. <@${r.user_id}> — **${r.claims}** Claim`).join('\n'):'هنوز هیچ Claimی ثبت نشده.';
+    const embed=new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setTitle('🏆 Ticket Claim Leaderboard')
+      .setDescription(`آمار تجمعی همه Claimها\n\n${body}`)
+      .setFooter({text:'به‌روزرسانی هر ۶ ساعت'})
+      .setTimestamp(new Date(now));
+    let message=null;
+    if(ticketSettings.claimLeaderboardMessageId) message=await ch.messages.fetch(ticketSettings.claimLeaderboardMessageId).catch(()=>null);
+    if(message){
+      try{
+        await message.edit({embeds:[embed],components:[]});
+      }catch(e){
+        console.error('[TICKET LEADERBOARD EDIT]',e.message);
         return;
       }
-      if(type==='transcript'){
-        if(!(await staffPermission(interaction.member,interaction.guild.id,'claim')).ok) return respond(interaction, {content:'⛔ رول Ticket Support برای این کار لازم است.',flags:MessageFlags.Ephemeral});
-        const t=await getTicket(interaction.channel); if(!t || t.id!==id) return respond(interaction, {content:'Ticket پیدا نشد.',flags:MessageFlags.Ephemeral});
-        return sendTranscript(interaction,t);
-      }
-      if(type==='ticketreopen'){
-        if(!(await staffPermission(interaction.member,interaction.guild.id,'reopen')).ok) return respond(interaction, {content:'⛔ رول Ticket Support برای این کار لازم است.',flags:MessageFlags.Ephemeral});
-        const t=await getTicket(interaction.channel); if(!t || t.id!==id) return respond(interaction, {content:'Ticket پیدا نشد.',flags:MessageFlags.Ephemeral});
-        if(t.status!=='closed') return respond(interaction, {content:'این Ticket باز است.',flags:MessageFlags.Ephemeral});
-        const {error}=await supabase.from('tickets').update({status:'open',closed_at:null}).eq('id',t.id).eq('status','closed');
-        if(error) return respond(interaction, {content:`❌ باز کردن Ticket انجام نشد: ${error.message}`,flags:MessageFlags.Ephemeral});
-        const ticketRole=interaction.guild.roles.cache.find(r=>r.name===TICKET_SUPPORT_ROLE);
-        if(ticketRole) await interaction.channel.permissionOverwrites.edit(ticketRole.id,{ViewChannel:true,SendMessages:true,ReadMessageHistory:true}).catch(()=>{});
-        await interaction.channel.permissionOverwrites.edit(t.opener_id,{ViewChannel:true,SendMessages:true,ReadMessageHistory:true}).catch(()=>{});
-        await interaction.channel.send({content:`🔓 <@&${ticketRole?.id}> <@${t.opener_id}> Ticket دوباره باز شد.`,allowedMentions:{users:[t.opener_id],roles:ticketRole?[ticketRole.id]:[]}});
-        return respond(interaction, {content:'Ticket دوباره باز شد.',flags:MessageFlags.Ephemeral});
-      }
-      if(type==='claim'){ if(!(await staffPermission(interaction.member,interaction.guild.id,'claim')).ok) return respond(interaction, {content:'⛔ رول Ticket Support برای این کار لازم است.',flags:MessageFlags.Ephemeral}); return claimTicket(interaction,await getTicket(interaction.channel)); }
-      if(type==='close'){
-        if(!(await staffPermission(interaction.member,interaction.guild.id,'close')).ok) return respond(interaction, {content:'⛔ رول Ticket Support برای این کار لازم است.',flags:MessageFlags.Ephemeral});
-        const t=await getTicket(interaction.channel); if(!t) return respond(interaction, {content:'Ticket نیست.',flags:MessageFlags.Ephemeral});
-        if(t.status!=='open') return respond(interaction, {content:'این Ticket قبلاً بسته شده.',flags:MessageFlags.Ephemeral});
-        const modal=new ModalBuilder().setCustomId(`closemodal:${t.id}`).setTitle('بستن تیکت').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('دلیل بستن').setStyle(TextInputStyle.Paragraph).setRequired(false)));
-        return await interaction.showModal(modal);
-      }
-      if(type==='feedback'){
-        const stars=Number(extra); const {data:t}=await supabase.from('tickets').select('*').eq('id',id).maybeSingle();
-        if(!t) return respond(interaction, {content:'Ticket پیدا نشد.',flags:MessageFlags.Ephemeral});
-        if(t.status!=='closed' || interaction.user.id!==t.opener_id) return respond(interaction, {content:'این Feedback فقط برای صاحب تیکت بسته‌شده قابل ثبت است.',flags:MessageFlags.Ephemeral});
-        const {data:existingFeedback}=await supabase.from('ticket_feedback').select('id').eq('ticket_id',id).eq('user_id',interaction.user.id).maybeSingle();
-        if(existingFeedback) return respond(interaction, {content:'این Ticket قبلاً Rating شده است.',flags:MessageFlags.Ephemeral});
-        const {error:feedbackInsertError}=await supabase.from('ticket_feedback').insert({ticket_id:id,user_id:interaction.user.id,claimed_by:t.claimed_by||null,stars});
-        if(feedbackInsertError){ console.error('feedback insert error:',feedbackInsertError); return respond(interaction, {content:'❌ ذخیره Rating انجام نشد. دوباره تلاش کنید.',flags:MessageFlags.Ephemeral}); }
-        await logTo(interaction.guild,'ticket_feedback_channel',`⭐ Ticket Feedback | ${interaction.user.tag} | ${stars}/5 | Ticket ${id}`);
-        const modal=new ModalBuilder().setCustomId(`feedbackmodal:${id}:${stars}`).setTitle(`${stars} ستاره`).addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('feedback').setLabel('نظر شما').setStyle(TextInputStyle.Paragraph).setRequired(false)));
-        return await interaction.showModal(modal);
-      }
+    }else{
+      message=await ch.send({embeds:[embed]}).catch(e=>{console.error('[TICKET LEADERBOARD SEND]',e.message);return null});
+      if(!message)return;
     }
-    if(interaction.isStringSelectMenu()){
-      if(interaction.customId==='ticketmenu' || interaction.customId.startsWith('ticketmenu:')){
-        const [panelId,typeIndexRaw]=String(interaction.values[0]||'').split(':');
-        const panel=(await supabase.from('ticket_panels').select('*').eq('id',panelId).maybeSingle()).data;
-        if(!panel) return respond(interaction, {content:'Panel پیدا نشد.',flags:MessageFlags.Ephemeral});
-        const typeIndex=Number(typeIndexRaw)||0; panel._typeIndex=typeIndex;
-        if(panel.form_enabled && panel.form_questions?.length){
-          const modal=new ModalBuilder().setCustomId(`ticketform:${panel.id}:${typeIndex}`).setTitle(`فرم ${String(selectedPanelType(panel,typeIndex).name||panel.name).slice(0,40)}`);
-          for(let i=0;i<Math.min(5,panel.form_questions.length);i++) modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId(`q${i}`).setLabel(String(panel.form_questions[i]).slice(0,45)).setStyle(TextInputStyle.Paragraph).setRequired(false)));
-          return await interaction.showModal(modal);
-        }
-        return createTicket(interaction,panel);
-      }
-    }
-    if(interaction.isModalSubmit()){
-      if(interaction.customId.startsWith('embedadd:')){
-        if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'⛔ فقط Owner می‌تواند دکمه Embed اضافه کند.',flags:MessageFlags.Ephemeral});
-        try{
-          // Modal submissions have the same short acknowledgement deadline as
-          // other interactions. Supabase/channel fetches can exceed it, so
-          // acknowledge first; the shared responder will then use editReply.
-          await interaction.deferReply({flags:MessageFlags.Ephemeral});
-          const parts=interaction.customId.split(':');
-          const channelId=parts[1];
-          const messageId=parts[2];
-          if(!channelId || !messageId) return respond(interaction, {content:'❌ شناسه پیام Embed نامعتبر است.',flags:MessageFlags.Ephemeral});
-          const label=interaction.fields.getTextInputValue('label').trim();
-          const message=interaction.fields.getTextInputValue('message').trim();
-          const emoji=interaction.fields.getTextInputValue('emoji').trim();
-          if(!label || !message) return respond(interaction, {content:'❌ نام دکمه و پیام آن الزامی است.',flags:MessageFlags.Ephemeral});
-          const channel=interaction.guild.channels.cache.get(channelId) || await interaction.guild.channels.fetch(channelId).catch(()=>null);
-          if(!channel?.isTextBased() || !channel.messages) return respond(interaction, {content:'❌ کانال Embed پیدا نشد یا دسترسی خواندن پیام‌ها وجود ندارد.',flags:MessageFlags.Ephemeral});
-          const publicMessage=await channel.messages.fetch(messageId).catch(()=>null);
-          if(!publicMessage) return respond(interaction, {content:'❌ پیام Embed پیدا نشد یا دیگر در دسترس نیست.',flags:MessageFlags.Ephemeral});
-          const settings=await getSettings(interaction.guild.id);
-          const buttons={...(settings.embed_buttons||{})};
-          const existing=Object.values(buttons).filter(x=>x && String(x.message_id)===String(messageId));
-          if(existing.length>=25) return respond(interaction, {content:'❌ دیسکورد برای یک پیام حداکثر ۲۵ دکمه اجازه می‌دهد.',flags:MessageFlags.Ephemeral});
-          const token=`${Date.now().toString(36)}${Math.random().toString(36).slice(2,8)}`;
-          buttons[token]={message_id:messageId,channel_id:channelId,message,label:label.slice(0,80),emoji};
-          const rows=[];
-          for(const [key,item] of Object.entries(buttons)){
-            if(!item || String(item.message_id)!==String(messageId) || String(item.channel_id)!==String(channelId)) continue;
-            const b=safeEmoji(new ButtonBuilder().setCustomId(`embmsg:${key}`).setLabel(String(item.label||'دکمه').slice(0,80)).setStyle(ButtonStyle.Primary),item.emoji);
-            let row=rows[rows.length-1];
-            if(!row || row.components.length>=5){ row=new ActionRowBuilder(); rows.push(row); }
-            row.addComponents(b);
-          }
-          await publicMessage.edit({components:rows});
-          await setSettings(interaction.guild.id,{embed_buttons:buttons});
-          return respond(interaction, {content:`✅ دکمه «${label}» اضافه شد.`,flags:MessageFlags.Ephemeral});
-        }catch(err){
-          console.error('embed add submit error:',err);
-          return respond(interaction, {content:`❌ افزودن دکمه انجام نشد.\nدلیل: ${String(err?.message||err).slice(0,500)}`,flags:MessageFlags.Ephemeral}).catch(()=>{});
-        }
-      }
-      if(interaction.customId.startsWith('closemodal:')){ const t=await getTicket(interaction.channel); return closeTicket(interaction,t,interaction.fields.getTextInputValue('reason')); }
-      if(interaction.customId.startsWith('feedbackmodal:')){
-        const [,id,stars]=interaction.customId.split(':'); const text=interaction.fields.getTextInputValue('feedback')||'';
-        await interaction.deferReply({flags:MessageFlags.Ephemeral});
-        const t=(await supabase.from('tickets').select('guild_id,opener_id,claimed_by,status').eq('id',id).maybeSingle()).data;
-        if(!t || t.status!=='closed' || interaction.user.id!==t.opener_id) return interaction.editReply({content:'این Feedback معتبر نیست.'});
-        const {error:feedbackError}=await supabase.from('ticket_feedback').update({text}).eq('ticket_id',id).eq('user_id',interaction.user.id).eq('stars',Number(stars));
-        if(feedbackError) console.error('feedback save error:',feedbackError);
-        const g=client.guilds.cache.get(t.guild_id);
-        if(g){
-          await logTo(g,'ticket_feedback_channel',`⭐ Feedback | ${interaction.user.tag} | ${stars}/5 | ${text||'بدون متن'}`);
-          const s=await getSettings(g.id), fb=s.ticket_feedback_channel && g.channels.cache.get(s.ticket_feedback_channel);
-          if(fb?.isTextBased()){
-            const owner=await g.members.fetch(t.opener_id).catch(()=>null);
-            const claimer=t.claimed_by ? await g.members.fetch(t.claimed_by).catch(()=>null) : null;
-            const embed=new EmbedBuilder().setTitle('⭐ Ticket Rating').addFields(
-              {name:'Rating',value:`${stars}/5 ⭐`,inline:true},
-              {name:'Ticket Owner',value:owner?`${owner} (${displayUser(owner)})`:`<@${t.opener_id}>`,inline:true},
-              {name:'Claimed By',value:claimer?`${claimer} (${displayUser(claimer)})`:t.claimed_by?`<@${t.claimed_by}>`:'Not claimed',inline:true},
-              {name:'Feedback',value:text||'No comment',inline:false}
-            ).setTimestamp();
-            await fb.send({embeds:[embed],allowedMentions:{parse:[]}}).catch(err=>console.error('rating log error:',err));
-          }
-        }
-        return interaction.editReply({content:'ممنون بابت Feedback ❤️'});
-      }
-      if(interaction.customId.startsWith('ticketform:')){
-        const parts=interaction.customId.split(':');
-        const panel=(await supabase.from('ticket_panels').select('*').eq('id',parts[1]).maybeSingle()).data;
-        if(!panel) return respond(interaction, {content:'Panel پیدا نشد.',flags:MessageFlags.Ephemeral});
-        panel._typeIndex=Number(parts[2])||0;
-        const answers={}; for(let i=0;i<5;i++){ try{answers[`q${i}`]=interaction.fields.getTextInputValue(`q${i}`);}catch{} }
-        return createTicket(interaction,panel,answers);
-      }
-      if(interaction.customId==='exchange'){
-        const banner=interaction.fields.getTextInputValue('banner');
-        await interaction.deferReply({flags:MessageFlags.Ephemeral});
-        const settings=await getSettings(interaction.guild.id);
-        const logChannelId=String(settings.exchange_log_channel || EXCHANGE_LOG_CHANNEL_ID || '').trim();
-        if(!logChannelId) return interaction.editReply({content:'❌ Exchange Log تنظیم نشده. /setexlog را تنظیم کنید یا EXCHANGE_LOG_CHANNEL_ID را در Railway قرار دهید.'});
-        const logChannel=interaction.guild.channels.cache.get(logChannelId) || await interaction.guild.channels.fetch(logChannelId).catch(()=>null);
-        if(!logChannel?.isTextBased()) return interaction.editReply({content:'❌ کانال Exchange Log معتبر نیست. ID کانال را بررسی کنید.'});
-        const {data:e,error:eError}=await supabase.from('exchange_requests').insert({guild_id:interaction.guild.id,user_id:interaction.user.id,banner,status:'pending'}).select().single();
-        if(eError || !e) { console.error('exchange insert error:',eError); return interaction.editReply({content:'❌ درخواست Exchange ذخیره نشد. تنظیمات Supabase را بررسی کنید.'}); }
-        const accessRoles=await getAccessRoleIds(interaction.guild.id);
-        const exchangeRoleId=String(accessRoles.exchange || '1550650257841328148');
-        const logMentionUsers=await resolveExchangeLogMentions(interaction.guild);
-        const mentions=[exchangeRoleId ? `<@&${exchangeRoleId}>` : '', ...logMentionUsers.map(id=>`<@${id}>`)].filter(Boolean).join(' ');
-        const row=new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(`exapprove:${e.id}`).setLabel('ACCEPT').setStyle(ButtonStyle.Success),
-          new ButtonBuilder().setCustomId(`exreject:${e.id}`).setLabel('DECLINE').setStyle(ButtonStyle.Danger)
-        );
-        try{
-          await logChannel.send({content:`${mentions}\n📥 **Exchange Request**\nUser: <@${interaction.user.id}>\n\n${banner}`,components:[row],allowedMentions:{users:[...new Set([...logMentionUsers, interaction.user.id])],roles:exchangeRoleId?[exchangeRoleId]:[],parse:[]}});
-        }catch(err){
-          console.error('exchange log send error:',err);
-          await supabase.from('exchange_requests').delete().eq('id',e.id);
-          return interaction.editReply({content:`❌ ارسال فرم به Exchange Log انجام نشد: ${err?.message || err}`});
-        }
-        return interaction.editReply({content:'فرم Exchange به Exchange Log ارسال شد و منتظر تایید است.'});
-      }
-    }
-    if(!interaction.isChatInputCommand()) return;
-    const {commandName}=interaction;
-    const guild=interaction.guild;
-    // /exchange is public and must open its modal immediately. Do not perform
-    // Supabase/settings work before showModal(), or a slow database response
-    // can consume Discord's interaction window and make the form fail to open.
-    if(commandName==='exchange'){
-      const modal=new ModalBuilder().setCustomId('exchange').setTitle('Exchange Form').addComponents(
-        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('banner').setLabel('اطلاعات / بنر اکسچنج').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(4000))
-      );
-      return interaction.showModal(modal).catch(err=>{
-        console.error('exchange modal error:',err);
-        return respond(interaction,{content:'❌ باز کردن فرم Exchange انجام نشد. دوباره تلاش کنید.',flags:MessageFlags.Ephemeral}).catch(()=>{});
-      });
-    }
-    // Modal-opening commands must be acknowledged with showModal(), not deferReply().
-    const opensModalCommand = commandName==='close';
-    if(guild && !opensModalCommand && !interaction.deferred && !interaction.replied) await interaction.deferReply();
-    if(guild) { await ensureRoles(guild); await saveDefaultAccessRoleIds(guild.id); }
-    const ownerOnlyCommand = ['embed'].includes(commandName);
-    const highRankConfigCommands = ['setlevelrole','clearlevelrole','setaccessrole','clearaccessrole','staffroles'];
-    const staffAction = ACTION_ACCESS[commandName];
-    const owner = isBotOwner(interaction.user.id);
-    if(!PUBLIC_COMMANDS.has(commandName) && !owner && !ownerOnlyCommand && !staffAction && !highRankConfigCommands.includes(commandName)){
-      return respond(interaction, {content:'⛔ شما دسترسی استفاده از این دستور را ندارید.',flags:MessageFlags.Ephemeral});
-    }
-    if(ownerOnlyCommand && !owner){
-      return respond(interaction, {content:'⛔ فقط Owner می‌تواند از این دستور استفاده کند.',flags:MessageFlags.Ephemeral});
-    }
-    if(staffAction && !owner && !PUBLIC_COMMANDS.has(commandName)){
-      const accessCheck=await staffPermission(interaction.member,guild.id,commandName);
-      if(!accessCheck.ok) return respond(interaction, {content:accessCheck.reason,flags:MessageFlags.Ephemeral});
-    }
-    if(highRankConfigCommands.includes(commandName) && !owner){
-      const accessCheck=await staffPermission(interaction.member,guild.id,'highrank');
-      if(!accessCheck.ok) return respond(interaction, {content:accessCheck.reason,flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='setlevelrole'){
-      const level=interaction.options.getInteger('level',true);
-      const role=interaction.options.getRole('role',true);
-      const roles=await getLevelRoleIds(guild.id);
-      roles[String(level)]=role.id;
-      await setSettings(guild.id,{staff_level_roles:roles});
-      return respond(interaction, {content:`✅ Staff Level **${level}** روی ${role} تنظیم شد.`,flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='clearlevelrole'){
-      const level=interaction.options.getInteger('level',true);
-      const roles=await getLevelRoleIds(guild.id);
-      roles[String(level)]=null;
-      await setSettings(guild.id,{staff_level_roles:roles});
-      return respond(interaction, {content:`✅ Staff Level **${level}** پاک شد.`,flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='setaccessrole'){
-      const access=interaction.options.getString('access',true);
-      const role=interaction.options.getRole('role',true);
-      const roles=await getAccessRoleIds(guild.id);
-      roles[access]=role.id;
-      await setSettings(guild.id,{access_roles:roles});
-      return respond(interaction, {content:`✅ Access Role **${access}** روی ${role} تنظیم شد.`,flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='clearaccessrole'){
-      const access=interaction.options.getString('access',true);
-      const roles=await getAccessRoleIds(guild.id);
-      roles[access]=null;
-      await setSettings(guild.id,{access_roles:roles});
-      return respond(interaction, {content:`✅ Access Role **${access}** پاک شد. از این لحظه هیچ Staff غیر-Owner به این قابلیت دسترسی ندارد.`,flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='staffroles'){
-      const levels=await getLevelRoleIds(guild.id), accesses=await getAccessRoleIds(guild.id);
-      const levelText=Array.from({length:10},(_,i)=>{const n=i+1; return `**Level ${n}:** ${levels[n] ? `<@&${levels[n]}>` : 'تنظیم نشده'}`;}).join('\n');
-      const accessLabels={ban_kick:'Ban / Kick',highrank:'High Rank',giveaway:'Giveaway / Drop',exchange:'Exchange',logs:'Logs',timeout:'Timeout',ticket_support:'Ticket Support'};
-      const accessText=Object.entries(accessLabels).map(([k,v])=>`**${v}:** ${accesses[k] ? `<@&${accesses[k]}>` : 'تنظیم نشده'}`).join('\n');
-      const embed=new EmbedBuilder().setTitle('🛡️ Staff Roles').addFields({name:'Staff Levels',value:levelText},{name:'Access Roles',value:accessText});
-      return respond(interaction, {embeds:[embed],flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='setwelcome'){
-      if(!isBotOwner(interaction.user.id)){
-        return respond(interaction, {content:'⛔ فقط Owner بات می‌تواند کانال خوشامدگویی را تنظیم کند.',flags:MessageFlags.Ephemeral});
-      }
-      const channel=interaction.options.getChannel('channel',true);
-      const {error}=await setSettings(guild.id,{welcome_channel:channel.id});
-      if(error){
-        console.error('setwelcome error:',error);
-        return respond(interaction, {content:`❌ ذخیره کانال خوشامدگویی انجام نشد: ${error.message||error}`,flags:MessageFlags.Ephemeral});
-      }
-      return respond(interaction, {content:`✅ کانال خوشامدگویی روی ${channel} تنظیم شد.`,flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='banch'){
-      if(!(await staffPermission(interaction.member,guild.id,'banch')).ok) return respond(interaction, {content:'⛔ رول Ban/Kick و سطح Staff مناسب لازم است.',flags:MessageFlags.Ephemeral});
-      const member=interaction.options.getMember('user');
-      if(!member) return respond(interaction, {content:'❌ ممبر پیدا نشد.',flags:MessageFlags.Ephemeral});
-      const accessRoles=await getAccessRoleIds(guild.id);
-      const role=guild.roles.cache.get(BANCH_TARGET_ROLE_ID);
-      if(!role) return respond(interaction, {content:'❌ رول مقصد Ban CH پیدا نشد.',flags:MessageFlags.Ephemeral});
-      const hierarchyCheck=await staffPermission(interaction.member,guild.id,'banch',member); if(!hierarchyCheck.ok) return respond(interaction, {content:hierarchyCheck.reason,flags:MessageFlags.Ephemeral});
-      if(member.id===interaction.user.id) return respond(interaction, {content:'❌ نمی‌توانی رول Ban CH را به خودت بدهی.',flags:MessageFlags.Ephemeral});
-      if(member.id===guild.ownerId) return respond(interaction, {content:'❌ نمی‌توانی به Owner سرور این رول را بدهی.',flags:MessageFlags.Ephemeral});
-      if(role.position>=guild.members.me.roles.highest.position) return respond(interaction, {content:'❌ رول مقصد باید پایین‌تر از بالاترین رول بات باشد.',flags:MessageFlags.Ephemeral});
-      if(member.roles.highest.position>=guild.members.me.roles.highest.position) return respond(interaction, {content:'❌ رول بالاترین این کاربر با رول بات برابر یا بالاتر است.',flags:MessageFlags.Ephemeral});
-      const result=await member.roles.add(role,'Ban CH command').catch(e=>e);
-      if(result instanceof Error) return respond(interaction, {content:`❌ دادن رول انجام نشد: ${result.message}`,flags:MessageFlags.Ephemeral});
-      return respond(interaction, {content:`✅ رول ${role} به ${member} داده شد.`});
-    }
-    if(commandName==='rerole'){
-      if(!isBotOwner(interaction.user.id) && !(await staffPermission(interaction.member,guild.id,'rerole')).ok) return respond(interaction, {content:'⛔ رول Giveaway و سطح Staff مناسب لازم است.',flags:MessageFlags.Ephemeral});
-      if(!interaction.channel?.isTextBased()) return respond(interaction, {content:'❌ این دستور باید داخل کانال متنی اجرا شود.',flags:MessageFlags.Ephemeral});
-      const {data:g,error:gError}=await supabase.from('giveaways').select('*').eq('guild_id',guild.id).eq('channel_id',interaction.channel.id).eq('ended',true).order('end_at',{ascending:false}).limit(1).maybeSingle();
-      if(gError || !g) return respond(interaction, {content:'❌ در این چنل Giveaway تمام‌شده‌ای پیدا نشد.',flags:MessageFlags.Ephemeral});
-      const {data:entries,error:entryError}=await supabase.from('giveaway_entries').select('user_id').eq('giveaway_id',g.id);
-      if(entryError) return respond(interaction, {content:'❌ خواندن شرکت‌کننده‌ها از دیتابیس انجام نشد.',flags:MessageFlags.Ephemeral});
-      const users=[...new Set((entries||[]).map(x=>String(x.user_id)).filter(Boolean))];
-      if(users.length<2) return respond(interaction, {content:'❌ برای انتخاب یک برنده جدید حداقل ۲ شرکت‌کننده لازم است.',flags:MessageFlags.Ephemeral});
-      const candidates=users.filter(u=>String(u)!==String(g.winner_id));
-      const winner=(candidates.length?candidates:users)[Math.floor(Math.random()*(candidates.length?candidates:users).length)];
-      const {data:updated,error:updateError}=await supabase.from('giveaways').update({winner_id:winner}).eq('id',g.id).eq('ended',true).select('id').maybeSingle();
-      if(updateError || !updated) return respond(interaction, {content:'❌ ذخیره برنده جدید انجام نشد.',flags:MessageFlags.Ephemeral});
-      await interaction.channel.send({content:`🔄 **Giveaway Reroll**
-🎁 جایزه: **${g.prize}**
-🏆 برنده جدید: <@${winner}>`,allowedMentions:{users:[winner],parse:[]}});
-      await logTo(guild,'giveaway_winner_log_channel',`🔄 Giveaway Reroll | prize=${g.prize} | winner=${winner} | توسط ${interaction.user.tag}`);
-      return respond(interaction, {content:`✅ برنده جدید انتخاب شد: <@${winner}>`,flags:MessageFlags.Ephemeral,allowedMentions:{users:[winner]}});
-    }
-    if(commandName==='embed'){
-      if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'⛔ فقط Owner می‌تواند Embed بسازد.',flags:MessageFlags.Ephemeral});
-      const title=interaction.options.getString('title')||'';
-      const description=interaction.options.getString('description')||'';
-      const embed=new EmbedBuilder();
-      if(title) embed.setTitle(title.slice(0,256));
-      if(description) embed.setDescription(description.slice(0,4096));
-      const publicMessage=await interaction.channel.send({embeds:[embed]});
-      const addRow=new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`embedadd:${interaction.channelId}:${publicMessage.id}`).setLabel('➕ افزودن دکمه').setStyle(ButtonStyle.Primary));
-      return respond(interaction, {content:'✅ Embed ساخته شد. از دکمه زیر برای اضافه‌کردن دکمه استفاده کن.',components:[addRow],flags:MessageFlags.Ephemeral});
-    }
-    if(['giveaway','giveawaysv','dropmatn','dropclick'].includes(commandName)){
-      // Authorized IDs/owners may use giveaway management directly; otherwise
-      // the dedicated giveaway access role is required. This keeps the command
-      // protected without locking out configured bot owners.
-      if(!isBotOwner(interaction.user.id) && !(await staffPermission(interaction.member,guild.id,'giveaway')).ok) {
-        return respond(interaction, {content:'⛔ شما دسترسی ساخت Giveaway را ندارید.',flags:MessageFlags.Ephemeral});
-      }
-      if(commandName==='giveaway'||commandName==='giveawaysv'){
-        const prize=interaction.options.getString('prize'), minutes=duration(interaction.options.getInteger('minutes'));
-        if(!minutes) return respond(interaction, {content:'❌ مدت زمان باید بیشتر از صفر دقیقه باشد.',flags:MessageFlags.Ephemeral});
-        const link=commandName==='giveawaysv'?interaction.options.getString('link'):null;
-        if(link){ try{ new URL(link); }catch{ return respond(interaction, {content:'❌ لینک واردشده معتبر نیست.',flags:MessageFlags.Ephemeral}); } }
-        if(!interaction.channel?.isTextBased()) return respond(interaction, {content:'❌ این دستور باید داخل یک کانال متنی اجرا شود.',flags:MessageFlags.Ephemeral});
+    await setSettings(g.id,{ticket:{claimLeaderboardMessageId:message.id,claimLeaderboardLastUpdatedAt:now}})
+      .catch(e=>console.error('[TICKET LEADERBOARD SAVE]',e.message));
+  };
+  // Check frequently so a restart does not reset the six-hour cadence. The actual
+  // update time is persisted in guild settings, and the same Discord message is edited.
+  await updateTicketClaimLeaderboard();
+  addTimer(()=>updateTicketClaimLeaderboard().catch(e=>console.error('[TICKET LEADERBOARD TIMER]',e.message)),60*1000);
+  addTimer(()=>cleanupLogs(logRetentionDays),6*60*60*1000);
+  addTimer(()=>ai.cleanup(aiRetentionDays),6*60*60*1000);
+  addTimer(async()=>{const g=client.guilds.cache.get(guildId);if(!g)return;const cfg=music247.get(guildId);if(cfg){const vc=await g.channels.fetch(cfg.voice_channel_id).catch(()=>null);if(vc?.isVoiceBased())await music.ensure247(g,vc,null).catch(e=>console.error('[247 HEALTH]',e.message));}},20000);
+  addTimer(()=>backupNow(undefined,backupRetention).catch(e=>console.error('[DB BACKUP]',e.message)),24*60*60*1000);
+});
 
-        const payload={guild_id:guild.id,channel_id:interaction.channel.id,prize,duration_minutes:minutes,end_at:new Date(Date.now()+minutes*60000).toISOString(),link};
-        const {data:g,error:gError}=await supabase.from('giveaways').insert(payload).select().single();
-        if(gError || !g) {
-          console.error('giveaway insert error:',gError);
-          const detail=gError?.message ? `\n${gError.message}` : '';
-          return respond(interaction, {content:`❌ ساخت Giveaway در دیتابیس انجام نشد.${detail}`,flags:MessageFlags.Ephemeral});
-        }
-        const row=new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`gw:${g.id}`).setLabel('Joined: 0').setStyle(ButtonStyle.Success));
-        if(link) row.addComponents(new ButtonBuilder().setLabel('باز کردن لینک').setStyle(ButtonStyle.Link).setURL(link));
-        let msg;
-        try{
-          msg=await interaction.channel.send({content:`🎉 **Giveaway**\n🎁 جایزه: **${prize}**\n⏱️ زمان: **${fmt(minutes*60000)}**\n👥 Joined: **0**`,components:[row]});
-        }catch(sendError){
-          console.error('giveaway channel send error:',sendError);
-          await supabase.from('giveaways').delete().eq('id',g.id).catch(()=>{});
-          return respond(interaction, {content:`❌ ارسال Giveaway به کانال انجام نشد. دسترسی Send Messages را بررسی کنید.\n${sendError?.message||''}`,flags:MessageFlags.Ephemeral});
-        }
-        const {error:updateError}=await supabase.from('giveaways').update({message_id:msg.id}).eq('id',g.id);
-        if(updateError) console.error('giveaway message update error:',updateError);
-        await logTo(guild,'giveaway_create_log_channel',`🎉 Giveaway ساخته شد | ${interaction.user.tag} | ${prize}`);
-        return respond(interaction, {content:'✅ Giveaway با موفقیت ساخته شد.',flags:MessageFlags.Ephemeral});
-      }
-      if(commandName==='dropmatn'||commandName==='dropclick'){
-        const target=commandName==='dropmatn'?interaction.options.getString('text'):null;
-         const prize=interaction.options.getString('prize');
-         const {data:d,error:dError}=await supabase.from('drops').insert({guild_id:guild.id,channel_id:interaction.channel.id,kind:commandName==='dropmatn'?'text':'click',target_text:target,prize}).select().single();
-         if(dError || !d) { console.error('drop insert error:', dError); return respond(interaction, {content:'❌ ساخت Drop در دیتابیس انجام نشد.',flags:MessageFlags.Ephemeral}); }
-         const embed=new EmbedBuilder().setTitle('⚡ DROP').setDescription(commandName==='dropmatn'?`اولین کسی که دقیقاً بنویسد:
-**${target}**
-برنده می‌شود!`:'اولین نفری که دکمه را بزند برنده می‌شود!').addFields({name:'🏆 جایزه',value:`**${prize}**`});
-         const row=commandName==='dropclick'?new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`drop:${d.id}`).setLabel('کلیک کن و برنده شو').setStyle(ButtonStyle.Success)):undefined;
-         const msg=await interaction.channel.send({embeds:[embed],components:row?[row]:[]});
-         const {error:dropMsgError}=await supabase.from('drops').update({message_id:msg.id}).eq('id',d.id); if(dropMsgError) console.error('drop message update error:',dropMsgError);
-         await logTo(guild,'drop_create_log_channel',`⚡ Drop ساخته شد | ${interaction.user.tag} | prize=${prize}`); return respond(interaction, {content:'Drop ساخته شد.',flags:MessageFlags.Ephemeral});
-      }
+client.on('guildCreate',async g=>{if(g.id!==guildId){await g.leave().catch(()=>{});return;}await refreshInvites(g)});
+client.on('guildMemberAdd',processMemberAdd);
+client.on('guildMemberRemove',async m=>{
+  try{
+    const result=invites.recordMemberLeave(m.guild.id,m.id);
+    if(result.changed){
+      const data=result.previous;
+      await sendLog(m.guild,'invite',{action:'leave',member:m.user.tag,inviter:`<@${data.inviter_id}>`,fake:!!data.fake,joined_at:data.last_joined_at?`<t:${Math.floor(data.last_joined_at/1000)}:R>`:'unknown'});
+    } else {
+      await sendLog(m.guild,'invite',{action:'leave_unknown',member:m.user.tag});
     }
-    if(commandName==='panel'){
-      const type=interaction.options.getString('type',true);
-      const meta=TICKET_TYPES[type];
-      const name=interaction.options.getString('name') || meta.label;
-      const welcome=interaction.options.getString('welcome') || `سلام [user]، تیکت **${meta.label}** شما ایجاد شد.`;
-      const text=interaction.options.getString('text') || `${meta.emoji} **${meta.label}**\nبرای باز کردن تیکت روی دکمه زیر بزنید.`;
-      const roles=interaction.options.getRole('mention_role');
-      const qs=[1,2,3,4,5].map(i=>interaction.options.getString(`q${i}`)).filter(Boolean);
-      const {data:last}=await supabase.from('ticket_panels').select('panel_number').eq('guild_id',guild.id).order('panel_number',{ascending:false}).limit(1).maybeSingle();
-      const number=Number(last?.panel_number||0)+1;
-      const {data:p,error:pError}=await supabase.from('ticket_panels').insert({guild_id:guild.id,panel_number:number,panel_type:type,name,welcome_text:welcome,description:text,category_id:interaction.options.getChannel('category')?.id||null,mention_roles:roles?[roles.id]:[],claim_enabled:true,close_enabled:true,button_name:'Open Ticket',button_emoji:meta.emoji,claim_emoji:'🎫',close_emoji:'🔒',form_enabled:qs.length>0,form_questions:qs,ticket_types:[{name:meta.label,emoji:meta.emoji,prefix:meta.prefix}]}).select().single();
-      if(pError || !p){ console.error('panel insert error:',pError); return respond(interaction, {content:`❌ ساخت Panel انجام نشد: ${pError?.message||'database error'}`,flags:MessageFlags.Ephemeral}); }
-      const embed=new EmbedBuilder().setTitle(`${meta.emoji} ${name}`.slice(0,256)).setDescription(text.slice(0,4096)).setFooter({text:`Panel #${number} • ${meta.label}`});
-      const msg=await interaction.channel.send({embeds:[embed],components:buildPanelComponents(p)});
-      await supabase.from('ticket_panels').update({channel_id:interaction.channel.id,message_id:msg.id}).eq('id',p.id);
-      return respond(interaction, {content:`✅ Panel #${number} (${meta.label}) ساخته شد.`,flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='addtype'){
-      const num=interaction.options.getInteger('num',true);
-      const name=clean(interaction.options.getString('name',true)).slice(0,80);
-      const emoji=interaction.options.getString('emoji') || '🎫';
-      const prefix=slugifyTicketType(interaction.options.getString('prefix') || name);
-      const {data:p,error:pLoadError}=await loadPanelByNumber(guild.id,num);
-      if(pLoadError) return respond(interaction, {content:`❌ خواندن Panel انجام نشد: ${pLoadError.message}`,flags:MessageFlags.Ephemeral});
-      if(!p) return respond(interaction, {content:`❌ Panel #${num} پیدا نشد. ابتدا /panels را اجرا کنید.`,flags:MessageFlags.Ephemeral});
-      const types=getPanelTypes(p);
-      if(types.length>=25) return respond(interaction, {content:'❌ حداکثر 25 نوع تیکت برای هر پنل است.',flags:MessageFlags.Ephemeral});
-      if(types.some(t=>String(t.name).toLowerCase()===name.toLowerCase())) return respond(interaction, {content:'❌ این نوع تیکت قبلاً در پنل وجود دارد.',flags:MessageFlags.Ephemeral});
-      types.push({name,emoji,prefix});
-      const {data:updated,error}=await savePanelTypes(p,types);
-      if(error) return respond(interaction, {content:`❌ افزودن نوع تیکت انجام نشد: ${error.message}`,flags:MessageFlags.Ephemeral});
-      await refreshTicketPanelMessage(guild,updated);
-      return respond(interaction, {content:`✅ «${name}» به Panel #${num} اضافه شد.`,flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='edittype'){
-      const num=interaction.options.getInteger('num',true), index=interaction.options.getInteger('index',true)-1;
-      const {data:p,error:pLoadError}=await loadPanelByNumber(guild.id,num);
-      if(pLoadError) return respond(interaction, {content:`❌ خواندن Panel انجام نشد: ${pLoadError.message}`,flags:MessageFlags.Ephemeral});
-      if(!p) return respond(interaction, {content:`❌ Panel #${num} پیدا نشد. ابتدا /panels را اجرا کنید.`,flags:MessageFlags.Ephemeral});
-      const types=getPanelTypes(p); if(index<0 || index>=types.length) return respond(interaction, {content:'❌ شماره نوع تیکت معتبر نیست.',flags:MessageFlags.Ephemeral});
-      const old={...types[index]}; const name=interaction.options.getString('name'); const emoji=interaction.options.getString('emoji'); const removeEmoji=interaction.options.getBoolean('remove_emoji')||false; const prefixInput=interaction.options.getString('prefix');
-      if(name!==null) old.name=clean(name).slice(0,80);
-      if(emoji!==null) old.emoji=emoji;
-      if(removeEmoji) old.emoji='';
-      if(prefixInput!==null) old.prefix=slugifyTicketType(prefixInput);
-      else if(name!==null) old.prefix=slugifyTicketType(name);
-      if(!old.name) return respond(interaction, {content:'❌ نام نوع تیکت نمی‌تواند خالی باشد.',flags:MessageFlags.Ephemeral});
-      types[index]=old;
-      if(types.some((t,i)=>i!==index && String(t.name).toLowerCase()===String(old.name).toLowerCase())) return respond(interaction, {content:'❌ این نام تیکت قبلاً وجود دارد.',flags:MessageFlags.Ephemeral});
-      const {data:updated,error}=await savePanelTypes(p,types);
-      if(error) return respond(interaction, {content:`❌ ویرایش نوع تیکت انجام نشد: ${error.message}`,flags:MessageFlags.Ephemeral});
-      await refreshTicketPanelMessage(guild,updated);
-      return respond(interaction, {content:`✅ نوع تیکت شماره ${index+1} در Panel #${num} ویرایش شد.`,flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='listtypes'){
-      const num=interaction.options.getInteger('num',true);
-      const {data:p,error:pLoadError}=await loadPanelByNumber(guild.id,num);
-      if(pLoadError) return respond(interaction, {content:`❌ خواندن Panel انجام نشد: ${pLoadError.message}`,flags:MessageFlags.Ephemeral});
-      if(!p) return respond(interaction, {content:`❌ Panel #${num} پیدا نشد. ابتدا /panels را اجرا کنید.`,flags:MessageFlags.Ephemeral});
-      const types=getPanelTypes(p);
-      const lines=types.map((t,i)=>`${i+1}. ${t.emoji||'▫️'} **${t.name}** — prefix: \`${slugifyTicketType(t.prefix||t.name)}\``);
-      return respond(interaction, {content:`🎫 **Panel #${num} — Ticket Types**\n${lines.join('\n')}\n\nتعداد: ${types.length}`,flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='deltype'){
-      const num=interaction.options.getInteger('num',true), index=interaction.options.getInteger('index',true)-1;
-      const {data:p,error:pLoadError}=await loadPanelByNumber(guild.id,num);
-      if(pLoadError) return respond(interaction, {content:`❌ خواندن Panel انجام نشد: ${pLoadError.message}`,flags:MessageFlags.Ephemeral});
-      if(!p) return respond(interaction, {content:`❌ Panel #${num} پیدا نشد. ابتدا /panels را اجرا کنید.`,flags:MessageFlags.Ephemeral});
-      const types=getPanelTypes(p); if(index<0 || index>=types.length) return respond(interaction, {content:'❌ شماره نوع تیکت معتبر نیست.',flags:MessageFlags.Ephemeral});
-      if(types.length===1) return respond(interaction, {content:'❌ نمی‌توان آخرین نوع تیکت پنل را حذف کرد. ابتدا نوع دیگری اضافه کنید.',flags:MessageFlags.Ephemeral});
-      const removed=types.splice(index,1)[0];
-      const {data:updated,error}=await savePanelTypes(p,types);
-      if(error) return respond(interaction, {content:`❌ حذف نوع تیکت انجام نشد: ${error.message}`,flags:MessageFlags.Ephemeral});
-      await refreshTicketPanelMessage(guild,updated);
-      return respond(interaction, {content:`✅ «${removed.name}» از Panel #${num} حذف شد.`,flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='reordertypes'){
-      const num=interaction.options.getInteger('num',true); const order=interaction.options.getString('order',true).split(',').map(x=>Number(x.trim()));
-      const {data:p,error:pLoadError}=await loadPanelByNumber(guild.id,num);
-      if(pLoadError) return respond(interaction, {content:`❌ خواندن Panel انجام نشد: ${pLoadError.message}`,flags:MessageFlags.Ephemeral});
-      if(!p) return respond(interaction, {content:`❌ Panel #${num} پیدا نشد. ابتدا /panels را اجرا کنید.`,flags:MessageFlags.Ephemeral});
-      const types=getPanelTypes(p);
-      if(order.length!==types.length || new Set(order).size!==types.length || order.some(n=>n<1||n>types.length)) return respond(interaction, {content:`❌ ترتیب باید دقیقاً شامل شماره‌های 1 تا ${types.length} باشد؛ مثال: ${types.map((_,i)=>i+1).join(',')}`,flags:MessageFlags.Ephemeral});
-      const reordered=order.map(n=>types[n-1]);
-      const {data:updated,error}=await savePanelTypes(p,reordered);
-      if(error) return respond(interaction, {content:`❌ تغییر ترتیب انجام نشد: ${error.message}`,flags:MessageFlags.Ephemeral});
-      await refreshTicketPanelMessage(guild,updated);
-      return respond(interaction, {content:`✅ ترتیب انواع Panel #${num} تغییر کرد.`,flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='delpanel'){
-      const num=interaction.options.getInteger('num',true);
-      const {data:p,error:pLoadError}=await loadPanelByNumber(guild.id,num);
-      if(pLoadError) return respond(interaction, {content:`❌ خواندن Panel انجام نشد: ${pLoadError.message}`,flags:MessageFlags.Ephemeral});
-      if(!p) return respond(interaction, {content:`❌ Panel #${num} پیدا نشد. ابتدا /panels را اجرا کنید.`,flags:MessageFlags.Ephemeral});
-      if(p.channel_id && p.message_id){ const ch=guild.channels.cache.get(p.channel_id); const msg=ch?await ch.messages.fetch(p.message_id).catch(()=>null):null; if(msg) await msg.delete().catch(()=>{}); }
-      const {error}=await supabase.from('ticket_panels').delete().eq('id',p.id).eq('guild_id',guild.id); if(error) return respond(interaction, {content:`❌ حذف Panel انجام نشد: ${error.message}`,flags:MessageFlags.Ephemeral});
-      return respond(interaction, {content:`✅ Panel #${num} کاملاً حذف شد.`,flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='editpanel'){
-      const num=interaction.options.getInteger('num',true);
-      const {data:p,error:pLoadError}=await loadPanelByNumber(guild.id,num);
-      if(pLoadError) return respond(interaction, {content:`❌ خواندن Panel انجام نشد: ${pLoadError.message}`,flags:MessageFlags.Ephemeral});
-      if(!p) return respond(interaction, {content:`❌ Panel #${num} پیدا نشد. ابتدا /panels را اجرا کنید.`,flags:MessageFlags.Ephemeral});
-      const patch={};
-      for(const k of ['name','text','welcome']){
-        const v=interaction.options.getString(k); if(v!==null) patch[k==='text'?'description':k==='welcome'?'welcome_text':'name']=v;
-      }
-      const type=interaction.options.getString('type'); if(type) { patch.panel_type=type; patch.ticket_types=[{name:TICKET_TYPES[type].label,emoji:TICKET_TYPES[type].emoji,prefix:TICKET_TYPES[type].prefix}]; }
-      const cat=interaction.options.getChannel('category'); if(cat) patch.category_id=cat.id;
-      const role=interaction.options.getRole('mention_role'); if(role) patch.mention_roles=[role.id];
-      if(!Object.keys(patch).length) return respond(interaction, {content:'هیچ تغییری وارد نشده است.',flags:MessageFlags.Ephemeral});
-      const {data:updated,error}=await supabase.from('ticket_panels').update(patch).eq('id',p.id).select().single();
-      if(error) return respond(interaction, {content:`❌ ویرایش Panel انجام نشد: ${error.message}`,flags:MessageFlags.Ephemeral});
-      if(updated.channel_id && updated.message_id){ const ch=guild.channels.cache.get(updated.channel_id); const msg=ch?await ch.messages.fetch(updated.message_id).catch(()=>null):null; if(msg){ const meta=TICKET_TYPES[updated.panel_type]||{}; const embed=new EmbedBuilder().setTitle(`${meta.emoji||'🎫'} ${updated.name}`.slice(0,256)).setDescription(String(updated.description||'برای باز کردن تیکت روی دکمه زیر بزنید.').slice(0,4096)).setFooter({text:`Panel #${num}`}); await msg.edit({embeds:[embed],components:buildPanelComponents(updated)}).catch(()=>{}); } }
-      return respond(interaction, {content:`✅ Panel #${num} ویرایش شد.`,flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='panels'){
-      const {data:panels}=await supabase.from('ticket_panels').select('panel_number,name,panel_type,channel_id').eq('guild_id',guild.id).order('panel_number',{ascending:true});
-      return respond(interaction, {content:(panels||[]).map(p=>`#${p.panel_number} — ${panelLabel(p)} — ${p.name} — ${p.channel_id?`<#${p.channel_id}>`:'no channel'}`).join('\n')||'هیچ Panelی وجود ندارد.',flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='allpanel'){
-      const channel=interaction.options.getChannel('channel')||interaction.channel;
-      const {data:panels}=await supabase.from('ticket_panels').select('*').eq('guild_id',guild.id).order('panel_number',{ascending:true});
-      const entries=[];
-      for(const p of panels||[]) for(let i=0;i<getPanelTypes(p).length;i++){
-        const t=getPanelTypes(p)[i]; entries.push({label:String(t.name).slice(0,100),value:`${p.id}:${i}`,description:`Panel #${p.panel_number} • ${String(t.name).slice(0,70)}`,...(t.emoji ? {emoji:t.emoji} : {})});
-      }
-      if(!entries.length) return respond(interaction, {content:'❌ ابتدا حداقل یک Panel بسازید.',flags:MessageFlags.Ephemeral});
-      if(entries.length>25) return respond(interaction, {content:`❌ All-in-one Menu حداکثر 25 گزینه دارد. الان ${entries.length} نوع تیکت دارید.`,flags:MessageFlags.Ephemeral});
-      const menu=new StringSelectMenuBuilder().setCustomId('ticketmenu').setPlaceholder(interaction.options.getString('placeholder')||'نوع تیکت را انتخاب کنید').addOptions(entries);
-      const embed=new EmbedBuilder().setTitle(interaction.options.getString('name')||'🎫 Ticket Menu').setDescription(interaction.options.getString('text')||'نوع تیکت موردنظر را انتخاب کنید.');
-      const msg=await channel.send({embeds:[embed],components:[new ActionRowBuilder().addComponents(menu)]});
-      await setSettings(guild.id,{ticket_all_in_one_channel:channel.id,ticket_all_in_one_message:msg.id});
-      return respond(interaction, {content:`✅ All-in-one Ticket menu ساخته شد: ${channel}`,flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='claim'){ const t=await getTicket(interaction.channel); if(!t) return respond(interaction, {content:'Ticket نیست.',flags:MessageFlags.Ephemeral}); if(!(await staffPermission(interaction.member,guild.id,'claim')).ok) return respond(interaction, {content:'⛔ رول Ticket Support برای این کار لازم است.',flags:MessageFlags.Ephemeral}); return claimTicket(interaction,t); }
-    if(commandName==='claimchange'){
-      const t=await getTicket(interaction.channel); if(!t) return respond(interaction, {content:'دسترسی یا Ticket ندارید.',flags:MessageFlags.Ephemeral});
-      if(!(await staffPermission(interaction.member,guild.id,'claim')).ok) return respond(interaction, {content:'⛔ رول Ticket Support برای این کار لازم است.',flags:MessageFlags.Ephemeral}); const u=interaction.options.getUser('user');
-      const targetMember=await guild.members.fetch(u.id).catch(()=>null);
-      if(!targetMember || (await getStaffLevel(targetMember,guild.id))<1) return respond(interaction, {content:'❌ مسئول جدید باید حداقل یک Staff Level داشته باشد تا بتواند Ticket را مدیریت کند.',flags:MessageFlags.Ephemeral});
-      const {error:claimChangeError}=await supabase.from('tickets').update({claimed_by:u.id}).eq('id',t.id);
-      if(claimChangeError) return respond(interaction, {content:`❌ تغییر Claim انجام نشد: ${claimChangeError.message}`,flags:MessageFlags.Ephemeral});
-      const {error:claimHistoryError}=await supabase.from('ticket_claim_history').insert({ticket_id:t.id,guild_id:guild.id,user_id:u.id,action:'claimchange',changed_by:interaction.user.id});
-      if(claimHistoryError) console.error('ticket claim history error:',claimHistoryError?.message||claimHistoryError);
-      const claimText=`🔄 Claim تغییر کرد | ${interaction.channel.name} | مسئول جدید: ${u.tag||u.username} (<@${u.id}>) | توسط ${interaction.user.tag}`;
-      await logTo(guild,'ticket_log_channel',claimText);
-      const settings=await getSettings(guild.id);
-      const logId=settings.ticket_log_channel;
-      const logChannel=logId ? (guild.channels.cache.get(logId)||await guild.channels.fetch(logId).catch(()=>null)) : null;
-      if(logChannel?.isTextBased()) await logChannel.send({content:claimText,allowedMentions:{users:[]}}).catch(err=>console.error('ticket claim-change discord log error:',err?.message||err));
-      return respond(interaction, {content:`Claim به <@${u.id}> منتقل شد.`,allowedMentions:{users:[u.id]}});
-    }
-    if(commandName==='add'||commandName==='remove'){
-      const t=await getTicket(interaction.channel); if(!t) return respond(interaction, {content:'دسترسی یا Ticket ندارید.',flags:MessageFlags.Ephemeral});
-      if(!(await staffPermission(interaction.member,guild.id,'claim')).ok) return respond(interaction, {content:'⛔ رول Ticket Support برای این کار لازم است.',flags:MessageFlags.Ephemeral}); const u=interaction.options.getUser('user');
-      if(commandName==='add'){ await interaction.channel.permissionOverwrites.edit(u.id,{ViewChannel:true,SendMessages:true,ReadMessageHistory:true}); await supabase.from('ticket_members').upsert({ticket_id:t.id,user_id:u.id,added_by:interaction.user.id}); return respond(interaction, {content:`<@${u.id}> به Ticket اضافه شد.`,allowedMentions:{users:[u.id]}}); }
-      await interaction.channel.permissionOverwrites.delete(u.id).catch(()=>{}); await supabase.from('ticket_members').delete().eq('ticket_id',t.id).eq('user_id',u.id); return respond(interaction, {content:`<@${u.id}> از Ticket حذف شد.`,allowedMentions:{users:[u.id]}});
-    }
-    if(commandName==='close'){ const t=await getTicket(interaction.channel); if(!t) return respond(interaction, {content:'Ticket نیست.',flags:MessageFlags.Ephemeral}); if(!(await staffPermission(interaction.member,guild.id,'close')).ok) return respond(interaction, {content:'⛔ رول Ticket Support برای این کار لازم است.',flags:MessageFlags.Ephemeral}); if(t.status!=='open') return respond(interaction, {content:'این Ticket قبلاً بسته شده.',flags:MessageFlags.Ephemeral}); const modal=new ModalBuilder().setCustomId(`closemodal:${t.id}`).setTitle('بستن تیکت').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('reason').setLabel('دلیل بستن').setStyle(TextInputStyle.Paragraph).setRequired(false))); return await interaction.showModal(modal); }
-    if(commandName==='reopen'){
-      const t=await getTicket(interaction.channel); if(!t) return respond(interaction, {content:'دسترسی یا Ticket ندارید.',flags:MessageFlags.Ephemeral});
-      if(!(await staffPermission(interaction.member,guild.id,'claim')).ok) return respond(interaction, {content:'⛔ رول Ticket Support برای این کار لازم است.',flags:MessageFlags.Ephemeral});
-      if(t.status!=='closed') return respond(interaction, {content:'این Ticket قبلاً باز است.',flags:MessageFlags.Ephemeral});
-      const {error}=await supabase.from('tickets').update({status:'open',closed_at:null}).eq('id',t.id).eq('status','closed'); if(error) return respond(interaction, {content:`❌ باز کردن Ticket انجام نشد: ${error.message}`,flags:MessageFlags.Ephemeral});
-      const ticketRole=interaction.guild.roles.cache.find(r=>r.name===TICKET_SUPPORT_ROLE); await interaction.channel.permissionOverwrites.edit(t.opener_id,{ViewChannel:true,SendMessages:true,ReadMessageHistory:true}); if(ticketRole) await interaction.channel.permissionOverwrites.edit(ticketRole.id,{ViewChannel:true,SendMessages:true,ReadMessageHistory:true});
-      await interaction.channel.send({content:`🔓 <@&${ticketRole?.id||'0'}> <@${t.opener_id}> Ticket دوباره باز شد.`,allowedMentions:{users:[t.opener_id],roles:ticketRole?[ticketRole.id]:[]}}); return respond(interaction, {content:'Ticket دوباره باز شد.',flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='stats'){ if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral}); await setSettings(guild.id,{stats_channel:interaction.channel.id}); return respond(interaction, {content:'این چنل برای گزارش Claim ذخیره شد.',flags:MessageFlags.Ephemeral}); }
-
-    if(['setfosh','deletefosh','whiteuser'].includes(commandName)){
-      if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral});
-      if(commandName==='setfosh'){ for(const w of interaction.options.getString('words').split(',').map(x=>x.trim().toLowerCase()).filter(Boolean)) await supabase.from('profanity_words').upsert({guild_id:guild.id,word:w}); }
-      if(commandName==='deletefosh'){ for(const w of interaction.options.getString('words').split(',').map(x=>x.trim().toLowerCase()).filter(Boolean)) await supabase.from('profanity_words').delete().eq('guild_id',guild.id).eq('word',w); }
-      if(commandName==='whiteuser'){ const u=interaction.options.getUser('user'); await supabase.from('profanity_whitelist').upsert({guild_id:guild.id,user_id:u.id}); }
-      return respond(interaction, {content:'تنظیمات فحش انجام شد.',flags:MessageFlags.Ephemeral});
-    }
-    if(['kick','ban','timeout','warn'].includes(commandName)){
-      if(commandName==='warn' && !isBotOwner(interaction.user.id)) return respond(interaction, {content:'⛔ فقط Owner می‌تواند Warn بدهد.',flags:MessageFlags.Ephemeral});
-      const m=interaction.options.getMember('user'), reason=interaction.options.getString('reason')||'بدون دلیل'; if(!m) return respond(interaction, {content:'ممبر پیدا نشد.',flags:MessageFlags.Ephemeral});
-      if(['kick','ban','timeout'].includes(commandName)){
-        const accessCheck=await staffPermission(interaction.member,guild.id,commandName,m);
-        if(!accessCheck.ok) return respond(interaction, {content:accessCheck.reason,flags:MessageFlags.Ephemeral});
-      }
-      if(commandName==='warn'){
-        const {count}=await supabase.from('member_warns').select('*',{count:'exact',head:true}).eq('guild_id',guild.id).eq('user_id',m.id);
-        const n=(count||0)+1;
-        const {error:warnInsertError}=await supabase.from('member_warns').insert({guild_id:guild.id,user_id:m.id,reason});
-        if(warnInsertError) return respond(interaction, {content:'❌ ثبت Warn انجام نشد.',flags:MessageFlags.Ephemeral});
-        if(n>=3){
-          const timeoutError=await m.timeout(2*60*60*1000,'3 warnings').catch(e=>e);
-          if(timeoutError instanceof Error){
-            await logTo(guild,'member_warn_log_channel',`⚠️ Warn | ${m.user.tag} | ${n}/3 | ${reason}\n❌ Timeout خودکار انجام نشد: ${timeoutError.message}`);
-            return respond(interaction, {content:`Warn ثبت شد (${n}/3)، اما Timeout خودکار انجام نشد.`,flags:MessageFlags.Ephemeral});
-          }
-          const {error:resetError}=await supabase.from('member_warns').delete().eq('guild_id',guild.id).eq('user_id',m.id);
-          if(resetError){
-            console.error('warn reset error:',resetError);
-            await logTo(guild,'member_warn_log_channel',`⚠️ Warn | ${m.user.tag} | ${n}/3 | ${reason}\n⏱️ Timeout خودکار انجام شد، اما صفرکردن Warnها در دیتابیس ناموفق بود.`);
-            return respond(interaction, {content:`⚠️ Warn سوم ثبت شد و Timeout انجام شد، اما پاک‌کردن Warnهای قبلی با خطا مواجه شد.`,flags:MessageFlags.Ephemeral});
-          }
-          await logTo(guild,'member_warn_log_channel',`⚠️ Warn سوم | ${m.user.tag} | توسط ${interaction.user.tag} | ${reason}\n⏱️ Timeout خودکار: ۲ ساعت | Warnها صفر شدند`);
-          return respond(interaction, {content:`⚠️ Warn سوم ثبت شد. ${m} به‌صورت خودکار ۲ ساعت Timeout شد و Warnها به ۰ ریست شدند.`});
-        }
-        await logTo(guild,'member_warn_log_channel',`⚠️ Warn | ${m.user.tag} | ${n}/3 | ${reason}`);
-        return respond(interaction, {content:`Warn ثبت شد (${n}/3).`});
-      }
-
-      // Discord hierarchy: a moderator may not act on a member whose highest role
-      // is equal to or higher than the moderator's highest role. The bot itself
-      // must also be above the target's highest role.
-      if(['kick','ban','timeout'].includes(commandName)){
-        const hierarchyError=moderationHierarchyError(interaction.member,m,guild,commandName==='ban'?'Ban':commandName==='kick'?'Kick':'Timeout');
-        if(hierarchyError) return respond(interaction, {content:hierarchyError,flags:MessageFlags.Ephemeral});
-      }
-
-      let actionError=null;
-      if(commandName==='kick') actionError=await m.kick(reason).catch(e=>e);
-      if(commandName==='ban') actionError=await m.ban({reason}).catch(e=>e);
-      if(commandName==='timeout') actionError=await m.timeout(2*60*60*1000,reason).catch(e=>e);
-      if(actionError instanceof Error) return respond(interaction, {content:`❌ ${commandName} انجام نشد. دسترسی و Hierarchy رول‌ها را بررسی کنید.`,flags:MessageFlags.Ephemeral});
-
-      const moderationLogKey=commandName==='timeout'?'timeout_log_channel':'ban_kick_log_channel';
-      const actionFa=commandName==='ban'?'بن':commandName==='kick'?'کیک':'تایم‌اوت';
-      const logText=`🛡️ **${actionFa}**\n👮 انجام‌دهنده: ${interaction.user} (${interaction.user.tag})\n👤 هدف: ${m.user} (${m.user.tag})\n📝 دلیل: ${reason}\n🕐 زمان: <t:${Math.floor(Date.now()/1000)}:F>`;
-      await logTo(guild,moderationLogKey,logText);
-      await sendConfiguredLog(guild,moderationLogKey,logText);
-      // The dedicated Timeout Log is also a moderation audit channel: when configured,
-      // bans are mirrored there so one place shows every Ban/Timeout action.
-      if(commandName==='ban') await sendConfiguredLog(guild,'timeout_log_channel',logText);
-      return respond(interaction, {content:`✅ ${actionFa} انجام شد.\n👮 توسط: ${interaction.user}\n👤 کاربر: ${m.user}`});
-    }
-    if(['unwarn','unban','untimeout'].includes(commandName)){
-      if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral});
-      if(commandName==='unban'){
-        const u=interaction.options.getUser('user'); if(!u) return respond(interaction, {content:'کاربر پیدا نشد.',flags:MessageFlags.Ephemeral});
-        try{ await guild.members.unban(u.id,'Unban command'); }catch(e){ return respond(interaction, {content:'❌ این کاربر بن نیست یا امکان Unban وجود ندارد.',flags:MessageFlags.Ephemeral}); }
-        await logTo(guild,'ban_kick_log_channel',`🔓 Unban | ${u.tag} | توسط ${interaction.user.tag}`);
-        return respond(interaction, {content:`${u} Unban شد.`});
-      }
-      if(commandName==='untimeout'){
-        const m=interaction.options.getMember('user'); if(!m) return respond(interaction, {content:'ممبر پیدا نشد.',flags:MessageFlags.Ephemeral});
-        const accessCheck=await staffPermission(interaction.member,guild.id,'untimeout',m); if(!accessCheck.ok) return respond(interaction, {content:accessCheck.reason,flags:MessageFlags.Ephemeral});
-        const err=await m.timeout(null,'Untimeout command').catch(e=>e); if(err instanceof Error) return respond(interaction, {content:'❌ برداشتن Timeout انجام نشد.',flags:MessageFlags.Ephemeral});
-        const untimeoutLog=`🔓 **Untimeout**\n👮 انجام‌دهنده: ${interaction.user} (${interaction.user.tag})\n👤 هدف: ${m.user} (${m.user.tag})\n🕐 زمان: <t:${Math.floor(Date.now()/1000)}:F>`;
-        await logTo(guild,'timeout_log_channel',untimeoutLog);
-        await sendConfiguredLog(guild,'timeout_log_channel',untimeoutLog);
-        return respond(interaction, {content:`${m} از Timeout خارج شد.`});
-      }
-      const table='member_warns';
-      const m=interaction.options.getMember('user'); if(!m) return respond(interaction, {content:'ممبر پیدا نشد.',flags:MessageFlags.Ephemeral});
-      const {data:last,error:findError}=await supabase.from(table).select('id').eq('guild_id',guild.id).eq('user_id',m.id).order('created_at',{ascending:false}).limit(1).maybeSingle();
-      if(findError || !last) return respond(interaction, {content:'⚠️ برای این کاربر Warn ثبت‌شده‌ای پیدا نشد.',flags:MessageFlags.Ephemeral});
-      const {error:delError}=await supabase.from(table).delete().eq('id',last.id);
-      if(delError) return respond(interaction, {content:'❌ حذف Warn انجام نشد.',flags:MessageFlags.Ephemeral});
-      const {count}=await supabase.from(table).select('*',{count:'exact',head:true}).eq('guild_id',guild.id).eq('user_id',m.id);
-      const logKey='member_warn_log_channel';
-      await logTo(guild,logKey,`🔓 ${commandName} | ${m.user.tag} | وارن باقی‌مانده: ${count||0} | توسط ${interaction.user.tag}`);
-      return respond(interaction, {content:`یک Warn از ${m} کم شد. وارن باقی‌مانده: ${count||0}`});
-    }
-    if(commandName==='setrolexp'){
-      if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral}); await supabase.from('xp_roles').upsert({guild_id:guild.id,level:interaction.options.getInteger('level'),role_id:interaction.options.getRole('role').id}); return respond(interaction, {content:'Role XP ذخیره شد.'});
-    }
-    if(commandName==='setxp'){
-      if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral}); const u=interaction.options.getUser('user'), amount=interaction.options.getInteger('amount'); const old=(await supabase.from('xp_users').select('*').eq('guild_id',guild.id).eq('user_id',u.id).maybeSingle()).data||{xp:0,level:0}; const xp=old.xp+amount, level=Math.floor(xp/10); await supabase.from('xp_users').upsert({guild_id:guild.id,user_id:u.id,xp,level}); return respond(interaction, {content:`${amount} پیام به ${u} اضافه شد.`});
-    }
-    if(commandName==='leaderboard'){
-      const {data:users}=await supabase.from('xp_users').select('*').eq('guild_id',guild.id).order('xp',{ascending:false}).limit(10); const e=new EmbedBuilder().setTitle('🏆 XP Leaderboard').setDescription((users||[]).map((x,i)=>`${i+1}. <@${x.user_id}> — Level ${x.level} | ${x.xp} XP`).join('\n')||'خالی'); return respond(interaction, {embeds:[e]});
-    }
-    if(commandName==='textowner'){
-      if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral}); const ch=interaction.options.getChannel('channel'); await setSettings(guild.id,{owner_relay_channel:ch.id}); return respond(interaction, {content:`Relay در ${ch} فعال شد.`});
-    }
-    if(commandName==='untextowner'){
-      if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral});
-      await setSettings(guild.id,{owner_relay_channel:null});
-      return respond(interaction, {content:'پیام‌های Owner دیگر توسط بات Relay نمی‌شوند.',flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='createcmd'){
-      if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral}); const s=await getSettings(guild.id); const cc=s.custom_commands||{}; cc[interaction.options.getString('keyword').toLowerCase()]=interaction.options.getString('text'); await setSettings(guild.id,{custom_commands:cc}); return respond(interaction, {content:'Custom command ذخیره شد.'});
-    }
-    if(commandName==='banner'){ const s=await getSettings(guild.id); if(!s.server_banner) return respond(interaction, {content:'بنر هنوز تنظیم نشده.',flags:MessageFlags.Ephemeral}); return respond(interaction, {content:s.server_banner}); }
-    if(commandName==='setbanner'){ if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral}); await setSettings(guild.id,{server_banner:interaction.options.getString('banner')}); return respond(interaction, {content:'بنر ذخیره شد.'}); }
-    if(commandName==='settextxp'){ if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral}); await setSettings(guild.id,{xp_level_text:interaction.options.getString('text')}); return respond(interaction, {content:'متن Level Up ذخیره شد.'}); }
-    if(commandName==='level'){ const u=(await supabase.from('xp_users').select('*').eq('guild_id',guild.id).eq('user_id',interaction.user.id).maybeSingle()).data||{xp:0,level:0}; return respond(interaction, {content:`⭐ Level: ${u.level} | تعداد پیام: ${u.xp}`}); }
-    if(commandName==='settextwel'){ if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral}); await setSettings(guild.id,{welcome_text:interaction.options.getString('text')}); return respond(interaction, {content:'متن Welcome ذخیره شد.'}); }
-    if(commandName==='settextinc'){ if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral}); await setSettings(guild.id,{invite_text:interaction.options.getString('text')}); return respond(interaction, {content:'متن Invite ذخیره شد.'}); }
-    if(commandName==='setex'){ if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral}); await setSettings(guild.id,{exchange_channel:interaction.options.getChannel('channel').id}); return respond(interaction, {content:'چنل Exchange ذخیره شد.'}); }
-    if(commandName==='setgivelog'){
-      if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral});
-      const ch=interaction.options.getChannel('channel');
-      await setSettings(guild.id,{giveaway_create_log_channel:ch.id,giveaway_winner_log_channel:ch.id,drop_create_log_channel:ch.id,drop_winner_log_channel:ch.id});
-      await protectLogChannel(guild,ch.id);
-      return respond(interaction, {content:`✅ Giveaway / Drop Log روی ${ch} تنظیم شد.`});
-    }
-    if(commandName==='setinvitelog'){
-      if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral});
-      const ch=interaction.options.getChannel('channel');
-      await setSettings(guild.id,{invite_log_channel:ch.id});
-      await protectLogChannel(guild,ch.id);
-      return respond(interaction, {content:`✅ Invite Log روی ${ch} تنظیم شد.`});
-    }
-    if(commandName==='setlogchannel'){
-      if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral});
-      const ch=interaction.options.getChannel('channel');
-      await setSettings(guild.id,{aggregated_log_channel:ch.id,next_log_flush_at:new Date(Date.now()+LOG_FLUSH_FIRST_MS).toISOString()});
-      await protectLogChannel(guild,ch.id);
-      return respond(interaction, {content:`✅ کانال گزارش لاگ‌ها روی ${ch} تنظیم شد. اولین گزارش خودکار ۳ ساعت بعد ارسال می‌شود و سپس هر ۶ ساعت یک‌بار.`});
-    }
-    if(commandName==='sendlogs'){
-      if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral});
-      await interaction.deferReply({flags:MessageFlags.Ephemeral});
-      const result=await flushGuildLogs(guild,true);
-      if(result.reason==='not-configured') return interaction.editReply({content:'❌ ابتدا با `/setlogchannel` کانال لاگ را تنظیم کنید.'});
-      if(result.reason==='invalid-channel') return interaction.editReply({content:'❌ کانال لاگ معتبر نیست یا دیگر وجود ندارد.'});
-      if(!result.sent) return interaction.editReply({content:`❌ ارسال گزارش لاگ انجام نشد.\nدلیل: ${result.error || result.reason || 'خطای نامشخص'}\n\nدسترسی‌های موردنیاز بات: View Channel, Send Messages, Embed Links, Read Message History.`});
-      return interaction.editReply({content:`✅ گزارش لاگ ارسال شد (${result.count} مورد) و زمان گزارش بعدی روی ۶ ساعت بعد تنظیم شد.`});
-    }
-    if(commandName==='setexlog'){ if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral}); const ch=interaction.options.getChannel('channel'); await setSettings(guild.id,{exchange_log_channel:ch.id}); return respond(interaction, {content:`Exchange Log روی ${ch} تنظیم شد.`}); }
-    if(commandName==='settimeoutlog' || commandName==='set-timeout-log'){
-      if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'⛔ فقط Owner می‌تواند Timeout Log را تنظیم کند.',flags:MessageFlags.Ephemeral});
-      const ch=interaction.options.getChannel('channel',true);
-      await setSettings(guild.id,{timeout_log_channel:ch.id});
-      await protectLogChannel(guild,ch.id);
-      return respond(interaction, {content:`✅ Timeout Log روی ${ch} تنظیم شد. از این به بعد Ban/Timeout مربوط به این سیستم در این کانال ثبت می‌شود.`,flags:MessageFlags.Ephemeral});
-    }
-    if(commandName==='setrate'){ if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral}); const ch=interaction.options.getChannel('channel'); await setSettings(guild.id,{ticket_feedback_channel:ch.id}); return respond(interaction, {content:`Rating Channel روی ${ch} تنظیم شد.`}); }
-    if(commandName==='setticketlog'){
-      if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'⛔ فقط Owner می‌تواند Transcript Log را تنظیم کند.',flags:MessageFlags.Ephemeral});
-      const ch=interaction.options.getChannel('channel');
-      await setSettings(guild.id,{ticket_transcript_log_channel:ch.id});
-      return respond(interaction, {content:`Transcript Log روی ${ch} تنظیم شد.`});
-    }
-    if(commandName==='setclaimlog'){ if(!isBotOwner(interaction.user.id)) return respond(interaction, {content:'فقط افراد مجاز.',flags:MessageFlags.Ephemeral}); const ch=interaction.options.getChannel('channel'); await setSettings(guild.id,{ticket_log_channel:ch.id}); await protectLogChannel(guild,ch.id); return respond(interaction, {content:`Claim Log روی ${ch} تنظیم شد.`}); }
-  }catch(e){
-    if(e?.code===10062 || e?.rawError?.code===10062) { console.warn('Interaction expired before response (10062).'); return; }
-    console.error(e);
-    if(!interaction.replied&&!interaction.deferred) await respond(interaction, {content:'❌ خطایی رخ داد. کنسول VPS را بررسی کنید.',flags:MessageFlags.Ephemeral}).catch(()=>{});
+    await sendLog(m.guild,'member',{action:'leave',user:m.user.tag,user_id:m.id});
+  }catch(e){console.error('[MEMBER REMOVE]',e)}
+});
+client.on('messageDelete',async m=>{if(!m.guild||m.author?.bot)return;try{if(m.partial)await m.fetch().catch(()=>{});await sendLog(m.guild,'message',{action:'delete',channel:m.channel?.name,author:m.author?.tag||'unknown',content:stripMentions(m.content||''),attachments:[...(m.attachments?.values?.()||[])].map(x=>x.url).join('\n'),message_id:m.id})}catch(e){console.error('[MESSAGE DELETE]',e.message)}});
+client.on('messageUpdate',async(a,b)=>{if(!b.guild||b.author?.bot)return;try{if(a.partial)await a.fetch().catch(()=>{});if(b.partial)await b.fetch().catch(()=>{});const changed=a.content!==b.content||a.attachments?.size!==b.attachments?.size||a.embeds?.length!==b.embeds?.length||JSON.stringify(a.embeds)!==JSON.stringify(b.embeds);if(changed)await sendLog(b.guild,'message',{action:'edit',channel:b.channel?.name,author:b.author?.tag||'unknown',before:stripMentions(a.content||''),after:stripMentions(b.content||''),attachments_before:a.attachments?.size||0,attachments_after:b.attachments?.size||0,message_id:b.id})}catch(e){console.error('[MESSAGE UPDATE]',e.message)}});
+client.on('messageDeleteBulk',async msgs=>{const first=msgs.first();if(first?.guild)await sendLog(first.guild,'message',{action:'bulk_delete',count:msgs.size,channel:first.channel?.name||'unknown'})});
+client.on('messageCreate',async m=>{if(m.author.bot||!m.guild)return;try{
+  await xp.applyXp(m).catch(e=>{if(e?.reason==='role_sync_failed')sendLog(m.guild,'xp',{action:'role_sync_failed',user:m.author.tag,failures:e.failures?.length||0}).catch(()=>{});});
+  // Guess Number: only an exact integer matching the active game can win; wrong guesses are silent.
+  const gameResult=guess.check(m.guild.id,m.channel.id,m.content);
+  if(gameResult?.correct){
+    const starter=await client.users.fetch(gameResult.starter_id).catch(()=>null);
+    if(starter)await starter.send({embeds:[new EmbedBuilder().setColor(0x57F287).setTitle('🔓 Guess Number Result').setDescription(`بازی تمام شد. عدد مخفی **${gameResult.number}** بود.\nبرنده: <@${m.author.id}>`) ]}).catch(()=>{});
+    await m.channel.send({content:`🎯 <@${m.author.id}> عدد درست را گفت و برنده شد!`,allowedMentions:{users:[m.author.id]}}).catch(()=>{});
+    await sendLog(m.guild,'guess',{action:'winner',channel:m.channel.id,winner:m.author.tag,starter:gameResult.starter_id,min:gameResult.min,max:gameResult.max});
+    return;
   }
-});
-
-client.on('guildMemberAdd',async member=>{
-  const s=await getSettings(member.guild.id);
-  const welcomeText=placeholders(s.welcome_text||'خوش آمدی [user] ❤️\nتعداد اعضا: [Number]',member,member.guild);
-  if(s.welcome_channel){
-    const ch=member.guild.channels.cache.get(s.welcome_channel) || await member.guild.channels.fetch(s.welcome_channel).catch(()=>null);
-    if(ch?.isTextBased()) await ch.send(welcomeText).catch(()=>{});
-  }
-  await logTo(member.guild,'welcome_channel',`👋 Welcome | ${member.user.tag} (${member.id})`);
-
-  const before=inviteCache.get(member.guild.id)||new Map();
-  const after=await member.guild.invites.fetch().catch(()=>new Map());
-  const candidates=[];
-  for(const i of after.values()){
-    const previous=Number(before.get(i.code)||0);
-    const current=Number(i.uses||0);
-    if(current>previous) candidates.push({invite:i,delta:current-previous});
-  }
-  candidates.sort((a,b)=>b.delta-a.delta);
-  const used=candidates[0]?.invite||null;
-  await cacheInvites(member.guild).catch(()=>{});
-
-  if(used?.inviter?.id){
-    const inviterId=used.inviter.id;
-    const {data:existingInvite,error:existingInviteError}=await supabase.from('invite_stats')
-      .select('id').eq('guild_id',member.guild.id).eq('invited_id',member.id).maybeSingle();
-    if(existingInviteError) console.error('invite stats lookup error:',existingInviteError.message);
-    if(!existingInvite){
-      const {error:insertInviteError}=await supabase.from('invite_stats').insert(
-        {guild_id:member.guild.id,inviter_id:inviterId,invited_id:member.id}
-      );
-      if(insertInviteError) console.error('invite stats save error:',insertInviteError.message);
+  const s=getSettings(m.guild.id);
+  if(s.ai?.channelId===m.channel.id){try{const out=await ai.ask(m.guild.id,m.author.id,m.content);await m.reply({content:out,allowedMentions:{repliedUser:false}})}catch(e){if(e.message!=='AI_COOLDOWN'){await sendLog(m.guild,'ai',{action:'error',user:m.author.tag,error:e.message});await m.reply({content:'AI موقتاً در دسترس نیست.',allowedMentions:{repliedUser:false}}).catch(()=>{})}}}
+  const cc=db.prepare('SELECT response FROM custom_commands WHERE guild_id=? AND name=?').get(m.guild.id,m.content.trim().toLowerCase());if(cc)await m.channel.send({content:stripMentions(cc.response),allowedMentions:{parse:[]}}).catch(()=>{});
+  for(const d of drops.active(m.guild.id,'text',m.channel.id)){if(m.content.trim()===d.trigger_text&&await drops.win(m.guild,d,m.author.id))break;}
+}catch(e){console.error('[MESSAGE CREATE]',e.message)}});
+client.on('guildMemberUpdate',async(a,b)=>{try{const added=b.roles.cache.filter(r=>!a.roles.cache.has(r.id)).map(r=>`<@&${r.id}>`),removed=a.roles.cache.filter(r=>!b.roles.cache.has(r.id)).map(r=>`<@&${r.id}>`);const changes={};let actor=null;if(a.user.username!==b.user.username){changes.username_before=a.user.username;changes.username_after=b.user.username}if(a.nickname!==b.nickname){changes.nickname_before=a.nickname||'none';changes.nickname_after=b.nickname||'none'}if(added.length)changes.roles_added=added.join(', ');if(removed.length)changes.roles_removed=removed.join(', ');if(added.length||removed.length)actor=await auditActor(b.guild,AuditLogEvent.MemberRoleUpdate,b.id);else if(a.nickname!==b.nickname||a.communicationDisabledUntilTimestamp!==b.communicationDisabledUntilTimestamp)actor=await auditActor(b.guild,AuditLogEvent.MemberUpdate,b.id);if(a.communicationDisabledUntilTimestamp!==b.communicationDisabledUntilTimestamp)changes.timeout=`${a.communicationDisabledUntilTimestamp||'none'} -> ${b.communicationDisabledUntilTimestamp||'none'}`;if(a.premiumSinceTimestamp!==b.premiumSinceTimestamp)changes.boost=`${a.premiumSinceTimestamp||'none'} -> ${b.premiumSinceTimestamp||'none'}`;if(Object.keys(changes).length)await sendLog(b.guild,'member',{action:'update',user:b.user.tag,...changes,...(actor?{by:actor}:{})});}catch(e){console.error('[MEMBER UPDATE]',e.message)}});
+client.on('voiceStateUpdate',async(a,b)=>{if(a.channelId===b.channelId&&a.serverMute===b.serverMute&&a.serverDeaf===b.serverDeaf&&a.selfMute===b.selfMute&&a.selfDeaf===b.selfDeaf&&a.selfStream===b.selfStream&&a.selfVideo===b.selfVideo)return;await sendLog(b.guild,'voice',{user:b.member?.user?.tag,from:a.channelId||'none',to:b.channelId||'none',serverMute:b.serverMute,serverDeaf:b.serverDeaf,selfMute:b.selfMute,selfDeaf:b.selfDeaf,stream:b.selfStream,video:b.selfVideo})});
+async function auditActor(guild,type,targetId){
+  try{
+    for(let attempt=0;attempt<4;attempt++){
+      const logs=await guild.fetchAuditLogs({type,limit:15});
+      const now=Date.now();
+      const candidates=logs.entries.filter(x=>{
+        const age=now-x.createdTimestamp;
+        return (!targetId||x.target?.id===targetId)&&age>=0&&age<8000;
+      }).sort((a,b)=>b.createdTimestamp-a.createdTimestamp);
+      if(candidates[0])return candidates[0].executor?.tag||'unknown';
+      await sleep(600);
     }
-
-    const {count}=await supabase.from('invite_stats').select('*',{count:'exact',head:true})
-      .eq('guild_id',member.guild.id).eq('inviter_id',inviterId);
-    const total=Number(count||0);
-    const inviteText=`👋 <@${member.id}> joined!\n🤝 Invited by: <@${inviterId}>\n📨 Total invites: **${total}**`;
-    if(s.invite_log_channel){
-      const ch=member.guild.channels.cache.get(s.invite_log_channel) || await member.guild.channels.fetch(s.invite_log_channel).catch(()=>null);
-      if(ch?.isTextBased()) await ch.send({content:inviteText,allowedMentions:{users:[member.id,inviterId],parse:[]}}).catch(err=>console.error('invite log send error:',err.message));
-    }
-    await logTo(member.guild,'invite_log_channel',`📨 Invite | ${member.user.tag} | inviter=${used.inviter.tag||inviterId} | total=${total}`);
-  }else{
-    console.log(`Invite tracker: could not determine inviter for ${member.user.tag} in ${member.guild.name}`);
-  }
-});
-client.on('voiceStateUpdate',async(oldS,newS)=>{ if(!newS.guild) return; if(!oldS.channelId&&newS.channelId) await logTo(newS.guild,'voice_log_channel',`🔊 <@${newS.id}> وارد ${newS.channel?.name} شد.`); else if(oldS.channelId&&!newS.channelId) await logTo(newS.guild,'voice_log_channel',`🔇 <@${newS.id}> از ${oldS.channel?.name} خارج شد.`); });
-client.on('messageDelete',async m=>{ if(m.guild&&!m.author?.bot) await logTo(m.guild,'message_log_channel',`🗑️ پیام حذف شد | ${m.author?.tag||'نامشخص'} | ${m.content||'بدون متن'}`); });
-client.on('messageUpdate',async(oldM,newM)=>{ if(oldM.guild&&oldM.content!==newM.content&&!newM.author?.bot) await logTo(oldM.guild,'message_log_channel',`✏️ پیام ویرایش شد | ${newM.author?.tag||'نامشخص'}\nقبل: ${oldM.content||''}\nبعد: ${newM.content||''}`); });
-client.on('guildUpdate',async(oldG,newG)=>{
-  const changes=[];
-  if(oldG.name!==newG.name) changes.push(`نام: ${oldG.name} → ${newG.name}`);
-  if(oldG.icon!==newG.icon) changes.push('آیکن سرور تغییر کرد');
-  if(changes.length) await logTo(newG,'server_update_log_channel',`🏠 Server Update | ${changes.join(' | ')}`);
-});
-client.on('roleCreate',r=>logTo(r.guild,'server_update_log_channel',`➕ Role ساخته شد: ${r.name}`));
-client.on('roleDelete',r=>logTo(r.guild,'server_update_log_channel',`➖ Role حذف شد: ${r.name}`));
-client.on('channelCreate',c=>c.guild&&logTo(c.guild,'server_update_log_channel',`➕ Channel ساخته شد: ${c.name}`));
-client.on('channelDelete',c=>c.guild&&logTo(c.guild,'server_update_log_channel',`➖ Channel حذف شد: ${c.name}`));
-
-client.on('roleUpdate',async(oldR,newR)=>{ if(oldR.name!==newR.name) await logTo(newR.guild,'server_update_log_channel',`✏️ Role تغییر نام: ${oldR.name} → ${newR.name}`); });
-client.on('channelUpdate',async(oldC,newC)=>{ if(oldC.name!==newC.name) await logTo(newC.guild,'server_update_log_channel',`✏️ Channel تغییر نام: ${oldC.name} → ${newC.name}`); });
-const inviteCache=new Map();
-async function cacheInvites(g){ const m=new Map(); for(const i of await g.invites.fetch().catch(()=>new Map())) m.set(i.code,i.uses||0); inviteCache.set(g.id,m); }
-client.on('clientReady',async()=>{ for(const g of client.guilds.cache.values()) await cacheInvites(g).catch(()=>{}); });
-client.on('inviteCreate',async i=>cacheInvites(i.guild));
-client.on('inviteDelete',async i=>cacheInvites(i.guild));
-process.on('unhandledRejection', e => {
-  if(e?.code===10062 || e?.rawError?.code===10062) { console.warn('Ignored expired Discord interaction (10062).'); return; }
-  console.error('UNHANDLED REJECTION:', e);
-});
-process.on('uncaughtException', e => {
-  if(e?.code===10062 || e?.rawError?.code===10062) { console.warn('Ignored expired Discord interaction exception (10062).'); return; }
-  console.error('UNCAUGHT EXCEPTION:', e);
-});
-
-client.login(process.env.DISCORD_TOKEN);
+    return 'unknown';
+  }catch{return 'unknown'}
+}
+client.on('channelCreate',async c=>c.guild&&sendLog(c.guild,'server',{action:'channel_create',channel:c.name,id:c.id,by:await auditActor(c.guild,AuditLogEvent.ChannelCreate,c.id)}));
+client.on('channelDelete',async c=>c.guild&&sendLog(c.guild,'server',{action:'channel_delete',channel:c.name,id:c.id,by:await auditActor(c.guild,AuditLogEvent.ChannelDelete,c.id)}));
+client.on('channelUpdate',async(a,b)=>{if(!b.guild)return;const changes={};if(a.name!==b.name)changes.name=`${a.name} -> ${b.name}`;if(a.parentId!==b.parentId)changes.parent=`${a.parentId||'none'} -> ${b.parentId||'none'}`;if(a.topic!==b.topic)changes.topic='changed';if(a.rateLimitPerUser!==b.rateLimitPerUser)changes.slowmode=`${a.rateLimitPerUser} -> ${b.rateLimitPerUser}`;if(Object.keys(changes).length)await sendLog(b.guild,'server',{action:'channel_update',channel:b.name,id:b.id,by:await auditActor(b.guild,AuditLogEvent.ChannelUpdate,b.id),...changes})});
+client.on('roleCreate',async r=>sendLog(r.guild,'server',{action:'role_create',role:r.name,id:r.id,by:await auditActor(r.guild,AuditLogEvent.RoleCreate,r.id)}));
+client.on('roleDelete',async r=>sendLog(r.guild,'server',{action:'role_delete',role:r.name,id:r.id,by:await auditActor(r.guild,AuditLogEvent.RoleDelete,r.id)}));
+client.on('roleUpdate',async(a,b)=>{const changes={};if(a.name!==b.name)changes.name=`${a.name} -> ${b.name}`;if(a.hexColor!==b.hexColor)changes.color=`${a.hexColor} -> ${b.hexColor}`;if(a.position!==b.position)changes.position=`${a.position} -> ${b.position}`;if(a.mentionable!==b.mentionable)changes.mentionable=`${a.mentionable} -> ${b.mentionable}`;if(a.hoist!==b.hoist)changes.hoist=`${a.hoist} -> ${b.hoist}`;if(a.permissions.bitfield!==b.permissions.bitfield)changes.permissions='changed';if(Object.keys(changes).length)await sendLog(b.guild,'server',{action:'role_update',role:b.name,id:b.id,by:await auditActor(b.guild,AuditLogEvent.RoleUpdate,b.id),...changes})});
+client.on('guildUpdate',async(a,b)=>{const changes={};if(a.name!==b.name)changes.name=`${a.name} -> ${b.name}`;if(a.icon!==b.icon)changes.icon='changed';if(a.banner!==b.banner)changes.banner='changed';if(a.verificationLevel!==b.verificationLevel)changes.verification=`${a.verificationLevel} -> ${b.verificationLevel}`;if(Object.keys(changes).length)await sendLog(b,'server',{action:'guild_update',by:await auditActor(b,AuditLogEvent.GuildUpdate,b.id),...changes})});
+client.on('guildBanAdd',async b=>sendLog(b.guild,'moderation',{action:'ban_add',user:b.user.tag,by:await auditActor(b.guild,AuditLogEvent.MemberBanAdd,b.user.id)}));
+client.on('guildBanRemove',async b=>sendLog(b.guild,'moderation',{action:'ban_remove',user:b.user.tag,by:await auditActor(b.guild,AuditLogEvent.MemberBanRemove,b.user.id)}));
+client.on('inviteCreate',async x=>queueInviteTask(x.guild,async()=>{await refreshInvites(x.guild);await sendLog(x.guild,'invite',{action:'create',code:x.code,inviter:x.inviter?.tag||'unknown'})}));
+client.on('inviteDelete',async x=>queueInviteTask(x.guild,async()=>{invites.removeInviteCode(x.guild.id,x.code);await refreshInvites(x.guild);await sendLog(x.guild,'invite',{action:'delete',code:x.code})}));
+client.on('threadCreate',async t=>t.guild&&sendLog(t.guild,'server',{action:'thread_create',name:t.name,id:t.id,parent:t.parentId}));
+client.on('threadDelete',async t=>t.guild&&sendLog(t.guild,'server',{action:'thread_delete',name:t.name,id:t.id,parent:t.parentId}));
+client.on('threadUpdate',async(a,b)=>b.guild&&a.name!==b.name&&sendLog(b.guild,'server',{action:'thread_update',before:a.name,after:b.name,id:b.id}));
+client.on('webhookUpdate',async c=>c.guild&&sendLog(c.guild,'server',{action:'webhook_update',channel:c.name,id:c.id}));
+client.on('emojiCreate',async e=>sendLog(e.guild,'emote',{action:'create',name:e.name,id:e.id,by:await auditActor(e.guild,AuditLogEvent.EmojiCreate,e.id)}));
+client.on('emojiDelete',async e=>sendLog(e.guild,'emote',{action:'delete',name:e.name,id:e.id,by:await auditActor(e.guild,AuditLogEvent.EmojiDelete,e.id)}));
+client.on('emojiUpdate',async(a,b)=>sendLog(b.guild,'emote',{action:'update',before:a.name,after:b.name,id:b.id,by:await auditActor(b.guild,AuditLogEvent.EmojiUpdate,b.id)}));
+client.on('error',e=>console.error('[CLIENT]',e));
+process.on('unhandledRejection',e=>console.error('[UNHANDLED]',e));
+async function shutdown(signal,exitCode=0){if(shuttingDown)return;shuttingDown=true;console.log(`[SHUTDOWN] ${signal}`);for(const t of timers)clearInterval(t);timers.clear();try{await backupNow(undefined,backupRetention).catch(e=>console.error('[BACKUP ON SHUTDOWN]',e.message));await client.destroy();}finally{process.exit(exitCode)}}
+process.on('SIGINT',()=>shutdown('SIGINT'));process.on('SIGTERM',()=>shutdown('SIGTERM'));process.on('uncaughtException',e=>{console.error('[UNCAUGHT]',e);shutdown('uncaughtException',1).catch(()=>process.exit(1))});
+if(!token)throw new Error('DISCORD_TOKEN missing');
+music.init(client,(g,t,p)=>sendLog(g,t,p)).then(()=>client.login(token)).catch(e=>{console.error('[BOOT]',e);process.exit(1)});
