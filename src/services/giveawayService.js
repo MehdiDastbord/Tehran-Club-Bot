@@ -14,18 +14,16 @@ function embed(g){
   const e=new EmbedBuilder().setColor(g.ended?0x95A5A6:0xF1C40F).setTitle('🎉 Giveaway')
     .setDescription(`**جایزه:** ${g.prize}\n\n⏳ **پایان:** <t:${Math.floor(g.ends_at/1000)}:R>\n📅 **زمان دقیق:** <t:${Math.floor(g.ends_at/1000)}:F>`)
     .setFooter({text:`Giveaway #${g.id}`}).setTimestamp();
-  if(g.link)e.addFields({name:'🔗 لینک',value:g.link.slice(0,1024)});
   if(g.ended)e.addFields({name:'🏆 نتیجه',value:g.winner_id?`برنده: <@${g.winner_id}>`:'بدون شرکت‌کننده'});
   return e;
 }
 function row(g,ended=false,page=0,pages=1){
-  const p=Math.max(1,pages);
-  return new ActionRowBuilder().addComponents(
+  const components=[
     new ButtonBuilder().setCustomId(`gw_join:${g.id}`).setLabel('Join Giveaway').setEmoji('🎉').setStyle(ButtonStyle.Success).setDisabled(ended),
-    new ButtonBuilder().setCustomId(`gw_list:${g.id}:${page}`).setLabel('Participants').setEmoji('👥').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`gw_prev:${g.id}:${page}`).setLabel('Prev').setEmoji('◀️').setStyle(ButtonStyle.Secondary).setDisabled(page<=0),
-    new ButtonBuilder().setCustomId(`gw_next:${g.id}:${page}`).setLabel('Next').setEmoji('▶️').setStyle(ButtonStyle.Secondary).setDisabled(page>=p-1)
-  );
+    new ButtonBuilder().setCustomId(`gw_list:${g.id}:${page}`).setLabel('Participants').setEmoji('👥').setStyle(ButtonStyle.Secondary)
+  ];
+  if(g.link && /^https?:\/\//i.test(g.link)) components.push(new ButtonBuilder().setLabel('Open Link').setEmoji('🔗').setStyle(ButtonStyle.Link).setURL(g.link));
+  return new ActionRowBuilder().addComponents(components);
 }
 function join(id,u){
   const now=Date.now();

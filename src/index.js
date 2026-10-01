@@ -1,6 +1,6 @@
 const {
   Client, GatewayIntentBits, Partials, MessageFlags, EmbedBuilder, ActionRowBuilder,
-  ButtonBuilder, ButtonStyle, ChannelType, PermissionFlagsBits, AttachmentBuilder,
+  ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, ChannelType, PermissionFlagsBits, AttachmentBuilder,
   AuditLogEvent, ModalBuilder, TextInputBuilder, TextInputStyle
 } = require('discord.js');
 const crypto = require('crypto');
@@ -15,13 +15,13 @@ const tickets = require('./services/ticketService');
 const giveaways = require('./services/giveawayService');
 const drops = require('./services/dropService');
 const ai = require('./services/aiService');
-const music = require('./services/musicService');
-const music247 = require('./services/music247');
 const outbox = require('./services/discordOutboxService');
 const delivery = require('./services/discordDeliveryService');
 const guess = require('./services/guessService');
 const { hasAccess, hasStrictRole, canManageTarget, botHas } = require('./services/permissionService');
 const { sleep } = require('./utils');
+const { joinVoiceChannel } = require('@discordjs/voice');
+const afkConnections = new Map();
 
 const client = new Client({
   intents: [
@@ -60,6 +60,15 @@ function hierarchyMessage(interaction,target){const r=canManageTarget(interactio
 async function getMember(guild,user){return guild.members.fetch(user.id).catch(()=>null)}
 function textChannel(channel){return !!channel?.isTextBased?.() && channel.type!==ChannelType.GuildVoice && channel.type!==ChannelType.GuildStageVoice;}
 function botPermissionMessage(guild,permission,label){return botHas(guild,permission)?null:`Bot دسترسی ${label} را ندارد.`;}
+function botChannelPermissions(channel,guild){
+  const me=guild?.members?.me;
+  if(!channel||!me||typeof channel.permissionsFor!=='function')return null;
+  try{return channel.permissionsFor(me)||null;}catch{return null;}
+}
+function botCanUseChannel(channel,guild,permissions){
+  const p=botChannelPermissions(channel,guild);
+  return !!p && permissions.every(x=>p.has(x));
+}
 function buttonWithEmoji(button,value){const e=safeEmoji(value);if(!e)return button;if(typeof e==='string')return button.setEmoji(e);return button.setEmoji({id:e.id,name:e.name,animated:e.animated});}
 async function deferEphemeral(interaction){if(!interaction.deferred&&!interaction.replied)await interaction.deferReply({flags:MessageFlags.Ephemeral});}
 
@@ -89,7 +98,7 @@ function invitePageData(guildId, mode, inviterId, page=0){
   return {embed:info(`${lines.length?lines.join('\n'):'هیچ موردی ثبت نشده.'}\n\nصفحه: **${safePage+1}**`),row};
 }
 
-function xpDefaults(existing={}){return {enabled:true,min:10,max:20,cooldownMs:60000,curve:'linear',multiplier:1,maxLevel:0,channelId:null,levelUpChannelId:null,...existing};}
+function xpDefaults(existing={}){return {enabled:true,min:10,max:20,cooldownMs:60000,curve:'linear',multiplier:1,maxLevel:0,levelUpChannelId:null,...existing};}
 function inviteDefaults(existing={}){return {fakeDays:3,countRejoins:false,...existing};}
 
 async function handleXp(i,s){
@@ -99,13 +108,13 @@ async function handleXp(i,s){
   if(!await need(i,'xp'))return;
   await deferEphemeral(i);
 
-  if(s==='setchannel'||s==='setlevelup'){
+  if(s==='setlevelup'){
     if(!await needAdmin(i))return;
     const ch=i.options.getChannel('channel');
     if(!textChannel(ch))return safeReply(i,{embeds:[err('Channel معتبر نیست.')],flags:MessageFlags.Ephemeral});
-    if(!i.guild.members.me?.permissionsFor(ch)?.has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages]))return safeReply(i,{embeds:[err('Bot در این Channel دسترسی ارسال ندارد.')],flags:MessageFlags.Ephemeral});
-    await setSettings(gid,{xp:{[s==='setchannel'?'channelId':'levelUpChannelId']:ch.id}});
-    return safeReply(i,{embeds:[ok(s==='setchannel'?`XP فقط در <#${ch.id}> محاسبه می‌شود.`:`پیام Level Up در <#${ch.id}> ارسال می‌شود.`)],flags:MessageFlags.Ephemeral});
+    if(!botCanUseChannel(ch,i.guild,[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages]))return safeReply(i,{embeds:[err('Bot در این Channel دسترسی ارسال ندارد.')],flags:MessageFlags.Ephemeral});
+    await setSettings(gid,{xp:{levelUpChannelId:ch.id}});
+    return safeReply(i,{embeds:[ok(`پیام Level Up → <#${ch.id}>`)],flags:MessageFlags.Ephemeral});
   }
 
   if(s==='settings'){
@@ -150,7 +159,7 @@ async function handleLogs(i,s){
     const type=i.options.getString('type');
     if(s==='set'){
       const ch=i.options.getChannel('channel'),me=i.guild.members.me;
-      if(!textChannel(ch)||!me||!ch.permissionsFor(me).has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))return safeReply(i,{embeds:[err('Log Channel معتبر نیست یا Bot دسترسی ارسال Log ندارد.')],flags:MessageFlags.Ephemeral});
+      if(!textChannel(ch)||!me||!botCanUseChannel(ch,i.guild,[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))return safeReply(i,{embeds:[err('Log Channel معتبر نیست یا Bot دسترسی ارسال Log ندارد.')],flags:MessageFlags.Ephemeral});
       cur[type]=ch.id;
     }else delete cur[type];
     await setSettings(gid,{logs:cur});
@@ -159,7 +168,7 @@ async function handleLogs(i,s){
   if(s==='resetall'){await setSettings(gid,{logs:{}});return safeReply(i,{embeds:[ok('تمام Log Channelها پاک شدند.')],flags:MessageFlags.Ephemeral});}
   if(s==='setup'){
     const invalid=[];const me=i.guild.members.me;
-    for(const type of LOG_TYPES){const ch=i.options.getChannel(type);if(!ch)continue;if(!textChannel(ch)||!me||!ch.permissionsFor(me).has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks])){invalid.push(type);continue;}cur[type]=ch.id;}
+    for(const type of LOG_TYPES){const ch=i.options.getChannel(type);if(!ch)continue;if(!textChannel(ch)||!me||!botCanUseChannel(ch,i.guild,[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks])){invalid.push(type);continue;}cur[type]=ch.id;}
     await setSettings(gid,{logs:cur});return safeReply(i,{embeds:[invalid.length?warn(`این Logها ذخیره نشدند: ${invalid.join(', ')}`):ok('تمام Log Channelهای انتخاب‌شده تنظیم شدند.')],flags:MessageFlags.Ephemeral});
   }
   if(s==='test'){
@@ -179,7 +188,7 @@ async function handleSetTicketLog(i){
   const gid=i.guild.id; const cur={...(getSettings(gid).logs||{})}; const invalid=[]; const me=i.guild.members.me;
   for(const type of LOG_TYPES){
     const ch=i.options.getChannel(type); if(!ch) continue;
-    if(!textChannel(ch)||!me||!ch.permissionsFor(me).has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks])){invalid.push(type);continue;}
+    if(!textChannel(ch)||!me||!botCanUseChannel(ch,i.guild,[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks])){invalid.push(type);continue;}
     cur[type]=ch.id;
   }
   await setSettings(gid,{logs:cur});
@@ -204,7 +213,7 @@ async function handleInvite(i,s){
   }
   if(s==='setchannel'){
     const ch=i.options.getChannel('channel');const me=i.guild.members.me;
-    if(!textChannel(ch)||!me||!ch.permissionsFor(me).has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))return safeReply(i,{embeds:[err('Invite Log Channel معتبر نیست یا Bot دسترسی ندارد.')],flags:MessageFlags.Ephemeral});
+    if(!textChannel(ch)||!me||!botCanUseChannel(ch,i.guild,[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))return safeReply(i,{embeds:[err('Invite Log Channel معتبر نیست یا Bot دسترسی ندارد.')],flags:MessageFlags.Ephemeral});
     await setSettings(gid,{logs:{invite:ch.id}});return safeReply(i,{embeds:[ok(`Invite Log → <#${ch.id}>`)],flags:MessageFlags.Ephemeral});
   }
   if(s==='config'){
@@ -292,16 +301,82 @@ async function handleTicket(i,s){
   const gid=i.guild.id;
   // Ticket actions may perform multiple Discord API calls; defer up front.
   await deferEphemeral(i);
-  if(s==='panel'){
+  if(s==='panel'||s==='addpanel'){
     if(!await need(i,'staff'))return;
-    const title=i.options.getString('title'),text=i.options.getString('text'),keys=[...new Set(i.options.getString('types').split(',').map(x=>x.trim().toLowerCase()).filter(Boolean))].slice(0,25);const cat=i.options.getChannel('category'),role=i.options.getRole('supportrole');if(!role)return safeReply(i,{embeds:[err('Ticket Support Role الزامی است.')],flags:MessageFlags.Ephemeral});const me=i.guild.members.me;if(role.managed||!me||role.position>=me.roles.highest.position)return safeReply(i,{embeds:[err('Ticket Support Role باید پایین‌تر از Role بات باشد.')],flags:MessageFlags.Ephemeral});if(cat&&cat.type!==ChannelType.GuildCategory)return safeReply(i,{embeds:[err('Category نامعتبر است.')],flags:MessageFlags.Ephemeral});
-    const all=tickets.getTypes(gid);const rows=[];for(const k of keys){if(!all[k])continue;let b=new ButtonBuilder().setCustomId(`ticket_open:${k}`).setLabel(String(all[k].name).slice(0,80)).setStyle(ButtonStyle.Primary);b=buttonWithEmoji(b,all[k].emoji||'🎫');let row=rows[rows.length-1];if(!row||row.components.length>=5){row=new ActionRowBuilder();rows.push(row);}row.addComponents(b);}if(!rows.length)return safeReply(i,{embeds:[err('هیچ Ticket Type معتبری انتخاب نشده.')],flags:MessageFlags.Ephemeral});
-    const oldRole=tickets.supportRoleId(i.guild);
-    const panelMessage=await i.channel.send({embeds:[new EmbedBuilder().setColor(0x5865F2).setTitle(title).setDescription(text)],components:rows});
-    const syncFailures=await tickets.syncSupportRole(i.guild,oldRole,role.id);
-    if(syncFailures.length){await panelMessage.delete().catch(()=>{});return safeReply(i,{embeds:[err(`Support Role تنظیم نشد؛ ${syncFailures.length} Ticket قدیمی Sync نشد.`)],flags:MessageFlags.Ephemeral});}
-    try{await setSettings(gid,{ticket:{categoryId:cat?.id||null,supportRoleId:role.id}});}catch(error){await tickets.syncSupportRole(i.guild,role.id,oldRole).catch(()=>{});await panelMessage.delete().catch(()=>{});return safeReply(i,{embeds:[err(`تنظیمات Ticket ذخیره نشد: ${clamp(error.message,500)}`)],flags:MessageFlags.Ephemeral});}
-    await sendLog(i.guild,'ticket',{action:'panel_created',support_role:role.id,by:i.user.tag});return safeReply(i,{embeds:[ok('Ticket Panel ساخته شد و Ticket Support Role اعمال شد.')],flags:MessageFlags.Ephemeral});
+    const name=String(i.options.getString('name')||'').trim();
+    const category=i.options.getChannel('category');
+    const text=String(i.options.getString('text')||'').trim();
+    const welcome=String(i.options.getString('welcome')||'').trim();
+    const emoji=String(i.options.getString('emoji')||'🎫').trim();
+    const button=String(i.options.getString('button')||'باز کردن Ticket').trim();
+    if(!name||!category||!text||!welcome||!button)return safeReply(i,{embeds:[err('تمام گزینه‌های پنل الزامی هستند.')],flags:MessageFlags.Ephemeral});
+    if(category.type!==ChannelType.GuildCategory)return safeReply(i,{embeds:[err('Category معتبر نیست.')],flags:MessageFlags.Ephemeral});
+    const me=i.guild.members.me;
+    if(!me||!botCanUseChannel(i.channel,i.guild,[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))
+      return safeReply(i,{embeds:[err('Bot در Channel فعلی دسترسی ساخت Panel ندارد.')],flags:MessageFlags.Ephemeral});
+    const roleId=tickets.supportRoleId(i.guild);
+    const role=roleId?i.guild.roles.cache.get(roleId):null;
+    if(!role)return safeReply(i,{embeds:[err('اول Ticket Support Role را با `/ticket setrole` تنظیم کن.')],flags:MessageFlags.Ephemeral});
+    if(role.managed||role.position>=me.roles.highest.position)return safeReply(i,{embeds:[err('Ticket Support Role باید پایین‌تر از Role بات باشد.')],flags:MessageFlags.Ephemeral});
+
+    const keyBase=name.toLowerCase().replace(/[^a-z0-9_-]/g,'').slice(0,24)||`panel${Date.now().toString(36).slice(-6)}`;
+    const settings=getSettings(gid);
+    const panels={...(settings.ticket?.panels||{})};
+    let key=keyBase, n=2;
+    while(panels[key]){key=`${keyBase.slice(0,20)}-${n++}`;}
+    panels[key]={
+      name:name.slice(0,80),
+      categoryId:category.id,
+      text:text.slice(0,2000),
+      welcome:welcome.slice(0,1500),
+      emoji:safeEmoji(i.options.getString('emoji')||'🎫')||'🎫',
+      button:button.slice(0,80),
+      prefix:key
+    };
+    try{
+      await setSettings(gid,{ticket:{panels}});
+    }catch(error){
+      return safeReply(i,{embeds:[err(`پنل ذخیره نشد: ${clamp(error.message,500)}`)],flags:MessageFlags.Ephemeral});
+    }
+    await sendLog(i.guild,'ticket',{action:'panel_saved',panel:key,name:panels[key].name,category:category.id,by:i.user.tag});
+    return safeReply(i,{embeds:[ok(`پنل **${panels[key].name}** ذخیره شد.\n\nبرای نمایش همه پنل‌ها در یک منوی کشویی:\n\`/ticket menu\`\n\nCategory: <#${category.id}>\nدکمه: ${panels[key].emoji} ${panels[key].button}`)],flags:MessageFlags.Ephemeral});
+  }
+  if(s==='menu'){
+    if(!await need(i,'staff'))return;
+    const panels=getSettings(gid).ticket?.panels||{};
+    const entries=Object.entries(panels).filter(([k,p])=>p&&p.name&&p.categoryId&&p.button);
+    if(!entries.length)return safeReply(i,{embeds:[err('هنوز هیچ Ticket Panelای ساخته نشده. اول `/ticket addpanel` را بزن.')],flags:MessageFlags.Ephemeral});
+    if(!botCanUseChannel(i.channel,i.guild,[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))
+      return safeReply(i,{embeds:[err('Bot در Channel فعلی دسترسی ارسال Menu ندارد.')],flags:MessageFlags.Ephemeral});
+
+    // Discord permits max 25 options per select and max 5 select rows per message.
+    // Therefore 1 message can contain up to 125 panels; larger collections are split
+    // into additional menu messages instead of silently losing options.
+    const messageChunks=[];
+    for(let x=0;x<entries.length;x+=125)messageChunks.push(entries.slice(x,x+125));
+    await i.deleteReply().catch(()=>{});
+    for(let ci=0;ci<messageChunks.length;ci++){
+      const group=messageChunks[ci];
+      const optionGroups=[];
+      for(let x=0;x<group.length;x+=25)optionGroups.push(group.slice(x,x+25));
+      const rows=optionGroups.map((options,gi)=>{
+        const menu=new StringSelectMenuBuilder()
+          .setCustomId(`ticket_panel_menu:${ci}:${gi}`)
+          .setPlaceholder(`انتخاب پنل Ticket${messageChunks.length>1?` ${ci+1}/${messageChunks.length}`:''}`);
+        menu.addOptions(options.map(([key,p])=>({
+          label:String(p.name).slice(0,100),
+          value:key,
+          description:String(p.button).slice(0,100),
+          emoji:safeEmoji(p.emoji||'🎫')||'🎫'
+        })));
+        return new ActionRowBuilder().addComponents(menu);
+      });
+      await i.channel.send({
+        embeds:[new EmbedBuilder().setColor(0x5865F2).setTitle(`🎫 Ticket Panel Menu${messageChunks.length>1?` ${ci+1}/${messageChunks.length}`:''}`).setDescription('پنل موردنظر را از منوی کشویی انتخاب کنید.')],
+        components:rows
+      });
+    }
+    return;
   }
   if(s==='setrole'){
     if(!await need(i,'staff'))return;
@@ -313,9 +388,8 @@ async function handleTicket(i,s){
     await sendLog(i.guild,'ticket',{action:'support_role_set',old_role:old||'none',role:role.id,by:i.user.tag});
     return safeReply(i,{embeds:[ok(`Ticket Support Role → <@&${role.id}>`)],flags:MessageFlags.Ephemeral});
   }
-  if(s==='addtype'){if(!await need(i,'staff'))return;const t=tickets.getTypes(gid),key=i.options.getString('key').toLowerCase().replace(/[^a-z0-9_-]/g,'').slice(0,30);if(!key)return safeReply(i,{embeds:[err('Key نامعتبر است.')],flags:MessageFlags.Ephemeral});t[key]={name:clamp(i.options.getString('name'),80),emoji:safeEmoji(i.options.getString('emoji')||'🎫')||'🎫',prefix:(i.options.getString('prefix')||key).replace(/[^a-zA-Z0-9_-]/g,'').slice(0,30)};await tickets.saveTypes(gid,t);return safeReply(i,{embeds:[ok(`Ticket Type **${key}** اضافه شد.`)],flags:MessageFlags.Ephemeral});}
   if(s==='leaderboard'){if(!await need(i,'staff'))return;const ch=i.options.getChannel('channel');if(!textChannel(ch))return safeReply(i,{embeds:[err('Channel معتبر نیست.')],flags:MessageFlags.Ephemeral});const me=i.guild.members.me;if(!me||!ch.permissionsFor(me).has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))return safeReply(i,{embeds:[err('Bot در این Channel دسترسی ارسال ندارد.')],flags:MessageFlags.Ephemeral});await setSettings(gid,{ticket:{claimLeaderboardChannelId:ch.id,claimLeaderboardMessageId:null}});return safeReply(i,{embeds:[ok(`Claim Leaderboard هر ۶ ساعت در <#${ch.id}> ارسال می‌شود.`)],flags:MessageFlags.Ephemeral});}
-  if(s==='settings'){const cfg=getSettings(gid).ticket||{};return safeReply(i,{embeds:[info(`Support Role: ${cfg.supportRoleId?`<@&${cfg.supportRoleId}>`:'تنظیم نشده'}\nCategory: ${cfg.categoryId?`<#${cfg.categoryId}>`:'تنظیم نشده'}\nTypes: ${Object.keys(tickets.getTypes(gid)).join(', ')}`)],flags:MessageFlags.Ephemeral});}
+  if(s==='settings'){const cfg=getSettings(gid).ticket||{};const panels=Object.values(cfg.panels||{});return safeReply(i,{embeds:[info(`Support Role: ${cfg.supportRoleId?`<@&${cfg.supportRoleId}>`:'تنظیم نشده'}\nPanelها: **${panels.length}**\n${panels.length?panels.map(p=>`• ${p.emoji||'🎫'} **${p.name||'بدون نام'}** → <#${p.categoryId}>`).join('\n'):'هیچ Panelای ساخته نشده.'}`)],flags:MessageFlags.Ephemeral});}
   const ticket=tickets.getByChannel(gid,i.channel.id);if(!ticket)return safeReply(i,{embeds:[err('این Channel یک Ticket ثبت‌شده نیست.')],flags:MessageFlags.Ephemeral});
   if(s==='claim')return safeReply(i,{embeds:[await tickets.claim(i.guild,ticket.id,i.user.id,i.member)?ok('Ticket Claim شد.'):err('Claim ناموفق بود؛ فقط Ticket Support Role دسترسی دارد یا Ticket قبلاً Claim شده.')],flags:MessageFlags.Ephemeral});
   if(s==='close'){const reason=stripMentions(i.options.getString('reason')||'بدون دلیل');return safeReply(i,{embeds:[await tickets.close(i.guild,ticket.id,i.member,reason)?ok('Ticket بسته شد.'):err('بستن Ticket ناموفق بود.')],flags:MessageFlags.Ephemeral});}
@@ -354,32 +428,96 @@ async function handleDrop(i,s){
 
 async function exchangeManage(i,action,requestId){
   const ex=getSettings(i.guild.id).exchange||{};
-  if(!ex.accessRoleId||!hasStrictRole(i.member,ex.accessRoleId))return safeReply(i,{embeds:[err('فقط Exchange Access Role می‌تواند Exchange را تأیید یا رد کند.')],flags:MessageFlags.Ephemeral});
-  const req=db.prepare('SELECT * FROM exchange_requests WHERE guild_id=? AND id=?').get(i.guild.id,requestId);if(!req||req.status!=='pending')return safeReply(i,{embeds:[err('درخواست Exchange پیدا نشد یا قبلاً بررسی شده.')],flags:MessageFlags.Ephemeral});
-  const r=db.prepare('UPDATE exchange_requests SET status=?,decided_by=?,decided_at=? WHERE guild_id=? AND id=? AND status="pending"').run(action,i.user.id,Date.now(),i.guild.id,req.id);if(!r.changes)return safeReply(i,{embeds:[err('این درخواست همزمان توسط فرد دیگری بررسی شد.')],flags:MessageFlags.Ephemeral});
-  const ch=await i.guild.channels.fetch(req.channel_id).catch(()=>null);const m=await ch?.messages.fetch(req.message_id).catch(()=>null);const color=action==='accept'?0x57F287:0xED4245;const title=action==='accept'?'✅ Exchange Accepted':'❌ Exchange Rejected';
-  if(m)await m.edit({embeds:[new EmbedBuilder().setColor(color).setTitle(title).setDescription(req.text).addFields({name:'درخواست‌دهنده',value:`<@${req.requester_id}>`,inline:true},{name:'بررسی‌کننده',value:`<@${i.user.id}>`,inline:true})],components:[]}).catch(e=>{console.error('[EXCHANGE MESSAGE]',e.message);ch?.send({content:`Exchange #${req.id} ${action==='accept'?'تأیید':'رد'} شد توسط <@${i.user.id}>.`,allowedMentions:{users:[i.user.id]}}).catch(()=>{})});
-  if(action==='accept'){const outId=getSettings(i.guild.id).exchange?.approvedChannelId;const out=outId?await i.guild.channels.fetch(outId).catch(()=>null):null;if(out?.isTextBased()){await out.send({embeds:[new EmbedBuilder().setColor(0x57F287).setTitle('💱 Exchange Approved').setDescription(req.text).addFields({name:'درخواست‌دهنده',value:`<@${req.requester_id}>`,inline:true},{name:'تأییدکننده',value:`<@${i.user.id}>`,inline:true},{name:'Request ID',value:String(req.id),inline:true})],allowedMentions:{users:[req.requester_id,i.user.id]}}).catch(e=>console.error('[EXCHANGE OUTPUT]',e.message));}}
-  await sendLog(i.guild,'exchange',{action,request:req.id,requester:req.requester_id,by:i.user.tag});return safeReply(i,{embeds:[ok('Exchange به‌روزرسانی شد.')],flags:MessageFlags.Ephemeral});
+  if(!['accept','reject'].includes(action))return safeReply(i,{embeds:[err('عملیات Exchange نامعتبر است.')],flags:MessageFlags.Ephemeral});
+  const roleId=ex.roleId;
+  if(!roleId||!hasStrictRole(i.member,roleId))return safeReply(i,{embeds:[err('فقط Exchange Role می‌تواند Accept/Reject کند.')],flags:MessageFlags.Ephemeral});
+  const req=db.prepare('SELECT * FROM exchange_requests WHERE guild_id=? AND id=?').get(i.guild.id,requestId);
+  if(!req||req.status!=='pending')return safeReply(i,{embeds:[err('درخواست Exchange پیدا نشد یا قبلاً بررسی شده.')],flags:MessageFlags.Ephemeral});
+  const acceptChannelId=ex.acceptChannelId;
+  if(i.channel?.id!==acceptChannelId)return safeReply(i,{embeds:[err('این درخواست فقط از Accept Channel قابل بررسی است.')],flags:MessageFlags.Ephemeral});
+  let out=null;
+  if(action==='accept'){
+    const outId=ex.mainChannelId;
+    if(!outId)return safeReply(i,{embeds:[err('Main Exchange Channel تنظیم نشده یا حذف شده است. Accept انجام نشد.')],flags:MessageFlags.Ephemeral});
+    out=await i.guild.channels.fetch(outId).catch(()=>null);
+    if(!out?.isTextBased()||!botCanUseChannel(out,i.guild,[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))return safeReply(i,{embeds:[err('Main Exchange Channel حذف شده، نامعتبر است یا Bot دسترسی ارسال ندارد. Accept انجام نشد.')],flags:MessageFlags.Ephemeral});
+  }
+  const r=db.prepare('UPDATE exchange_requests SET status=?,decided_by=?,decided_at=? WHERE guild_id=? AND id=? AND status="pending"').run(action,i.user.id,Date.now(),i.guild.id,req.id);
+  if(!r.changes)return safeReply(i,{embeds:[err('این درخواست همزمان توسط فرد دیگری بررسی شد.')],flags:MessageFlags.Ephemeral});
+  const ch=await i.guild.channels.fetch(req.channel_id).catch(()=>null);
+  const m=await ch?.messages.fetch(req.message_id).catch(()=>null);
+  const color=action==='accept'?0x57F287:0xED4245;
+  const title=action==='accept'?'✅ Exchange Accepted':'❌ Exchange Rejected';
+  const embed=new EmbedBuilder().setColor(color).setTitle(title).setDescription(stripMentions(req.text)).addFields({name:'درخواست‌دهنده',value:`<@${req.requester_id}>`,inline:true},{name:'بررسی‌کننده',value:`<@${i.user.id}>`,inline:true},{name:'Request ID',value:String(req.id),inline:true});
+  if(req.banner_url)embed.setImage(req.banner_url);
+  if(m)await m.edit({embeds:[embed],components:[]}).catch(e=>console.error('[EXCHANGE MESSAGE]',e.message));
+  if(action==='accept'){
+    try{
+      const outEmbed=new EmbedBuilder().setColor(0x57F287).setTitle('💱 Exchange Approved').setDescription(stripMentions(req.text)).addFields({name:'درخواست‌دهنده',value:`<@${req.requester_id}>`,inline:true},{name:'Request ID',value:String(req.id),inline:true});
+      if(req.banner_url)outEmbed.setImage(req.banner_url);
+      await out.send({embeds:[outEmbed],allowedMentions:{parse:[]}});
+    }catch(error){
+      db.prepare('UPDATE exchange_requests SET status="pending",decided_by=NULL,decided_at=NULL WHERE id=? AND status="accept"').run(req.id);
+      // Restore the moderation message so the request can actually be reviewed again.
+      const pendingEmbed=new EmbedBuilder().setColor(0x1ABC9C).setTitle('💱 Exchange Request').setDescription(stripMentions(req.text)).addFields({name:'درخواست‌دهنده',value:`<@${req.requester_id}>`,inline:true},{name:'Request ID',value:String(req.id),inline:true});
+      if(req.banner_url)pendingEmbed.setImage(req.banner_url);
+      if(m)await m.edit({embeds:[pendingEmbed],components:[new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`exchange:accept:${req.id}`).setLabel('Accept').setEmoji('✅').setStyle(ButtonStyle.Success),new ButtonBuilder().setCustomId(`exchange:reject:${req.id}`).setLabel('Reject').setEmoji('❌').setStyle(ButtonStyle.Danger))],allowedMentions:{users:[req.requester_id]}}).catch(()=>{});
+      return safeReply(i,{embeds:[err(`ارسال به Main Exchange Channel ناموفق بود؛ Accept لغو شد. ${clamp(error.message,300)}`)],flags:MessageFlags.Ephemeral});
+    }
+  }
+  await sendLog(i.guild,'exchange',{action,request:req.id,requester:req.requester_id,by:i.user.tag});
+  return safeReply(i,{embeds:[ok(action==='accept'?'Exchange با موفقیت Accept و به Main Channel ارسال شد.':'Exchange Reject شد.')],flags:MessageFlags.Ephemeral});
 }
 
-async function handleMusic(i,s){
-  if(!await need(i,'music'))return;
+function destroyAfk(guildId, expectedConnection=null){
+  const old=afkConnections.get(guildId);
+  if(!old)return false;
+  if(expectedConnection && old.connection!==expectedConnection)return false;
+  afkConnections.delete(guildId);
+  try{old.connection?.destroy();}catch(e){console.error('[AFK DESTROY]',e.message);}
+  return true;
+}
+
+function watchAfkConnection(guildId, connection){
+  // AFK must never reconnect by itself. Any terminal/disconnected voice state
+  // clears the active reference; the user must invoke /afk again to reconnect.
+  const clearIfCurrent=()=>{
+    const current=afkConnections.get(guildId);
+    if(current?.connection!==connection)return;
+    afkConnections.delete(guildId);
+    try{connection.destroy();}catch{}
+  };
+  connection.on('error',e=>{
+    console.error(`[AFK VOICE ERROR ${guildId}]`,e?.message||e);
+    // A failed AFK connection must never leave a stale handle behind.
+    // Do not reconnect automatically; the user must run /afk again.
+    clearIfCurrent();
+  });
+  connection.on('stateChange',(_oldState,newState)=>{
+    const status=newState?.status;
+    if(status==='disconnected'||status==='destroyed') clearIfCurrent();
+  });
+}
+
+async function handleAfk(i){
   await deferEphemeral(i);
   const voice=i.member?.voice?.channel;
-  if(s==='play'||['skip','pause','resume','stop','leave','volume','loop','shuffle'].includes(s)){if(!voice)return safeReply(i,{embeds:[err('اول وارد Voice شو.')],flags:MessageFlags.Ephemeral});const me=i.guild.members.me;if(!me||!voice.permissionsFor(me).has([PermissionFlagsBits.Connect,PermissionFlagsBits.Speak]))return safeReply(i,{embeds:[err('Bot به Connect/Speak در Voice دسترسی ندارد.')],flags:MessageFlags.Ephemeral});const q=music.queue(i.guild.id);if(q&&q.channel?.id&&q.channel.id!==voice.id)return safeReply(i,{embeds:[err(`بات الان در <#${q.channel.id}> است.`)],flags:MessageFlags.Ephemeral});if(q&&['skip','pause','resume','stop','leave','volume','loop','shuffle'].includes(s)){const inSame=q.channel?.id===voice.id;if(!inSame)return safeReply(i,{embeds:[err('باید داخل همان Voice بات باشی.')],flags:MessageFlags.Ephemeral});}
-  }
+  if(!voice)return safeReply(i,{embeds:[err('اول وارد Voice شو.')],flags:MessageFlags.Ephemeral});
+  const me=i.guild.members.me;
+  const perms=voice.permissionsFor(me);
+  if(!me||!perms?.has(PermissionFlagsBits.Connect))return safeReply(i,{embeds:[err('Bot به Connect در Voice دسترسی ندارد.')],flags:MessageFlags.Ephemeral});
   try{
-    if(s==='play'){const stay=!!music247.get(i.guild.id);const track=await music.play(i.guild,voice,i.options.getString('query'),i.user,stay,i.channel);await sendLog(i.guild,'music',{action:'play',track:track.title,by:i.user.tag,channel:voice.id});return safeReply(i,{embeds:[ok(`🎵 **${clamp(track.title,250)}** به Queue اضافه شد.`)],flags:MessageFlags.Ephemeral});}
-    if(s==='queue'){const q=music.queue(i.guild.id);if(!q)return safeReply(i,{embeds:[info('Queue فعالی نیست.')],flags:MessageFlags.Ephemeral});const rows=q.tracks.toArray();return safeReply(i,{embeds:[info(`${q.currentTrack?`Now: **${clamp(q.currentTrack.title,250)}**\n`:''}${rows.length?rows.slice(0,20).map((t,n)=>`${n+1}. ${clamp(t.title,150)}`).join('\n'):'Queue خالی است.'}`)],flags:MessageFlags.Ephemeral});}
-    if(s==='nowplaying'){const st=music.status(i.guild.id);return safeReply(i,{embeds:[st?.track?info(`🎵 **${clamp(st.track.title,250)}**\nVoice: <#${st.channelId}>\nPaused: ${st.paused?'Yes':'No'}\nVolume: ${st.volume??'?'}\nLoop: ${st.repeatMode}`):info('هیچ آهنگی در حال پخش نیست.')],flags:MessageFlags.Ephemeral});}
-    if(s==='shuffle'){const q=music.queue(i.guild.id);if(!q)return safeReply(i,{embeds:[err('Queue فعال نیست.')],flags:MessageFlags.Ephemeral});q.tracks.shuffle();return safeReply(i,{embeds:[ok('Queue Shuffle شد.')],flags:MessageFlags.Ephemeral});}
-    if(s==='247'){
-      const enabled=i.options.getBoolean('enabled');if(enabled){if(!voice)return safeReply(i,{embeds:[err('برای 24/7 باید داخل Voice باشی.')],flags:MessageFlags.Ephemeral});music247.set(i.guild.id,voice.id,i.channel.id);await music.ensure247(i.guild,voice,i.channel);await sendLog(i.guild,'music',{action:'247_enable',voice:voice.id,by:i.user.tag});return safeReply(i,{embeds:[ok(`24/7 فعال شد در <#${voice.id}>.`)],flags:MessageFlags.Ephemeral});}
-      music247.disable(i.guild.id);const q=music.queue(i.guild.id);if(q){q.options.leaveOnEnd=true;q.options.leaveOnStop=true;q.options.leaveOnEmpty=true;if(!q.currentTrack&&q.tracks?.size===0)await q.delete().catch(()=>{});}await sendLog(i.guild,'music',{action:'247_disable',by:i.user.tag});return safeReply(i,{embeds:[ok('24/7 خاموش شد و اتصال آزاد شد.')],flags:MessageFlags.Ephemeral});
-    }
-    await music.control(i.guild.id,s,i.options.getInteger('value')??i.options.getInteger('mode'));await sendLog(i.guild,'music',{action:s,by:i.user.tag});return safeReply(i,{embeds:[ok(`Music: ${s}`)],flags:MessageFlags.Ephemeral});
-  }catch(e){const msg=e.message==='MUSIC_ALREADY_IN_ANOTHER_VOICE'?'بات در Voice دیگری است.':e.message;await sendLog(i.guild,'music',{action:'error',by:i.user.tag,error:msg}).catch(()=>{});return safeReply(i,{embeds:[err(msg||'خطای Music رخ داد.')],flags:MessageFlags.Ephemeral});}
+    destroyAfk(i.guild.id);
+    const connection=joinVoiceChannel({channelId:voice.id,guildId:i.guild.id,adapterCreator:i.guild.voiceAdapterCreator,selfDeaf:true,selfMute:true});
+    const record={connection,channelId:voice.id};
+    afkConnections.set(i.guild.id,record);
+    watchAfkConnection(i.guild.id,connection);
+    await sendLog(i.guild,'voice',{action:'afk',by:i.user.tag,channel:voice.id});
+    return safeReply(i,{embeds:[ok(`💤 در <#${voice.id}> به حالت AFK نشستم.`)],flags:MessageFlags.Ephemeral});
+  }catch(e){
+    destroyAfk(i.guild.id);
+    return safeReply(i,{embeds:[err(`ورود به Voice برای AFK ناموفق بود: ${clamp(e.message||'Unknown error',300)}`)],flags:MessageFlags.Ephemeral});
+  }
 }
 
 async function handleEmbedCommand(i){
@@ -410,20 +548,75 @@ async function handleEmbedCommand(i){
 متن مخفی هر دکمه با کلیک به‌صورت خصوصی نمایش داده می‌شود.`)],flags:MessageFlags.Ephemeral});
 }
 
+
+const CONTROL_MENU_ITEMS={
+  ticket:'🎫 Ticket — ساخت/تنظیم پنل Ticket و Support Role',
+  xp:'⭐ XP — کانال XP، Level Up و Roleهای Level',
+  invite:'📨 Invite — Invite Logger و آمار',
+  logs:'📋 Logs — تنظیم Channelهای Log',
+  staff:'🛡️ Staff — Rank و Role Mapping',
+  giveaway:'🎁 Giveaway — تنظیم و اجرای Giveaway',
+  drop:'🎉 Drop — تنظیم Drop',
+  ai:'🤖 AI — Channel و تنظیمات AI',
+  exchange:'💱 Exchange — Channel و Access Role',
+  welcome:'👋 Welcome — پیام ورود',
+  moderation:'🔨 Moderation — دستورات مدیریت',
+  guess:'🔢 Guess — بازی حدس عدد',
+  emote:'😀 Emoji — افزودن Emoji'
+};
+function buildControlMenu(){
+  const menu=new StringSelectMenuBuilder()
+    .setCustomId('control_menu')
+    .setPlaceholder('یک بخش را انتخاب کن...')
+    .addOptions(Object.entries(CONTROL_MENU_ITEMS).map(([value,description])=>({
+      label:description.slice(2,description.indexOf(' — ')>0?description.indexOf(' — '):100).slice(0,100),
+      value,
+      description:description.replace(/^.. /,'').slice(0,100),
+      emoji:description.slice(0,2).trim()
+    })));
+  return new ActionRowBuilder().addComponents(menu);
+}
+function controlPanelEmbed(){
+  return new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle('🧭 Tehran Club — Control Panel')
+    .setDescription('از منوی کشویی پایین، بخش موردنظر را انتخاب کن.\n\nهر بخش دستورهای اصلی همان سیستم را به تو نشان می‌دهد.')
+    .addFields(
+      {name:'🎫 Ticket',value:'Panel، Support Role، Claim، Close، Reopen و مدیریت اعضا',inline:false},
+      {name:'⭐ XP / 🛡️ Staff',value:'تنظیم XP، Level Role و Rankهای Staff',inline:false},
+      {name:'📋 Logs / 📨 Invite',value:'تنظیم لاگ‌ها و Invite Logger',inline:false},
+      {name:'🎁 Giveaway / 🎉 Drop',value:'مدیریت رویدادها و دسترسی‌ها',inline:false},
+      {name:'🤖 AI',value:'AI Channel و تنظیمات AI',inline:false}
+    )
+    .setFooter({text:'فقط افراد دارای دسترسی مدیریتی/سیستمی باید از این پنل استفاده کنند.'});
+}
+function controlHelp(value){
+  const map={
+    ticket:'`/ticket addpanel` — ساخت یک پنل مستقل با Name، Category، Text، Welcome، Emoji، Button Text. هر تعداد پنل خواستی بساز.\n`/ticket settings` — وضعیت Ticket و لیست Panelها.\n`/ticket setrole` — تغییر Ticket Support Role.\n`/ticket leaderboard` — Claim Leaderboard.',
+    xp:'XP در تمام Channelهای سرور محاسبه می‌شود.\n`/xp setlevelup` — کانال Level Up.\n`/xp settings` — مقدار XP و Cooldown.\n`/xp setrole` — اتصال Level به Role.\n`/xp add` و `/xp remove` — تغییر دستی XP.\n`/xp reset` و `/xp resetall` — ریست.',
+    invite:'`/invite setchannel` — Invite Log.\n`/invite config` — Fake/Rejoin.\n`/invite leaderboard` و `/invite stats` — آمار.\n`/invite alljoins` و `/invite events` — تاریخچه.',
+    logs:'`/logs setup` — تنظیم چند Log Channel با یک دستور.\n`/logs set` و `/logs status` و `/logs test`.',
+    staff:'`/staff setrole` — Role Mapping.\n`/staff rankup`، `/staff rankdown`، `/staff setlevel`.\n`/staff history` و `/staff list`.',
+    giveaway:'`/giveaway start` — شروع.\n`/giveaway end` — پایان و انتخاب خودکار Winner.',
+    drop:'`/drop button` یا `/drop text` — شروع Drop.\n`/drop end` و `/drop list`.',
+    ai:'`/ai setchannel` — تنها Channel مجاز AI.\n`/ai clear` — پاک کردن History.',
+    exchange:'`/exchange create` — ثبت درخواست.\n`/exchange accept-channel` — Accept Channel.\n`/exchange main-channel` — Main Exchange Channel.\n`/exchange role` — Exchange Role.',
+    welcome:'`/welcome set` — Channel و پیام Welcome.\n`/welcome disable` — خاموش.',
+    moderation:'`/mod ban`، `kick`، `timeout`، `warn`، `warnings`.',
+    guess:'`/guess start` — شروع بازی.\n`/guess stop` و `/guess status`.',
+    emote:'`/addemote` — افزودن Custom Emoji.'
+  };
+  return new EmbedBuilder().setColor(0x57F287).setTitle(`⚙️ ${value}`).setDescription(map[value]||'این بخش راهنمای مستقیمی ندارد.');
+}
+
 async function handleSlash(i){
   const n=i.commandName,s=i.options.getSubcommand(false);
+  if(n==='menu'){
+    if(!await needAdmin(i))return;
+    return safeReply(i,{embeds:[controlPanelEmbed()],components:[buildControlMenu()],flags:MessageFlags.Ephemeral});
+  }
   if(n==='setticketlog')return handleSetTicketLog(i);
   if(n==='embed')return handleEmbedCommand(i);
-  if(n==='rerole'){
-    if(!owner(i.user.id))return safeReply(i,{embeds:[err('فقط Owner اجازه استفاده از /rerole را دارد.')],flags:MessageFlags.Ephemeral});
-    await deferEphemeral(i);
-    const g=db.prepare('SELECT * FROM giveaways WHERE guild_id=? AND channel_id=? AND ended=1 ORDER BY id DESC LIMIT 1').get(i.guild.id,i.channel.id);
-    if(!g)return safeReply(i,{embeds:[err('Giveaway تمام‌شده‌ای در این Channel پیدا نشد.')],flags:MessageFlags.Ephemeral});
-    const r=await giveaways.reroll(i.guild,g);
-    if(r.error==='GIVEAWAY_NOT_ENOUGH_PARTICIPANTS')return safeReply(i,{embeds:[err('برای Reroll حداقل دو شرکت‌کننده لازم است.')],flags:MessageFlags.Ephemeral});
-    if(r.error)return safeReply(i,{embeds:[err('Reroll ناموفق بود.')],flags:MessageFlags.Ephemeral});
-    return safeReply(i,{embeds:[ok(`Giveaway #${g.id} دوباره قرعه‌کشی شد. برنده جدید: <@${r.winner}>`)],flags:MessageFlags.Ephemeral});
-  }
   if(n==='banch'){
     if(!hasStrictRole(i.member,banchAccessRoleId))return safeReply(i,{embeds:[err('برای /banch دسترسی لازم را نداری.')],flags:MessageFlags.Ephemeral});
     await deferEphemeral(i);
@@ -435,27 +628,48 @@ async function handleSlash(i){
     await target.roles.add(role,`Banch by ${i.user.tag}`); await sendLog(i.guild,'moderation',{action:'banch',target:target.user.tag,role:role.id,by:i.user.tag});
     return safeReply(i,{embeds:[ok(`Role <@&${role.id}> به <@${target.id}> داده شد.`)],flags:MessageFlags.Ephemeral});
   }
-  if(n==='xp')return handleXp(i,s);if(n==='logs')return handleLogs(i,s);if(n==='invite')return handleInvite(i,s);if(n==='staff')return handleStaff(i,s);if(n==='ticket')return handleTicket(i,s);if(n==='giveaway')return handleGiveaway(i,s);if(n==='drop')return handleDrop(i,s);if(n==='music')return handleMusic(i,s);
+  if(n==='xp')return handleXp(i,s);if(n==='logs')return handleLogs(i,s);if(n==='invite')return handleInvite(i,s);if(n==='staff')return handleStaff(i,s);if(n==='ticket')return handleTicket(i,s);if(n==='giveaway')return handleGiveaway(i,s);if(n==='drop')return handleDrop(i,s);if(n==='afk')return handleAfk(i);
   if(n==='exchange'){
-    await deferEphemeral(i);
-    const ex=getSettings(i.guild.id).exchange||{};if(!ex.channelId||!ex.accessRoleId)return safeReply(i,{embeds:[err('Exchange Channel و Exchange Access Role را ابتدا تنظیم کن.')],flags:MessageFlags.Ephemeral});const ch=await i.guild.channels.fetch(ex.channelId).catch(()=>null);if(!textChannel(ch))return safeReply(i,{embeds:[err('Exchange Channel معتبر نیست.')],flags:MessageFlags.Ephemeral});const text=stripMentions(i.options.getString('text')).slice(0,4000);const reqId=db.prepare('INSERT INTO exchange_requests(guild_id,channel_id,requester_id,text,status) VALUES(?,?,?,?,"pending")').run(i.guild.id,ch.id,i.user.id,text).lastInsertRowid;let msg;try{msg=await ch.send({embeds:[new EmbedBuilder().setColor(0x1ABC9C).setTitle('💱 Exchange Request').setDescription(text).addFields({name:'درخواست‌دهنده',value:`<@${i.user.id}>`,inline:true},{name:'Request ID',value:String(reqId),inline:true})],components:[new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`exchange:accept:${reqId}`).setLabel('Accept').setEmoji('✅').setStyle(ButtonStyle.Success),new ButtonBuilder().setCustomId(`exchange:reject:${reqId}`).setLabel('Reject').setEmoji('❌').setStyle(ButtonStyle.Danger))],allowedMentions:{users:[i.user.id]}});const updated=db.prepare('UPDATE exchange_requests SET message_id=? WHERE id=? AND status="pending"').run(msg.id,reqId);if(!updated.changes){await msg.delete().catch(()=>{});throw new Error('EXCHANGE_REQUEST_DB_FAILED');}}catch(e){db.prepare('DELETE FROM exchange_requests WHERE id=?').run(reqId);throw e;}await sendLog(i.guild,'exchange',{action:'created',request:reqId,requester:i.user.tag});return safeReply(i,{embeds:[ok(`درخواست Exchange ساخته شد. ID: ${reqId}`)],flags:MessageFlags.Ephemeral});
+    const ex=getSettings(i.guild.id).exchange||{};
+    if(!ex.acceptChannelId||!ex.mainChannelId||!ex.roleId)return safeReply(i,{embeds:[err('Exchange هنوز کامل تنظیم نشده است. Accept Channel، Main Channel و Exchange Role را تنظیم کن.')],flags:MessageFlags.Ephemeral});
+    const modal=new ModalBuilder().setCustomId('exchange_create_modal').setTitle('ثبت Exchange');
+    const banner=new TextInputBuilder().setCustomId('banner_url').setLabel('Banner URL').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(2000).setPlaceholder('https://...');
+    const text=new TextInputBuilder().setCustomId('text').setLabel('توضیحات Exchange').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(4000);
+    modal.addComponents(new ActionRowBuilder().addComponents(banner),new ActionRowBuilder().addComponents(text));
+    return i.showModal(modal);
   }
-  if(n==='setex'){if(!await needAdmin(i))return;await deferEphemeral(i);const channel=i.options.getChannel('channel'),me=i.guild.members.me;if(!textChannel(channel)||!me||!channel.permissionsFor(me).has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))return safeReply(i,{embeds:[err('Exchange Output Channel معتبر نیست یا Bot دسترسی ارسال ندارد.')],flags:MessageFlags.Ephemeral});await setSettings(i.guild.id,{exchange:{approvedChannelId:channel.id}});return safeReply(i,{embeds:[ok(`Exchangeهای تأییدشده → <#${channel.id}>`)],flags:MessageFlags.Ephemeral});}
-  if(n==='exchange-config'){if(!await needAdmin(i))return;await deferEphemeral(i);const role=i.options.getRole('role'),channel=i.options.getChannel('channel'),me=i.guild.members.me;if(!textChannel(channel)||role.managed||!me||!channel.permissionsFor(me).has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))return safeReply(i,{embeds:[err('Channel یا Exchange Role نامعتبر است یا Bot دسترسی ارسال ندارد.')],flags:MessageFlags.Ephemeral});await setSettings(i.guild.id,{exchange:{channelId:channel.id,accessRoleId:role.id}});await sendLog(i.guild,'exchange',{action:'config',channel:channel.id,role:role.id,by:i.user.tag});return safeReply(i,{embeds:[ok(`Exchange Channel: <#${channel.id}>\nExchange Access Role: <@&${role.id}>`)],flags:MessageFlags.Ephemeral});}
+  if(n==='exchange-accept-channel'||n==='exchange-main-channel'){
+    if(!await needAdmin(i))return;
+    await deferEphemeral(i);
+    const channel=i.options.getChannel('channel');
+    if(!textChannel(channel)||!botCanUseChannel(channel,i.guild,[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))return safeReply(i,{embeds:[err('Channel معتبر نیست یا Bot دسترسی View/Send/Embed ندارد.')],flags:MessageFlags.Ephemeral});
+    const ex={...(getSettings(i.guild.id).exchange||{})};
+    if(n==='exchange-accept-channel')ex.acceptChannelId=channel.id; else ex.mainChannelId=channel.id;
+    await setSettings(i.guild.id,{exchange:ex});
+    return safeReply(i,{embeds:[ok(`${n==='exchange-accept-channel'?'Accept Channel':'Main Exchange Channel'} → <#${channel.id}>`)],flags:MessageFlags.Ephemeral});
+  }
+  if(n==='exchange-role'){
+    if(!await needAdmin(i))return;
+    await deferEphemeral(i);
+    const role=i.options.getRole('role'),me=i.guild.members.me;
+    if(!role||role.managed||!me||role.position>=me.roles.highest.position)return safeReply(i,{embeds:[err('Exchange Role باید معتبر و پایین‌تر از Role بات باشد.')],flags:MessageFlags.Ephemeral});
+    const ex={...(getSettings(i.guild.id).exchange||{}),roleId:role.id};
+    await setSettings(i.guild.id,{exchange:ex});
+    return safeReply(i,{embeds:[ok(`Exchange Role → <@&${role.id}>`)],flags:MessageFlags.Ephemeral});
+  }
   if(n==='exchange-manage')return exchangeManage(i,i.options.getString('action'),i.options.getInteger('request'));
   if(n==='addemote'){
     if(!await need(i,'emote'))return;await deferEphemeral(i);const perm=botPermissionMessage(i.guild,PermissionFlagsBits.ManageGuildExpressions,'Manage Expressions');if(perm)return safeReply(i,{embeds:[err(perm)],flags:MessageFlags.Ephemeral});const raw=i.options.getString('emoji').trim();const match=raw.match(/^<a?:([\w~]+):(\d{17,20})>$/);const animated=!!match&&raw.startsWith('<a:');const limit=animated?(i.guild.maximumEmojis?.animated||0):(i.guild.maximumEmojis?.static||0);const count=i.guild.emojis.cache.filter(e=>!!e.animated===animated).size;if(limit&&count>=limit)return safeReply(i,{embeds:[err(`ظرفیت ${animated?'Animated':'Static'} Emojiهای سرور پر است.`)],flags:MessageFlags.Ephemeral});const name=(i.options.getString('name')||match?.[1]||'emoji').replace(/[^a-zA-Z0-9_]/g,'').slice(0,32);if(!name)return safeReply(i,{embeds:[err('نام Emoji نامعتبر است.')],flags:MessageFlags.Ephemeral});const url=match?`https://cdn.discordapp.com/emojis/${match[2]}.${animated?'gif':'png'}?size=4096`:raw;if(!/^https?:\/\//i.test(url))return safeReply(i,{embeds:[err('Emoji باید URL یا Custom Emoji معتبر باشد.')],flags:MessageFlags.Ephemeral});try{const created=await i.guild.emojis.create({attachment:url,name});await sendLog(i.guild,'emote',{action:'created',name:created.name,id:created.id,by:i.user.tag});return safeReply(i,{embeds:[ok(`Emoji اضافه شد: ${created}`)],flags:MessageFlags.Ephemeral});}catch(e){return safeReply(i,{embeds:[err(`افزودن Emoji ناموفق بود: ${clamp(e.message,1000)}`)],flags:MessageFlags.Ephemeral});}
   }
   if(n==='guess'){
     if(!await need(i,'guess'))return;await deferEphemeral(i);const gid=i.guild.id;
-    if(s==='start'){const r=await guess.start(gid,i.channel.id,i.user.id,i.options.getInteger('min'),i.options.getInteger('max'));if(r.error)return safeReply(i,{embeds:[err(r.error)],flags:MessageFlags.Ephemeral});let dmSent=true;try{const u=await client.users.fetch(r.starter_id);await u.send({embeds:[new EmbedBuilder().setColor(0xF39C12).setTitle('🔐 Guess Number Secret').setDescription(`عدد مخفی بازی Channel <#${r.channel_id}> انتخاب شد.
-بازه: **${r.min} تا ${r.max}**`) .addFields({name:'عدد مخفی',value:`**${r.number}**`})]});}catch{dmSent=false;}await sendLog(i.guild,'guess',{action:'start',by:i.user.tag,channel:i.channel.id,min:r.min,max:r.max,secret_dm:dmSent});return safeReply(i,{embeds:[ok(`بازی شروع شد: **${r.min} تا ${r.max}**${dmSent?'':'\n⚠️ ارسال DM عدد مخفی ممکن نشد.'}`)],flags:MessageFlags.Ephemeral});}
+    if(s==='start'){const r=await guess.start(gid,i.channel.id,i.user.id,i.options.getInteger('min'),i.options.getInteger('max'));if(r.error)return safeReply(i,{embeds:[err(r.error)],flags:MessageFlags.Ephemeral});let dmSent=true;try{const u=await client.users.fetch(r.starter_id);await u.send({embeds:[new EmbedBuilder().setColor(0xF39C12).setTitle('🔐 Guess Number Secret').setDescription(`عدد مخفی بازی Channel <#${r.channel_id}> انتخاب شد.\nبازه: **${r.min} تا ${r.max}**`).addFields({name:'عدد مخفی',value:`**${r.number}**`})]});}catch{dmSent=false;}await i.channel.send({embeds:[new EmbedBuilder().setColor(0xF39C12).setTitle('🔢 بازی حدس عدد شروع شد!').setDescription(`از **${r.min}** تا **${r.max}** یک عدد انتخاب شده.\nهرکس عدد درست را بفرستد برنده می‌شود!\n🔐 عدد انتخاب‌شده برای سازنده بازی DM شده است.`)]});await sendLog(i.guild,'guess',{action:'start',by:i.user.tag,channel:i.channel.id,min:r.min,max:r.max,secret_dm:dmSent});return safeReply(i,{embeds:[ok(`بازی شروع شد: **${r.min} تا ${r.max}**${dmSent?'':'\n⚠️ ارسال DM عدد مخفی ممکن نشد.'}`)],flags:MessageFlags.Ephemeral});}
     if(s==='stop'){if(!guess.stop(gid,i.channel.id))return safeReply(i,{embeds:[err('بازی فعالی در این Channel نیست.')],flags:MessageFlags.Ephemeral});await sendLog(i.guild,'guess',{action:'stop',by:i.user.tag,channel:i.channel.id});return safeReply(i,{embeds:[ok('بازی متوقف شد.')],flags:MessageFlags.Ephemeral});}
     const r=guess.get(gid,i.channel.id);return safeReply(i,{embeds:[info(r?`بازی فعال: **${r.min} تا ${r.max}**`: 'بازی فعالی نیست.')],flags:MessageFlags.Ephemeral});
   }
   if(n==='mod'){
-    if(['warn','unwarn','untimeout','unban'].includes(s)&&!owner(i.user.id))return safeReply(i,{embeds:[err('این دستور فقط برای Owner است.')],flags:MessageFlags.Ephemeral});
-    if(!await need(i,'moderation'))return;await deferEphemeral(i);const reason=stripMentions(i.options.getString('reason')||'بدون دلیل');
+    const accessKey=s==='ban'||s==='unban'?'moderation_ban':s==='kick'?'moderation_kick':s==='timeout'||s==='untimeout'?'moderation_timeout':'moderation_warn';
+    if(!await need(i,accessKey))return;await i.deferReply();const reason=stripMentions(i.options.getString('reason')||'بدون دلیل');
     try{
       if(s==='unban'){const id=i.options.getString('user');if(!/^\d{17,20}$/.test(id))return safeReply(i,{embeds:[err('User ID نامعتبر است.')],flags:MessageFlags.Ephemeral});const perm=botPermissionMessage(i.guild,PermissionFlagsBits.BanMembers,'Ban Members');if(perm)return safeReply(i,{embeds:[err(perm)],flags:MessageFlags.Ephemeral});await i.guild.members.unban(id,reason);await sendLog(i.guild,'moderation',{action:'unban',user:id,by:i.user.tag,reason});return safeReply(i,{embeds:[ok('Unban انجام شد.')],flags:MessageFlags.Ephemeral});}
       const u=await getMember(i.guild,i.options.getUser('user'));if(!u)return safeReply(i,{embeds:[err('Member پیدا نشد.')],flags:MessageFlags.Ephemeral});const hm=hierarchyMessage(i,u);if(hm&&!owner(i.user.id))return safeReply(i,{embeds:[err(hm)],flags:MessageFlags.Ephemeral});
@@ -479,11 +693,13 @@ async function handleSlash(i){
       }
       if(s==='unwarn'){const r=db.prepare('DELETE FROM warnings WHERE id=(SELECT id FROM warnings WHERE guild_id=? AND user_id=? ORDER BY id DESC LIMIT 1)').run(i.guild.id,u.id);if(!r.changes)return safeReply(i,{embeds:[err('Warningی برای این کاربر وجود ندارد.')],flags:MessageFlags.Ephemeral});await sendLog(i.guild,'warning',{action:'unwarn',target:u.user.tag,by:i.user.tag});return safeReply(i,{embeds:[ok('آخرین Warning حذف شد.')],flags:MessageFlags.Ephemeral});}
       if(s==='warnings'){const rows=db.prepare('SELECT * FROM warnings WHERE guild_id=? AND user_id=? ORDER BY id DESC LIMIT 20').all(i.guild.id,u.id);return safeReply(i,{embeds:[info(rows.length?rows.map((r,n)=>`${n+1}. <@${r.moderator_id}> — <t:${Math.floor(r.created_at/1000)}:R> — ${clamp(r.reason,200)}`).join('\n'):'هشداری ثبت نشده.')],flags:MessageFlags.Ephemeral});}
-      await sendLog(i.guild,'moderation',{action:s,target:u.user.tag,by:i.user.tag,reason});return safeReply(i,{embeds:[ok('عملیات انجام شد.')],flags:MessageFlags.Ephemeral});
+      await sendLog(i.guild,'moderation',{action:s,target:u.user.tag,target_id:u.id,user_id:u.id,by:i.user.tag,actor_id:i.user.id,reason});
+      const publicText=s==='warn'?`⚠️ <@${u.id}> توسط <@${i.user.id}> اخطار گرفت.`:s==='timeout'?`⏳ <@${u.id}> توسط <@${i.user.id}> Timeout شد.`:s==='kick'?`👢 <@${u.id}> توسط <@${i.user.id}> Kick شد.`:`🔨 <@${u.id}> توسط <@${i.user.id}> Ban شد.`;
+      return i.editReply({embeds:[ok(`${publicText}\n**دلیل:** ${reason}`)],allowedMentions:{users:[u.id,i.user.id]}});
     }catch(e){await sendLog(i.guild,'moderation',{action:'error',error:e.message,by:i.user.tag}).catch(()=>{});return safeReply(i,{embeds:[err(`عملیات ناموفق بود: ${clamp(e.message,1000)}`)],flags:MessageFlags.Ephemeral});}
   }
   if(n==='welcome'){
-    if(!await need(i,'staff'))return;const cfg={...(getSettings(i.guild.id).welcome||{})};if(s==='set'){const ch=i.options.getChannel('channel');const me=i.guild.members.me;if(!textChannel(ch))return safeReply(i,{embeds:[err('Channel معتبر نیست.')],flags:MessageFlags.Ephemeral});if(!me||!ch.permissionsFor(me).has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))return safeReply(i,{embeds:[err('Bot در این Channel دسترسی ارسال/Embed ندارد.')],flags:MessageFlags.Ephemeral});cfg.channelId=ch.id;cfg.text=stripMentions(i.options.getString('text')).slice(0,4000);await setSettings(i.guild.id,{welcome:cfg});return safeReply(i,{embeds:[ok(`Welcome → <#${ch.id}>`)],flags:MessageFlags.Ephemeral});}await setSettings(i.guild.id,{welcome:{}});return safeReply(i,{embeds:[ok('Welcome خاموش شد.')],flags:MessageFlags.Ephemeral});
+    if(!await need(i,'staff'))return;const cfg={...(getSettings(i.guild.id).welcome||{})};if(s==='set'){const ch=i.options.getChannel('channel');const me=i.guild.members.me;if(!textChannel(ch))return safeReply(i,{embeds:[err('Channel معتبر نیست.')],flags:MessageFlags.Ephemeral});if(!me||!botCanUseChannel(ch,i.guild,[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))return safeReply(i,{embeds:[err('Bot در این Channel دسترسی ارسال/Embed ندارد.')],flags:MessageFlags.Ephemeral});cfg.channelId=ch.id;cfg.text=String(i.options.getString('text')||'خوش آمدی [user] به [server]!').slice(0,4000);await setSettings(i.guild.id,{welcome:cfg});return safeReply(i,{embeds:[ok(`Welcome → <#${ch.id}>`)],flags:MessageFlags.Ephemeral});}await setSettings(i.guild.id,{welcome:{}});return safeReply(i,{embeds:[ok('Welcome خاموش شد.')],flags:MessageFlags.Ephemeral});
   }
   if(n==='customcmd'){
     if(!await need(i,'staff'))return;const name=i.options.getString('name').toLowerCase().trim().slice(0,32);if(!/^[a-z0-9_-]+$/.test(name))return safeReply(i,{embeds:[err('نام Custom Command باید فقط شامل a-z، 0-9، _ یا - باشد.')],flags:MessageFlags.Ephemeral});if(s==='set')db.prepare('INSERT INTO custom_commands(guild_id,name,response) VALUES(?,?,?) ON CONFLICT(guild_id,name) DO UPDATE SET response=excluded.response').run(i.guild.id,name,stripMentions(i.options.getString('response')));else db.prepare('DELETE FROM custom_commands WHERE guild_id=? AND name=?').run(i.guild.id,name);return safeReply(i,{embeds:[ok('Custom Command به‌روزرسانی شد.')],flags:MessageFlags.Ephemeral});
@@ -502,7 +718,7 @@ async function handleSlash(i){
     const inviteReady=!!me?.permissions.has(PermissionFlagsBits.ManageGuild);const dbIntegrity=integrityCheck();
     const auditReady=!!me?.permissions.has(PermissionFlagsBits.ViewAuditLog);
     const voiceReady=!!me?.permissions.has(PermissionFlagsBits.Connect)&&!!me?.permissions.has(PermissionFlagsBits.Speak);
-    checks.push(`DB: ${dbIntegrity==='ok'?'✅':'❌ '+dbIntegrity}`);checks.push(`Bot Manage Roles: ${me?.permissions.has(PermissionFlagsBits.ManageRoles)?'✅':'❌'}`);checks.push(`Bot Manage Channels: ${me?.permissions.has(PermissionFlagsBits.ManageChannels)?'✅':'❌'}`);checks.push(`Audit Log: ${auditReady?'✅':'❌'}`);checks.push(`Invite Tracking: ${inviteReady?'✅':'❌ Manage Guild'}`);checks.push(`Voice: ${voiceReady?'✅':'❌ Connect/Speak'}`);checks.push(`OpenAI Key: ${process.env.OPENAI_API_KEY?'✅':'❌'}`);checks.push(`AI Channel: ${s.ai?.channelId?`<#${s.ai.channelId}>`:'—'}`);checks.push(`Ticket Support: ${s.ticket?.supportRoleId?`<@&${s.ticket.supportRoleId}>`:'—'}`);checks.push(`Exchange: ${s.exchange?.accessRoleId?`<@&${s.exchange.accessRoleId}>`:'—'}`);return safeReply(i,{embeds:[info(checks.join('\n'))],flags:MessageFlags.Ephemeral});
+    checks.push(`DB: ${dbIntegrity==='ok'?'✅':'❌ '+dbIntegrity}`);checks.push(`Bot Manage Roles: ${me?.permissions.has(PermissionFlagsBits.ManageRoles)?'✅':'❌'}`);checks.push(`Bot Manage Channels: ${me?.permissions.has(PermissionFlagsBits.ManageChannels)?'✅':'❌'}`);checks.push(`Audit Log: ${auditReady?'✅':'❌'}`);checks.push(`Invite Tracking: ${inviteReady?'✅':'❌ Manage Guild'}`);checks.push(`Voice: ${voiceReady?'✅':'❌ Connect/Speak'}`);checks.push(`OpenAI Key: ${process.env.OPENAI_API_KEY?'✅':'❌'}`);checks.push(`AI Channel: ${s.ai?.channelId?`<#${s.ai.channelId}>`:'—'}`);checks.push(`Ticket Support: ${s.ticket?.supportRoleId?`<@&${s.ticket.supportRoleId}>`:'—'}`);checks.push(`Exchange: ${s.exchange?.roleId?`<@&${s.exchange.roleId}>`:'—'}`);return safeReply(i,{embeds:[info(checks.join('\n'))],flags:MessageFlags.Ephemeral});
   }
 }
 
@@ -511,6 +727,25 @@ async function onInteraction(i){
     if(i.isChatInputCommand())return await handleSlash(i);
     if(i.isModalSubmit()) {
       const [kind,a]=i.customId.split(':');
+      if(kind==='exchange_create_modal'){
+        await deferEphemeral(i);
+        const ex=getSettings(i.guild.id).exchange||{};
+        const acceptId=ex.acceptChannelId;
+        if(!acceptId||!ex.roleId)return safeReply(i,{embeds:[err('Exchange هنوز کامل تنظیم نشده است.')],flags:MessageFlags.Ephemeral});
+        const ch=await i.guild.channels.fetch(acceptId).catch(()=>null);
+        if(!textChannel(ch)||!botCanUseChannel(ch,i.guild,[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.SendMessages,PermissionFlagsBits.EmbedLinks]))return safeReply(i,{embeds:[err('Accept Channel معتبر نیست یا Bot دسترسی لازم را ندارد.')],flags:MessageFlags.Ephemeral});
+        const banner=i.fields.getTextInputValue('banner_url').trim();
+        const text=stripMentions(i.fields.getTextInputValue('text')||'').slice(0,4000);
+        if(!/^https?:\/\//i.test(banner))return safeReply(i,{embeds:[err('Banner URL باید یک لینک http/https معتبر باشد.')],flags:MessageFlags.Ephemeral});
+        const reqId=db.prepare('INSERT INTO exchange_requests(guild_id,channel_id,requester_id,text,banner_url,status) VALUES(?,?,?,?,?,?)').run(i.guild.id,ch.id,i.user.id,text,banner,'pending').lastInsertRowid;
+        try{
+          const emb=new EmbedBuilder().setColor(0x1ABC9C).setTitle('💱 Exchange Request').setDescription(text).addFields({name:'درخواست‌دهنده',value:`<@${i.user.id}>`,inline:true},{name:'Request ID',value:String(reqId),inline:true}).setImage(banner);
+          const msg=await ch.send({embeds:[emb],components:[new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`exchange:accept:${reqId}`).setLabel('Accept').setEmoji('✅').setStyle(ButtonStyle.Success),new ButtonBuilder().setCustomId(`exchange:reject:${reqId}`).setLabel('Reject').setEmoji('❌').setStyle(ButtonStyle.Danger))],allowedMentions:{users:[i.user.id]}});
+          const updated=db.prepare('UPDATE exchange_requests SET message_id=? WHERE id=? AND status="pending"').run(msg.id,reqId);if(!updated.changes){await msg.delete().catch(()=>{});throw new Error('EXCHANGE_REQUEST_DB_FAILED');}
+        }catch(e){db.prepare('DELETE FROM exchange_requests WHERE id=?').run(reqId);throw e;}
+        await sendLog(i.guild,'exchange',{action:'created',request:reqId,requester:i.user.tag,user_id:i.user.id});
+        return safeReply(i,{embeds:[ok(`درخواست Exchange ساخته شد. ID: ${reqId}`)],flags:MessageFlags.Ephemeral});
+      }
       if(kind==='ticket_close_modal'){
         await deferEphemeral(i);
         const ticket=tickets.getById(Number(a));
@@ -518,6 +753,22 @@ async function onInteraction(i){
         const reason=stripMentions(i.fields.getTextInputValue('reason')||'بدون دلیل');
         return safeReply(i,{embeds:[await tickets.close(i.guild,ticket.id,i.member,reason)?ok('Ticket بسته شد.'):err('بستن Ticket ناموفق بود.')],flags:MessageFlags.Ephemeral});
       }
+    }
+    if(i.isStringSelectMenu()){
+      if(i.customId.startsWith('ticket_panel_menu:')){
+        const key=i.values[0];
+        const panel=getSettings(i.guild.id).ticket?.panels?.[key];
+        if(!panel)return safeReply(i,{embeds:[err('این Ticket Panel دیگر وجود ندارد یا تنظیمات آن ناقص است.')],flags:MessageFlags.Ephemeral});
+        const category=await i.guild.channels.fetch(panel.categoryId).catch(()=>null);
+        if(!category||category.type!==ChannelType.GuildCategory)return safeReply(i,{embeds:[err('Category این Ticket Panel حذف شده است؛ پنل را اصلاح کن.')],flags:MessageFlags.Ephemeral});
+        const btn=buttonWithEmoji(new ButtonBuilder().setCustomId(`ticket_open:${key}`).setLabel(panel.button).setStyle(ButtonStyle.Primary),panel.emoji||'🎫');
+        const embed=new EmbedBuilder().setColor(0x5865F2).setTitle(`${panel.emoji||'🎫'} ${panel.name}`).setDescription(panel.text);
+        return i.reply({embeds:[embed],components:[new ActionRowBuilder().addComponents(btn)]});
+      }
+      if(i.customId!=='control_menu')return;
+      const value=i.values[0];
+      if(!owner(i.user.id)&&!isAdmin(i.member))return safeReply(i,{embeds:[err('فقط Owner یا Administrator می‌تواند از این پنل استفاده کند.')],flags:MessageFlags.Ephemeral});
+      return i.update({embeds:[controlHelp(value)],components:[buildControlMenu()]});
     }
     if(!i.isButton())return;
     const [kind,a,b,c]=i.customId.split(':');
@@ -617,7 +868,7 @@ async function processMemberAdd(member){
 }
 client.once('ready',async()=>{
   console.log(`${botName} ready as ${client.user.tag}`);outbox.recoverFailed();delivery.recover();if(!guildId)throw new Error('GUILD_ID missing');
-  for(const g of [...client.guilds.cache.values()]){if(g.id!==guildId){await g.leave().catch(()=>{});continue;}await refreshInvites(g);await tickets.reconcile(g).catch(e=>console.error('[TICKET RECONCILE]',e.message));await xp.reconcileGuild(g).then(r=>{if(r.length)console.error('[XP RECONCILE]',JSON.stringify(r.slice(0,3)))}).catch(e=>console.error('[XP RECONCILE]',e.message));await staff.reconcileGuild(g).then(r=>{if(r.length)console.error('[STAFF RECONCILE]',JSON.stringify(r.slice(0,3)))}).catch(e=>console.error('[STAFF RECONCILE]',e.message));const q=music247.get(g.id);if(q){const vc=await g.channels.fetch(q.voice_channel_id).catch(()=>null);if(vc?.isVoiceBased())await music.ensure247(g,vc,null).catch(e=>console.error('[247 STARTUP]',e.message));}}
+  for(const g of [...client.guilds.cache.values()]){if(g.id!==guildId){await g.leave().catch(()=>{});continue;}await refreshInvites(g);await tickets.reconcile(g).catch(e=>console.error('[TICKET RECONCILE]',e.message));await xp.reconcileGuild(g).then(r=>{if(r.length)console.error('[XP RECONCILE]',JSON.stringify(r.slice(0,3)))}).catch(e=>console.error('[XP RECONCILE]',e.message));await staff.reconcileGuild(g).then(r=>{if(r.length)console.error('[STAFF RECONCILE]',JSON.stringify(r.slice(0,3)))}).catch(e=>console.error('[STAFF RECONCILE]',e.message));}
   if(intervalsStarted)return;intervalsStarted=true;
   const addTimer=(fn,ms)=>{const t=setInterval(fn,ms);timers.add(t);return t;};
   addTimer(()=>outbox.drain(client).catch(e=>console.error('[OUTBOX]',e.message)),5000);
@@ -661,7 +912,6 @@ client.once('ready',async()=>{
   addTimer(()=>updateTicketClaimLeaderboard().catch(e=>console.error('[TICKET LEADERBOARD TIMER]',e.message)),60*1000);
   addTimer(()=>cleanupLogs(logRetentionDays),6*60*60*1000);
   addTimer(()=>ai.cleanup(aiRetentionDays),6*60*60*1000);
-  addTimer(async()=>{const g=client.guilds.cache.get(guildId);if(!g)return;const cfg=music247.get(guildId);if(cfg){const vc=await g.channels.fetch(cfg.voice_channel_id).catch(()=>null);if(vc?.isVoiceBased())await music.ensure247(g,vc,null).catch(e=>console.error('[247 HEALTH]',e.message));}},20000);
   addTimer(()=>backupNow(undefined,backupRetention).catch(e=>console.error('[DB BACKUP]',e.message)),24*60*60*1000);
 });
 
@@ -699,7 +949,22 @@ client.on('messageCreate',async m=>{if(m.author.bot||!m.guild)return;try{
   for(const d of drops.active(m.guild.id,'text',m.channel.id)){if(m.content.trim()===d.trigger_text&&await drops.win(m.guild,d,m.author.id))break;}
 }catch(e){console.error('[MESSAGE CREATE]',e.message)}});
 client.on('guildMemberUpdate',async(a,b)=>{try{const added=b.roles.cache.filter(r=>!a.roles.cache.has(r.id)).map(r=>`<@&${r.id}>`),removed=a.roles.cache.filter(r=>!b.roles.cache.has(r.id)).map(r=>`<@&${r.id}>`);const changes={};let actor=null;if(a.user.username!==b.user.username){changes.username_before=a.user.username;changes.username_after=b.user.username}if(a.nickname!==b.nickname){changes.nickname_before=a.nickname||'none';changes.nickname_after=b.nickname||'none'}if(added.length)changes.roles_added=added.join(', ');if(removed.length)changes.roles_removed=removed.join(', ');if(added.length||removed.length)actor=await auditActor(b.guild,AuditLogEvent.MemberRoleUpdate,b.id);else if(a.nickname!==b.nickname||a.communicationDisabledUntilTimestamp!==b.communicationDisabledUntilTimestamp)actor=await auditActor(b.guild,AuditLogEvent.MemberUpdate,b.id);if(a.communicationDisabledUntilTimestamp!==b.communicationDisabledUntilTimestamp)changes.timeout=`${a.communicationDisabledUntilTimestamp||'none'} -> ${b.communicationDisabledUntilTimestamp||'none'}`;if(a.premiumSinceTimestamp!==b.premiumSinceTimestamp)changes.boost=`${a.premiumSinceTimestamp||'none'} -> ${b.premiumSinceTimestamp||'none'}`;if(Object.keys(changes).length)await sendLog(b.guild,'member',{action:'update',user:b.user.tag,...changes,...(actor?{by:actor}:{})});}catch(e){console.error('[MEMBER UPDATE]',e.message)}});
-client.on('voiceStateUpdate',async(a,b)=>{if(a.channelId===b.channelId&&a.serverMute===b.serverMute&&a.serverDeaf===b.serverDeaf&&a.selfMute===b.selfMute&&a.selfDeaf===b.selfDeaf&&a.selfStream===b.selfStream&&a.selfVideo===b.selfVideo)return;await sendLog(b.guild,'voice',{user:b.member?.user?.tag,from:a.channelId||'none',to:b.channelId||'none',serverMute:b.serverMute,serverDeaf:b.serverDeaf,selfMute:b.selfMute,selfDeaf:b.selfDeaf,stream:b.selfStream,video:b.selfVideo})});
+client.on('voiceStateUpdate',async(a,b)=>{
+  if(a.channelId===b.channelId&&a.serverMute===b.serverMute&&a.serverDeaf===b.serverDeaf&&a.selfMute===b.selfMute&&a.selfDeaf===b.selfDeaf&&a.selfStream===b.selfStream&&a.selfVideo===b.selfVideo)return;
+  // Only a state change belonging to the bot itself may clear AFK.
+  // A normal member leaving the same voice channel must never affect AFK.
+  const botId=client.user?.id;
+  if(botId && b.id===botId && !b.channelId){
+    const afk=afkConnections.get(b.guild.id);
+    // If a newer AFK session is already active, do not let an old disconnect
+    // event destroy the new session.
+    if(afk && (!a.channelId || afk.channelId===a.channelId)){
+      destroyAfk(b.guild.id,afk.connection);
+      await sendLog(b.guild,'voice',{user:b.member?.user?.tag||'bot',from:a.channelId||'none',to:'none',action:'afk_disconnected_no_reconnect'}).catch(()=>{});
+    }
+  }
+  await sendLog(b.guild,'voice',{user:b.member?.user?.tag,from:a.channelId||'none',to:b.channelId||'none',serverMute:b.serverMute,serverDeaf:b.serverDeaf,selfMute:b.selfMute,selfDeaf:b.selfDeaf,stream:b.selfStream,video:b.selfVideo})
+});
 async function auditActor(guild,type,targetId){
   try{
     for(let attempt=0;attempt<4;attempt++){
@@ -735,7 +1000,7 @@ client.on('emojiDelete',async e=>sendLog(e.guild,'emote',{action:'delete',name:e
 client.on('emojiUpdate',async(a,b)=>sendLog(b.guild,'emote',{action:'update',before:a.name,after:b.name,id:b.id,by:await auditActor(b.guild,AuditLogEvent.EmojiUpdate,b.id)}));
 client.on('error',e=>console.error('[CLIENT]',e));
 process.on('unhandledRejection',e=>console.error('[UNHANDLED]',e));
-async function shutdown(signal,exitCode=0){if(shuttingDown)return;shuttingDown=true;console.log(`[SHUTDOWN] ${signal}`);for(const t of timers)clearInterval(t);timers.clear();try{await backupNow(undefined,backupRetention).catch(e=>console.error('[BACKUP ON SHUTDOWN]',e.message));await client.destroy();}finally{process.exit(exitCode)}}
+async function shutdown(signal,exitCode=0){if(shuttingDown)return;shuttingDown=true;console.log(`[SHUTDOWN] ${signal}`);for(const t of timers)clearInterval(t);timers.clear();for(const [gid] of afkConnections)destroyAfk(gid);try{await backupNow(undefined,backupRetention).catch(e=>console.error('[BACKUP ON SHUTDOWN]',e.message));await client.destroy();}finally{process.exit(exitCode)}}
 process.on('SIGINT',()=>shutdown('SIGINT'));process.on('SIGTERM',()=>shutdown('SIGTERM'));process.on('uncaughtException',e=>{console.error('[UNCAUGHT]',e);shutdown('uncaughtException',1).catch(()=>process.exit(1))});
 if(!token)throw new Error('DISCORD_TOKEN missing');
-music.init(client,(g,t,p)=>sendLog(g,t,p)).then(()=>client.login(token)).catch(e=>{console.error('[BOOT]',e);process.exit(1)});
+client.login(token).catch(e=>{console.error('[BOOT]',e);process.exit(1)});

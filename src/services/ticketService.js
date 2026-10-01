@@ -4,18 +4,18 @@ const { sendLog } = require('./logService');
 const { withKeyLock } = require('./lockService');
 function logRecoveryFailure(guild,ticketId,operation,error){ db.prepare('INSERT INTO logs(guild_id,type,payload,created_at) VALUES(?,?,?,?)').run(guild.id,'ticket_recovery',JSON.stringify({ticket_id:ticketId,operation,error:String(error?.message||error)}),Date.now()); }
 
-const DEFAULT_TYPES = {
-  support: { name:'Support', emoji:'🎫', prefix:'support' },
-  exchange: { name:'Exchange', emoji:'💱', prefix:'exchange' },
-  staff: { name:'Staff', emoji:'👤', prefix:'staff' },
-  event: { name:'Event', emoji:'🎉', prefix:'event' }
-};
-
 function getTypes(guildId) {
-  const custom = getSettings(guildId).ticket?.types;
-  return { ...DEFAULT_TYPES, ...(custom || {}) };
+  // Ticket creation is panel-driven. There is intentionally no separate "type" editor.
+  const panels=getSettings(guildId).ticket?.panels||{};
+  return Object.fromEntries(Object.entries(panels).map(([key,p])=>[key,{
+    name:String(p?.name||key),
+    emoji:p?.emoji||'🎫',
+    prefix:p?.prefix||key,
+    welcome:p?.welcome||'سلام {user} 👋\nتیکت شما ایجاد شد.',
+    categoryId:p?.categoryId,
+    text:p?.text||''
+  }]));
 }
-async function saveTypes(guildId, types) { return setSettings(guildId, { ticket: { types } }); }
 function supportRoleId(guild) { return getSettings(guild.id).ticket?.supportRoleId || null; }
 function getByChannel(guildId, channelId) { return db.prepare('SELECT * FROM tickets WHERE guild_id=? AND channel_id=?').get(guildId,channelId)||null; }
 function getById(id) { return db.prepare('SELECT * FROM tickets WHERE id=?').get(id)||null; }
@@ -46,9 +46,11 @@ async function create(guild,interaction,key){
   return withKeyLock(`ticket-create:${guild.id}:${interaction.user.id}`,async()=>{
     const type=getTypes(guild.id)[key]; if(!type)return {error:'TICKET_TYPE_NOT_FOUND'};
     const settings=getSettings(guild.id); const support=supportRoleId(guild); if(!support)return {error:'TICKET_SUPPORT_ROLE_MISSING'};
-    const bot=guild.members.me; if(!bot?.permissions.has(PermissionFlagsBits.ManageChannels))return {error:'Bot دسترسی Manage Channels ندارد.'};
+    const bot=guild.members.me;
+    if(!bot?.permissions?.has(PermissionFlagsBits.ManageChannels))return {error:'Bot دسترسی Manage Channels ندارد.'};
+    if(!bot.permissions.has(PermissionFlagsBits.ManageRoles))return {error:'Bot برای مدیریت Permission Overwriteها به Manage Roles نیاز دارد.'};
     const supportRole=guild.roles.cache.get(support); if(!supportRole||supportRole.managed||supportRole.position>=bot.roles.highest.position)return {error:'Ticket Support Role باید پایین‌تر از Role بات باشد.'};
-    let category=null; const catId=settings.ticket?.categoryId;
+    let category=null; const catId=type?.categoryId || settings.ticket?.categoryId;
     if(catId){category=await guild.channels.fetch(catId).catch(()=>null);if(!category)return {error:'Ticket Category پیدا نشد.'};if(category.type!==ChannelType.GuildCategory)return {error:'Ticket Category معتبر نیست.'};}
 
     const openKey=`${guild.id}:${interaction.user.id}`;
@@ -66,7 +68,11 @@ async function create(guild,interaction,key){
     try{
       const inserted=db.prepare('INSERT INTO tickets(guild_id,channel_id,opener_id,type,created_at,status,open_key) VALUES(?,?,?,?,?,?,?)').run(guild.id,channel.id,interaction.user.id,key,Date.now(),'open',openKey);
       ticket=getById(inserted.lastInsertRowid);
-      const msg=await channel.send({content:`<@${interaction.user.id}> <@&${support}>`,embeds:[buildEmbed(ticket,type)],components:[buildControls(ticket)],allowedMentions:{users:[interaction.user.id],roles:[support]}});
+      const welcomeText=String(type?.welcome||'سلام {user} 👋\nتیکت شما ایجاد شد.')
+  .replaceAll('{user}',`<@${interaction.user.id}>`).replaceAll('{support}',`<@&${support}>`);
+      const welcomeEmbed=new EmbedBuilder().setColor(0x57F287).setTitle('👋 خوش آمدید').setDescription(welcomeText);
+      await channel.send({content:`<@${interaction.user.id}> <@&${support}>`,embeds:[welcomeEmbed],allowedMentions:{users:[interaction.user.id],roles:[support]}});
+      const msg=await channel.send({embeds:[buildEmbed(ticket,type)],components:[buildControls(ticket)]});
       const updated=db.prepare('UPDATE tickets SET control_message_id=? WHERE id=?').run(msg.id,ticket.id); if(!updated.changes)throw new Error('TICKET_CONTROL_DB_FAILED');
       await sendLog(guild,'ticket',{action:'created',ticket:ticket.id,channel:channel.name,user:interaction.user.tag,type:key,support_role:support});
       return {channel,ticket:getById(ticket.id),existing:false};
@@ -244,7 +250,7 @@ async function addUser(guild,id,userId,member){
 
 async function removeUser(guild,id,userId,member){
   return withKeyLock(`ticket:${id}`,async()=>{
-    const t=getById(id);if(!t||t.guild_id!==guild.id||t.status!=='open')return false;assertSupport(guild,member);if(userId===t.opener_id)return false;
+    const t=getById(id);if(!t||t.guild_id!==guild.id||t.status!=='open')return false;if(member?.id!==t.opener_id)return false;if(userId===t.opener_id)return false;
     const ch=await guild.channels.fetch(t.channel_id).catch(()=>null);if(!ch)return false;
     if(!db.prepare('SELECT 1 FROM ticket_participants WHERE ticket_id=? AND user_id=? AND active=1').get(id,userId))return false;
     const existingOverwrite=ch.permissionOverwrites.cache.get(userId);const previousOverwrite=existingOverwrite?{allow:existingOverwrite.allow.bitfield,deny:existingOverwrite.deny.bitfield}:null;
@@ -339,4 +345,4 @@ function claimLeaderboard(guildId){
     LIMIT 20
   `).all(guildId);
 }
-module.exports={getTypes,saveTypes,getByChannel,getById,supportRoleId,isStaff:isSupport,create,claim,close,reopen,addUser,removeUser,transcript,syncSupportRole,reconcile,activeParticipants,recordFeedback,claimLeaderboard};
+module.exports={getTypes,getByChannel,getById,supportRoleId,isStaff:isSupport,create,claim,close,reopen,addUser,removeUser,transcript,syncSupportRole,reconcile,activeParticipants,recordFeedback,claimLeaderboard};

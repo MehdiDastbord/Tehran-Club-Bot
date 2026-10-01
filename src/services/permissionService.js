@@ -3,7 +3,7 @@ const { getSettings } = require('../db');
 const { isOwner, isAdmin, hasRole } = require('../utils');
 const { owners } = require('../config');
 
-const ACCESS_KEYS = ['giveaway','exchange','logs','ticket','moderation','staff','music','xp','invite','ai','drop','emote','guess'];
+const ACCESS_KEYS = ['giveaway','exchange','logs','ticket','staff','xp','invite','ai','drop','emote','guess','moderation_ban','moderation_kick','moderation_timeout','moderation_warn'];
 
 function hasAccess(member, key, { admin = true, owner = true } = {}) {
   if (owner && isOwner(member?.id, owners)) return true;

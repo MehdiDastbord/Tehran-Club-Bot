@@ -1,6 +1,6 @@
 {
   "name": "tehran-club-bot",
-  "version": "20.0.0",
+  "version": "23.0.0",
   "private": true,
   "description": "Tehran Club Discord bot - hardened single-guild discord.js bot",
   "main": "src/index.js",
@@ -16,13 +16,10 @@
     "node": ">=22.12.0"
   },
   "dependencies": {
-    "@discord-player/extractor": "7.2.0",
     "@discordjs/voice": "0.19.2",
     "better-sqlite3": "13.0.3",
-    "discord-player": "7.2.0",
     "discord.js": "14.27.0",
     "dotenv": "17.2.2",
-    "ffmpeg-static": "5.3.0",
     "openai": "7.17.0"
   }
 }

@@ -210,12 +210,6 @@ CREATE TABLE IF NOT EXISTS guess_games (
   active INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS music_247 (
-  guild_id TEXT PRIMARY KEY,
-  voice_channel_id TEXT NOT NULL,
-  text_channel_id TEXT,
-  enabled INTEGER NOT NULL DEFAULT 1
-);
 CREATE TABLE IF NOT EXISTS exchange_requests (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   guild_id TEXT NOT NULL,
@@ -225,7 +219,8 @@ CREATE TABLE IF NOT EXISTS exchange_requests (
   text TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
   decided_by TEXT,
-  decided_at INTEGER
+  decided_at INTEGER,
+  banner_url TEXT
 );
 CREATE TABLE IF NOT EXISTS embed_buttons (
   message_id TEXT NOT NULL,
@@ -249,6 +244,9 @@ CREATE INDEX IF NOT EXISTS idx_warnings_user ON warnings(guild_id,user_id,create
 CREATE INDEX IF NOT EXISTS idx_exchange_status ON exchange_requests(guild_id,status,id);
 `);
 
+// Remove legacy Music/24-7 persistence from databases created by older versions.
+try { db.exec('DROP TABLE IF EXISTS music_247'); } catch (e) { console.error('[DB LEGACY MUSIC CLEANUP]', e.message); }
+
 function columnNames(table) {
   return db.prepare(`PRAGMA table_info(${table})`).all().map((x) => x.name);
 }
@@ -257,6 +255,7 @@ function addColumn(table, column, ddl) {
 }
 
 try {
+  addColumn('exchange_requests', 'banner_url', 'TEXT');
   addColumn('invites', 'fake_leaves', 'INTEGER NOT NULL DEFAULT 0');
   addColumn('invited_members', 'original_inviter_id', 'TEXT');
   addColumn('invited_members', 'active', 'INTEGER NOT NULL DEFAULT 1');

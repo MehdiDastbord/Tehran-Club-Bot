@@ -83,7 +83,6 @@ async function changeRoleMapping(guild,level,roleId,remove=false,actorTag='syste
 async function applyXp(message) {
   const guildId=message.guild.id,userId=message.author.id,settings={...(getSettings(guildId).xp||{})};
   if(settings.enabled===false||message.author.bot)return {awarded:false,reason:'disabled'};
-  if(settings.channelId&&settings.channelId!==message.channel.id)return {awarded:false,reason:'channel'};
   const cooldown=Math.max(0,Number(settings.cooldownMs??60000));const min=Math.max(0,Math.floor(Number(settings.min??10))),max=Math.max(min,Math.floor(Number(settings.max??20)));
   return withReadLock(`xp:${guildId}`,()=>withKeyLock(`xp:${guildId}:${userId}`,async()=>{
     const row=getXp(guildId,userId);const now=Date.now();if(now-row.last_xp_at<cooldown)return {awarded:false,reason:'cooldown',row};

@@ -12,8 +12,6 @@ register(new SlashCommandBuilder().setName('leaderboard').setDescription('XP Lea
 register(new SlashCommandBuilder().setName('banner').setDescription('نمایش بنر سرور'));
 
 const xp = new SlashCommandBuilder().setName('xp').setDescription('مدیریت کامل XP');
-xp.addSubcommand(s => s.setName('setchannel').setDescription('کانال دریافت XP پیام')
-  .addChannelOption(o => o.setName('channel').setDescription('Channel').addChannelTypes(ChannelType.GuildText).setRequired(true)));
 xp.addSubcommand(s => s.setName('setlevelup').setDescription('کانال پیام Level Up')
   .addChannelOption(o => o.setName('channel').setDescription('Channel').addChannelTypes(ChannelType.GuildText).setRequired(true)));
 xp.addSubcommand(s => s.setName('settings').setDescription('تنظیم Curve/XP/Cooldown')
@@ -41,7 +39,7 @@ xp.addSubcommand(s => s.setName('removerole').setDescription('حذف Role از L
 xp.addSubcommand(s => s.setName('roles').setDescription('لیست Level Roleها'));
 register(xp);
 
-const logTypes = ['message','member','moderation','ticket','giveaway','drop','exchange','xp','invite','voice','server','staff','ai','music','emote','guess','warning'];
+const logTypes = ['message','member','moderation','ticket','giveaway','drop','exchange','xp','invite','voice','server','staff','ai','emote','guess','warning'];
 const logs = new SlashCommandBuilder().setName('logs').setDescription('مدیریت Logها');
 logs.addSubcommand(s => s.setName('set').setDescription('تنظیم یک Log Channel')
   .addStringOption(o => o.setName('type').setDescription('نوع Log').setRequired(true)
@@ -53,13 +51,10 @@ logs.addSubcommand(s => s.setName('reset').setDescription('حذف تنظیم ی�
 logs.addSubcommand(s => s.setName('resetall').setDescription('حذف تمام Log Channelها'));
 logs.addSubcommand(s => s.setName('status').setDescription('نمایش وضعیت Logها'));
 logs.addSubcommand(s => s.setName('test').setDescription('تست ارسال Log'));
-logs.addSubcommand(s => {
-  s.setName('setup').setDescription('تنظیم چند Log Channel با یک دستور');
-  for (const type of logTypes) {
-    s.addChannelOption(o => o.setName(type).setDescription(`${type} log`).addChannelTypes(ChannelType.GuildText));
-  }
-  return s;
-});
+const setup = logs.addSubcommand(s => s.setName('setup').setDescription('تنظیم چند Log Channel با یک دستور'));
+for (const type of logTypes) {
+  setup.addChannelOption(o => o.setName(type).setDescription(`${type} log`).addChannelTypes(ChannelType.GuildText));
+}
 register(logs);
 
 // Legacy/shortcut command: configure all log channels in one command.
@@ -135,40 +130,29 @@ ai.addSubcommand(s => s.setName('disable').setDescription('خاموش کردن A
 ai.addSubcommand(s => s.setName('clear').setDescription('پاک کردن حافظه AI'));
 register(ai);
 
-const music = new SlashCommandBuilder().setName('music').setDescription('Music Player');
-for (const [name, description] of [['play','Play'],['skip','Skip'],['pause','Pause'],['resume','Resume'],['stop','Stop'],['leave','Leave'],['queue','Queue'],['nowplaying','Now Playing'],['shuffle','Shuffle']]) {
-  music.addSubcommand(s => {
-    s.setName(name).setDescription(description);
-    if (name === 'play') s.addStringOption(o => o.setName('query').setDescription('Song title or supported URL').setRequired(true));
-    return s;
-  });
-}
-music.addSubcommand(s => s.setName('volume').setDescription('Volume').addIntegerOption(o => o.setName('value').setDescription('0-100').setMinValue(0).setMaxValue(100).setRequired(true)));
-music.addSubcommand(s => s.setName('loop').setDescription('0 off, 1 track, 2 queue, 3 autoplay').addIntegerOption(o => o.setName('mode').setDescription('Mode').setMinValue(0).setMaxValue(3).setRequired(true)));
-music.addSubcommand(s => s.setName('247').setDescription('ماندن در Voice حتی بدون Track').addBooleanOption(o => o.setName('enabled').setDescription('Enabled').setRequired(true)));
-register(music);
+register(new SlashCommandBuilder().setName('afk').setDescription('ماندن بی‌صدا در Voice فعلی'));
 
 const ticket = new SlashCommandBuilder().setName('ticket').setDescription('Ticket System');
-ticket.addSubcommand(s => s.setName('panel').setDescription('Create panel')
-  .addStringOption(o => o.setName('title').setDescription('Title').setRequired(true))
-  .addStringOption(o => o.setName('text').setDescription('Text').setRequired(true))
-  .addStringOption(o => o.setName('types').setDescription('Comma separated type keys').setRequired(true))
-  .addRoleOption(o => o.setName('supportrole').setDescription('Ticket Support Role').setRequired(true))
-  .addChannelOption(o => o.setName('category').setDescription('Category')));
-ticket.addSubcommand(s => s.setName('addtype').setDescription('Add ticket type')
-  .addStringOption(o => o.setName('key').setDescription('Key').setRequired(true))
-  .addStringOption(o => o.setName('name').setDescription('Name').setRequired(true))
-  .addStringOption(o => o.setName('emoji').setDescription('Emoji'))
-  .addStringOption(o => o.setName('prefix').setDescription('Prefix')));
-ticket.addSubcommand(s => s.setName('setrole').setDescription('Set Ticket Support Role').addRoleOption(o => o.setName('role').setDescription('Role').setRequired(true)));
+ticket.addSubcommand(s => {
+  s.setName('addpanel').setDescription('ساخت یک Ticket Panel مستقل');
+  s.addStringOption(o=>o.setName('name').setDescription('نام پنل').setMaxLength(80).setRequired(true));
+  s.addChannelOption(o=>o.setName('category').setDescription('Category تیکت').addChannelTypes(ChannelType.GuildCategory).setRequired(true));
+  s.addStringOption(o=>o.setName('text').setDescription('متن پنل').setMaxLength(2000).setRequired(true));
+  s.addStringOption(o=>o.setName('welcome').setDescription('پیام خوش‌آمد؛ {user} و {support} قابل استفاده‌اند').setMaxLength(1500).setRequired(true));
+  s.addStringOption(o=>o.setName('emoji').setDescription('Emoji دکمه').setMaxLength(100).setRequired(true));
+  s.addStringOption(o=>o.setName('button').setDescription('متن دکمه').setMaxLength(80).setRequired(true));
+  return s;
+});
+ticket.addSubcommand(s => s.setName('menu').setDescription('ساخت منوی کشویی از تمام پنل‌های Ticket'));
+ticket.addSubcommand(s => s.setName('setrole').setDescription('Set Ticket Support Role').addRoleOption(o=>o.setName('role').setDescription('Role').setRequired(true)));
 ticket.addSubcommand(s => s.setName('settings').setDescription('Ticket settings'));
 ticket.addSubcommand(s => s.setName('claim').setDescription('Claim Ticket'));
-ticket.addSubcommand(s => s.setName('close').setDescription('Close Ticket').addStringOption(o => o.setName('reason').setDescription('Close reason')));
+ticket.addSubcommand(s => s.setName('close').setDescription('Close Ticket').addStringOption(o=>o.setName('reason').setDescription('Close reason')));
 ticket.addSubcommand(s => s.setName('reopen').setDescription('Reopen Ticket'));
 ticket.addSubcommand(s => s.setName('transcript').setDescription('Transcript'));
-ticket.addSubcommand(s => s.setName('leaderboard').setDescription('Set Claim Leaderboard channel').addChannelOption(o => o.setName('channel').setDescription('Channel').addChannelTypes(ChannelType.GuildText).setRequired(true)));
-ticket.addSubcommand(s => s.setName('add').setDescription('Add user').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)));
-ticket.addSubcommand(s => s.setName('remove').setDescription('Remove user').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)));
+ticket.addSubcommand(s => s.setName('leaderboard').setDescription('Set Claim Leaderboard channel').addChannelOption(o=>o.setName('channel').setDescription('Channel').addChannelTypes(ChannelType.GuildText).setRequired(true)));
+ticket.addSubcommand(s => s.setName('add').setDescription('Add user').addUserOption(o=>o.setName('user').setDescription('User').setRequired(true)));
+ticket.addSubcommand(s => s.setName('remove').setDescription('Remove user').addUserOption(o=>o.setName('user').setDescription('User').setRequired(true)));
 register(ticket);
 
 const giveaway = new SlashCommandBuilder().setName('giveaway').setDescription('Giveaway');
@@ -191,16 +175,13 @@ drop.addSubcommand(s => s.setName('end').setDescription('End active drop').addIn
 drop.addSubcommand(s => s.setName('list').setDescription('List active drops in this channel'));
 register(drop);
 
-register(new SlashCommandBuilder().setName('exchange').setDescription('Create Exchange request')
-  .addStringOption(o => o.setName('text').setDescription('Request').setRequired(true)));
-register(new SlashCommandBuilder().setName('exchange-config').setDescription('Exchange settings')
-  .addChannelOption(o => o.setName('channel').setDescription('Request channel').addChannelTypes(ChannelType.GuildText).setRequired(true))
-  .addRoleOption(o => o.setName('role').setDescription('Exchange Access Role').setRequired(true)));
-register(new SlashCommandBuilder().setName('setex').setDescription('تنظیم کانال خروجی Exchange تأییدشده')
-  .addChannelOption(o => o.setName('channel').setDescription('Approved Exchange channel').addChannelTypes(ChannelType.GuildText).setRequired(true)));
-register(new SlashCommandBuilder().setName('exchange-manage').setDescription('Accept/Reject Exchange')
-  .addStringOption(o => o.setName('action').setDescription('Action').setRequired(true).addChoices({ name: 'accept', value: 'accept' }, { name: 'reject', value: 'reject' }))
-  .addIntegerOption(o => o.setName('request').setDescription('Request ID').setMinValue(1).setRequired(true)));
+register(new SlashCommandBuilder().setName('exchange').setDescription('باز کردن فرم Exchange'));
+register(new SlashCommandBuilder().setName('exchange-accept-channel').setDescription('تنظیم Channel دریافت درخواست Exchange')
+  .addChannelOption(o => o.setName('channel').setDescription('Accept Channel').addChannelTypes(ChannelType.GuildText).setRequired(true)));
+register(new SlashCommandBuilder().setName('exchange-main-channel').setDescription('تنظیم Channel نهایی Exchange')
+  .addChannelOption(o => o.setName('channel').setDescription('Main Exchange Channel').addChannelTypes(ChannelType.GuildText).setRequired(true)));
+register(new SlashCommandBuilder().setName('exchange-role').setDescription('تنظیم Exchange Role')
+  .addRoleOption(o => o.setName('role').setDescription('Exchange Role').setRequired(true)));
 register(new SlashCommandBuilder().setName('addemote').setDescription('Add Emoji')
   .addStringOption(o => o.setName('emoji').setDescription('<:name:id> or URL').setRequired(true))
   .addStringOption(o => o.setName('name').setDescription('Optional name')));
@@ -243,14 +224,12 @@ register(custom);
 
 register(new SlashCommandBuilder().setName('setaccessrole').setDescription('Set an Access Role')
   .addStringOption(o => o.setName('type').setDescription('Type').setRequired(true)
-    .addChoices(...['giveaway','exchange','logs','ticket','moderation','staff','music','xp','invite','ai','drop','emote','guess'].map(x => ({ name: x, value: x }))))
+    .addChoices(...['giveaway','exchange','logs','ticket','moderation','staff','xp','invite','ai','drop','emote','guess'].map(x => ({ name: x, value: x }))))
   .addRoleOption(o => o.setName('role').setDescription('Role').setRequired(true)));
 // Owner-only utility commands. Discord supports at most 25 buttons per message;
 // the embed command accepts 1-25 and is intentionally documented for 10+ buttons.
 register(new SlashCommandBuilder().setName('banch').setDescription('دادن Role مخصوص Banch به یک کاربر')
   .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)));
-
-register(new SlashCommandBuilder().setName('rerole').setDescription('قرعه‌کشی دوباره آخرین Giveaway تمام‌شده همین Channel'));
 
 register(new SlashCommandBuilder().setName('embed').setDescription('ساخت Embed با دکمه‌های متن‌مخفی')
   .addStringOption(o => o.setName('title').setDescription('عنوان Embed').setMaxLength(256).setRequired(true))

@@ -7,7 +7,7 @@ function create(guild,channel,kind,trigger,prize,durationMinutes=60){const mins=
 function active(g,k,channelId=null){const now=Date.now();if(channelId)return db.prepare('SELECT * FROM drops WHERE guild_id=? AND kind=? AND ended=0 AND channel_id=? AND ends_at>? ORDER BY id ASC').all(g,k,channelId,now);return db.prepare('SELECT * FROM drops WHERE guild_id=? AND kind=? AND ended=0 AND ends_at>? ORDER BY id ASC').all(g,k,now)}
 function getById(id){return db.prepare('SELECT * FROM drops WHERE id=?').get(id)||null}
 function row(d,disabled=false){return new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`drop:${d.id}`).setLabel('Claim').setEmoji('🎁').setStyle(ButtonStyle.Primary).setDisabled(disabled))}
-function embed(d){const e=new EmbedBuilder().setColor(d.ended?0x95A5A6:0xE67E22).setTitle('🎁 Drop').setDescription(`**جایزه:** ${d.prize}\n\n⏳ **پایان:** <t:${Math.floor((d.ends_at||Date.now()+3600000)/1000)}:R>`).setFooter({text:`Drop #${d.id}`}).setTimestamp();if(d.ended)e.addFields({name:'🏆 نتیجه',value:d.winner_id?`برنده: <@${d.winner_id}>`:'بدون برنده'});return e}
+function embed(d){const text=d.kind==='text'&&d.trigger_text?`\n\n💬 **متن Drop:** ${d.trigger_text}`:'';const e=new EmbedBuilder().setColor(d.ended?0x95A5A6:0xE67E22).setTitle('🎁 Drop').setDescription(`**جایزه:** ${d.prize}${text}\n\n⏳ **پایان:** <t:${Math.floor((d.ends_at||Date.now()+3600000)/1000)}:R>`).setFooter({text:`Drop #${d.id}`}).setTimestamp();if(d.ended)e.addFields({name:'🏆 نتیجه',value:d.winner_id?`برنده: <@${d.winner_id}>`:'بدون برنده'});return e}
 async function finishMessage(guild,d,winner=null,reason='ended'){
   if(d.message_id){
     const edit={embeds:[embed(d).toJSON()],components:[row(d,true).toJSON()]};
